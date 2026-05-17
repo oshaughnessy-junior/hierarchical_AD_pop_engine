@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project]
+name = "hierarchical_ad_pop_engine"
+version = "0.0.1"
+description = "Autodifferentiable engine for hierarchical compact-binary populations"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Richard O'Shaughnessy", email = "rossma@rit.edu" },
+]
+requires-python = ">=3.11"
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "equinox>=0.11",
+    "gwkokab>=0.1",
+    "jaxtyping>=0.2",
+    "numpy<3",
+    # numpyro >=0.20 needed for `numpyro._typing.DistributionT`, which
+    # gwkokab.inference imports unconditionally (gwkokab itself only pins
+    # >=0.19 but actually requires the newer typing module).
+    "numpyro>=0.20",
+    "scipy>=1.12",
+]
+keywords = [
+    "astrophysics",
+    "autodifferentiation",
+    "bayesian-inference",
+    "compact-binaries",
+    "coagulation",
+    "gravitational-waves",
+    "hierarchical-mergers",
+    "jax",
+    "population-inference",
+]
+
+[project.optional-dependencies]
+cpu = ["jax>=0.4.30,<0.8.0"]
+cuda12 = ["jax[cuda12]>=0.4.30,<0.8.0"]
+test = ["pytest>=8.3.0"]
+dev = ["ruff>=0.8.0"]
+
+[project.urls]
+Repository = "https://github.com/oshaughn/hierarchical_AD_pop_engine"
+
+[tool.pytest.ini_options]
+addopts = ["-v", "--color=yes"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
