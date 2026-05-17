@@ -15,24 +15,51 @@ samples natal BHs as a particle list, pairs them stochastically, and
 records mergers. We then compare the simulator's outputs to the engine
 both at the distribution level and at the posterior level.
 
-## Architectural separation rule (non-negotiable)
+## Architectural separation rule
 
-The simulator imports **only the lowest-level physics primitives** that
-both sides explicitly agree on:
+The independence we want is **at the algorithm level**: discrete particle
+Monte Carlo vs continuous-density grid quadrature. The library choice is
+secondary. Re-implementing physics-fit formulas (`M_rem`, `chi_rem`,
+`v_kick`) in a parallel pure-numpy stack risks introducing *new*
+formula-typing bugs that defeat the validation purpose.
 
-- `M_rem(m1, m2, χ1, χ2)`              — Lousto-Zlochower remnant mass.
-- `chi_rem(m1, m2, χ1, χ2)`            — Barausse-Rezzolla remnant spin.
-- `P_retain(m1, m2, χ1, χ2, v_esc)`    — aligned-only retention Heaviside.
+So the rule is:
 
-It does **not** import:
+- **May import:** engine physics primitives that both sides explicitly
+  agree on — `M_rem`, `chi_rem`, `retention_aligned`, `v_kick_aligned`,
+  natal-mass / natal-spin distribution samplers. JAX is allowed
+  transitively (these primitives are jax-backed); the simulator wraps
+  call sites with `np.asarray` so the outer driver is numpy-native.
+- **May not import:** `hierarchical_ad_pop_engine.response.*` — that's
+  the thing under test, including `_solve`, `_log_total_density`,
+  `log_rate_density`, the `_step_one_generation` bilinear-scatter.
+  The simulator does not use the grid representation as its working
+  state (it tracks particles); it may *output* on the engine's
+  `BinaryGrid` for hot-swap convenience.
 
-- `hierarchical_ad_pop_engine.response.*`  (the thing under test).
-- `hierarchical_ad_pop_engine.grids.*`     (no grid representation).
-- `jax` or `equinox`                       (no shared autodiff path).
+This is a deliberate relaxation of an earlier draft of this plan. We
+keep the validation power (independent algorithm + independent code
+path through quadrature / scatter / accumulator) while not duplicating
+formulas that are external truth.
 
-Mass-sampling and spin-sampling primitives are re-implemented from
-`scipy.stats` distributions so that even the random-number plumbing is
-independent. Independence is the entire point.
+## Hot-swap design goal
+
+The simulator's outputs should plug into the same likelihood path the
+engine plugs into, so the gold-standard red-team check is a *posterior
+swap*: same prior, same mock catalog, same likelihood interface, two
+forward models. Concretely:
+
+- **Phase 0 output:** discrete catalog of merger events
+  `(m1, m2, χ1, χ2, g1, g2)`. Sufficient for distribution-level checks.
+- **Phase 1+ output:** also produce `log_n_k(m, χ)` on a
+  `BinaryGrid` by histogramming the per-generation populations.
+  This matches the shape `CoagulationResponse._solve()` returns and can
+  be substituted for it in any downstream Poisson-likelihood call.
+- **Phase 3 hot-swap:** wrap the simulator behind the same numpyro
+  Distribution shim the engine will eventually wear (Stage 2 of
+  `PLAN_gwkokab_fit.md`). NUTS / SVI then run unchanged on the
+  simulator-backed model; posterior comparison is the gold-standard
+  red-team check.
 
 ## Phase 0 — independent forward simulator
 
@@ -41,35 +68,51 @@ File: `red_team/sim_coagulation.py`
 Inputs: same θ as the engine — natal IMF (μ, σ), natal spin (loc, scale),
 kernel (a, b), v_esc, k_max, N_seed.
 
-Algorithm:
+Algorithm (matches the engine's accumulator structure, but as discrete
+particle MC rather than 4D quadrature):
 
-1. **Natal sample.** Draw `N_seed` natal BHs from `f_IMF(m) × g_spin(χ)`
-   using `scipy.stats.truncnorm.rvs`. Annotate each with `generation = 1`.
-2. **Pair selection.** For each generation:
-   a. Form an active list of unpaired BHs of the current generation.
-   b. Draw a random pair (i, j) uniformly from the active list.
-   c. Accept with probability `K(m_i, m_j) / K_max(active)` (rejection
-      sampling on the unnormalised kernel).
-   d. If accepted, remove i and j from the active list. If rejected,
-      put them back and try another pair.
-   e. Loop until no further pairs can be drawn (budget exhausted).
-3. **Retention.** For each accepted pair draw `r ~ Uniform(0, 1)` and
-   retain iff `r < P_retain(m_i, m_j, χ_i, χ_j, v_esc)`. For pure
-   aligned-only `P_retain ∈ {0, 1}`, so this is a hard cut.
-4. **Remnant.** For retained pairs compute `M_rem, chi_rem`. Annotate
-   the remnant with `generation = max(g_i, g_j) + 1`.
-5. **Record merger event.** Save `(m_i, m_j, χ_i, χ_j, g_i, g_j)` to
-   the merger catalog. Enforce `m_i ≥ m_j` by post-swap.
-6. **Next generation.** Insert the retained remnants into the seed
-   pool. Increment generation counter. Repeat (2-5).
-7. Stop when `generation > k_max` or the active list is empty.
+1. **Natal sample.** Draw `N_seed` natal BHs from
+   `f_IMF(m) × g_spin(χ)` using `scipy.stats.truncnorm.rvs`. Annotate
+   each with `generation = 1`. Store as `populations[1] = (m, χ)`.
+2. **Per generation `k = 2..k_max`:** the k-th generation is built from
+   pairs (j, l) with `max(j, l) = k − 1`, mirroring `_solve`'s
+   accumulator.
+   For each such pair-of-generations (j, l):
+   a. **Sample N pairs** of particles (one from `populations[j]`, one
+      from `populations[l]`) with probability ∝ `K(m_a, m_b)` via
+      batched rejection on a kernel upper bound.
+   b. **Retention.** Apply `retention_aligned(m_a, m_b, χ_a, χ_b, v_esc)`
+      — keeps a pair iff `v_kick < v_esc`. Pure Heaviside in the
+      aligned-only physics.
+   c. **Remnant.** Compute `M_rem`, `chi_rem` for retained pairs.
+      Annotate remnant with `generation = k`.
+   d. **Record merger event.** `(m1, m2, χ1, χ2, g1, g2)` with
+      `m1 ≥ m2` enforced. Both retained and non-retained pairs are
+      logged with a `retained: bool` flag so the simulator's retention
+      fraction can be sanity-checked against the engine's `P_retain`
+      integrand.
+3. Stop when `k > k_max` or no pairs can be sampled (empty pool).
 
-Output: numpy structured array of merger events, shape `(N_mergers, 6)`:
-`(m1, m2, χ1, χ2, g1, g2)`. Float64 throughout. No JAX.
+Note on with- vs without-replacement pairing: the engine treats `n_1`
+as a *non-depleting source* — `n_2` is computed from pairs of `n_1`'s
+without subtracting consumed natal BHs. The simulator matches this by
+**sampling pairs with replacement** from each generation's pool. A
+without-replacement variant (more physically realistic for a finite
+cluster) is a separate experiment; the with-replacement variant is the
+right comparison target for Phase 1.
+
+Output:
+
+- `populations`: dict `{1: (m_1, χ_1), 2: (m_2, χ_2), ...}` of retained
+  per-generation populations. `len(populations[k])` is the discrete
+  analog of `∫ n_k(m, χ) dm dχ`.
+- `merger_events`: numpy structured array, shape `(N_events, 7)`:
+  `(m1, m2, χ1, χ2, g1, g2, retained)`. Float64; `retained` is bool.
 
 Acceptance: simulator runs end-to-end in seconds for
-`N_seed = 10^4, k_max = 4`. No JAX, no grid, no imports from
-`response.*`.
+`N_seed = 10^4, k_max = 4`, vectorised pair-sampling via batched
+rejection. No imports from `response.*`. JAX is invoked transitively
+through the imported physics primitives only.
 
 ## Phase 1 — distribution-level engine ↔ simulator check
 
