@@ -38,7 +38,7 @@ from jaxtyping import ArrayLike
 from ..grids import BinaryGrid
 from ..interp import log_density_at
 from ..kernels import log_pairing_kernel_grid
-from ..natal.mass import log_natal_mass
+from ..natal.mass import log_natal_mass, log_natal_mass_gaussian
 from ..natal.spin import build_natal_spin, log_natal_spin
 from ..remnants.mass import M_rem
 from ..remnants.spin import chi_rem
@@ -180,10 +180,14 @@ class CoagulationResponse(eqx.Module):
     natal_spin_params: dict
     kernel_params: dict
     log_R_env: Array
+    natal_mass_kind: str = eqx.field(static=True, default="pl_peak")
 
     def _natal_log_density(self) -> Array:
         spin_dist = build_natal_spin(**self.natal_spin_params)
-        log_f_m = log_natal_mass(self.grid.m, **self.natal_mass_params)  # (N_m,)
+        if self.natal_mass_kind == "gaussian":
+            log_f_m = log_natal_mass_gaussian(self.grid.m, **self.natal_mass_params)
+        else:
+            log_f_m = log_natal_mass(self.grid.m, **self.natal_mass_params)  # (N_m,)
         log_g_chi = log_natal_spin(spin_dist, self.grid.chi)  # (N_chi,)
         # Replace -inf with a finite very-negative number so the 4D log-sum
         # arithmetic doesn't propagate NaN. Cells flagged -inf carry zero
@@ -277,6 +281,55 @@ def _logsumexp_axis(x: Array, axis: int) -> Array:
     m = jnp.max(x, axis=axis, keepdims=True)
     safe_m = jnp.where(jnp.isneginf(m), 0.0, m)
     return jnp.log(jnp.sum(jnp.exp(x - safe_m), axis=axis)) + jnp.squeeze(safe_m, axis=axis)
+
+
+def build_gaussian_coagulation(
+    *,
+    mu: ArrayLike = 8.0,
+    sigma: ArrayLike = 1.0,
+    m_min: ArrayLike = 2.0,
+    m_max: ArrayLike = 200.0,
+    natal_spin_loc: ArrayLike = 0.0,
+    natal_spin_scale: ArrayLike = 0.05,
+    kernel_a: ArrayLike = 0.0,
+    kernel_b: ArrayLike = 2.0,
+    log_R_env: ArrayLike = 0.0,
+    k_max: int = 4,
+    grid: Optional[BinaryGrid] = None,
+) -> "CoagulationResponse":
+    """Convenience constructor for an impulse-response demo / unit test.
+
+    Uses ``jax.scipy.stats.truncnorm.logpdf`` (the same primitive gwkokab's
+    own ``GaussianPrimaryMassRatio`` uses) as the natal IMF. The defaults
+    ``μ = 8 M⊙``, ``σ = 1 M⊙`` give a narrow Gaussian centred on the natal
+    8 M⊙ BHs of Doctor+2020's working example, so successive generations
+    pile up at the expected ``M_rem(m, m)`` cascade locations.
+    """
+    if grid is None:
+        grid = BinaryGrid.default(
+            m_min=float(jnp.asarray(m_min)),
+            m_max=float(jnp.asarray(m_max)),
+        )
+    return CoagulationResponse(
+        grid=grid,
+        k_max=k_max,
+        natal_mass_params=dict(
+            mu=jnp.asarray(mu),
+            sigma=jnp.asarray(sigma),
+            m_min=jnp.asarray(m_min),
+            m_max=jnp.asarray(m_max),
+        ),
+        natal_spin_params=dict(
+            loc=jnp.asarray(natal_spin_loc),
+            scale=jnp.asarray(natal_spin_scale),
+        ),
+        kernel_params=dict(
+            a=jnp.asarray(kernel_a),
+            b=jnp.asarray(kernel_b),
+        ),
+        log_R_env=jnp.asarray(log_R_env),
+        natal_mass_kind="gaussian",
+    )
 
 
 def build_default_coagulation(

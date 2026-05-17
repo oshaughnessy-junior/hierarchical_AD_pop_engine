@@ -30,7 +30,7 @@ import jax.numpy as jnp
 from gwkokab.models.utils import doubly_truncated_power_law_log_norm_constant
 from gwkokab.utils.kernel import log_planck_taper_window
 from jax import Array
-from jax.scipy.stats import norm
+from jax.scipy.stats import norm, truncnorm
 from jaxtyping import ArrayLike
 
 
@@ -114,6 +114,45 @@ def log_natal_mass(
     )
     log_prob = log_unnorm - log_Z
     return jnp.where(inside, log_prob, -jnp.inf)
+
+
+def log_natal_mass_gaussian(
+    m: Array,
+    mu: ArrayLike,
+    sigma: ArrayLike,
+    m_min: ArrayLike,
+    m_max: ArrayLike,
+) -> Array:
+    """Truncated-normal natal IMF.
+
+    Pedagogically useful: a narrow Gaussian gives an impulse-response view of
+    the coagulation operator (peaks at successive generations land at the
+    expected ``M_rem(m, m)`` locations).
+
+    Uses ``jax.scipy.stats.truncnorm.logpdf`` — the same primitive gwkokab's
+    own ``GaussianPrimaryMassRatio`` calls (see
+    ``gwkokab.models.mass._models.GaussianPrimaryMassRatio.log_prob``). The
+    result is a fully normalised, AD-safe truncated Gaussian on
+    ``[m_min, m_max]``.
+
+    Parameters
+    ----------
+    m
+        Mass query points (solar masses).
+    mu, sigma
+        Mean and standard deviation of the underlying (untruncated) Gaussian.
+    m_min, m_max
+        Hard truncation limits.
+
+    Returns
+    -------
+    Array
+        ``log f_IMF(m)``, normalised so ``∫ exp(log f) dm = 1`` over
+        ``[m_min, m_max]``.
+    """
+    a = (m_min - mu) / sigma
+    b = (m_max - mu) / sigma
+    return truncnorm.logpdf(m, a=a, b=b, loc=mu, scale=sigma)
 
 
 # Kept for backward compat with existing callers that pass a params dict;
