@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from scipy.stats import truncnorm
+from scipy.stats import gaussian_kde, truncnorm
 
 # Allowed engine imports — physics primitives only. Wrapped with np.asarray
 # at the call sites below so the outer driver is numpy-native. The
@@ -339,33 +339,159 @@ _STAGE1_THETA = dict(
 )
 
 
+# ---------------------------------------------------------------------------
+# 1-D density estimator with boundary reflection — used by the smoke driver
+# AND by Phase 1's engine-vs-simulator overlay (red_team/phase1_overlay.py).
+# ---------------------------------------------------------------------------
+def make_marginal(
+    data: np.ndarray,
+    eval_points: np.ndarray,
+    *,
+    kind: str = "kde",
+    bounds: Optional[tuple[float, float]] = None,
+    log_space: bool = False,
+    bw_method=None,
+) -> np.ndarray:
+    """Estimate a 1-D density of ``data`` and evaluate it at ``eval_points``.
+
+    Parameters
+    ----------
+    data
+        1-D array of samples.
+    eval_points
+        1-D array of points at which to return the density.
+    kind
+        - ``"kde"``: Gaussian KDE. If ``bounds`` is given, use the
+          reflection trick (extend the sample with reflected copies at
+          each boundary) so the density does not leak across — important
+          for spin ∈ [0, 1] half-normal-near-0 distributions and for the
+          natal-IMF tail at ``m_min``.
+        - ``"hist"``: histogram with bin edges spanning ``eval_points``
+          plus symmetric outer half-cells. Kept as a fallback so the user
+          can see the raw MC realization when KDE smoothing looks
+          suspicious.
+    bounds
+        ``(low, high)`` over which to enforce reflection. Ignored for
+        kind="hist".
+    log_space
+        If True, the KDE is performed on ``log(data)`` and the density
+        returned is ``dN/dm`` (Jacobian ``1/m``). Used for mass marginals
+        on a geometric grid.
+    bw_method
+        Passed through to ``gaussian_kde``. ``None`` → Silverman's rule
+        on the *original* sample (we compensate for the artificially
+        larger std of the reflected sample explicitly).
+
+    Returns
+    -------
+    density : 1-D array, ``len(eval_points)``.
+        Density estimate in linear (not log) coordinates. Not
+        absolute-rate-normalised — Phase 1 compares shapes after
+        per-marginal renormalisation.
+    """
+    data = np.asarray(data, dtype=np.float64)
+    eval_points = np.asarray(eval_points, dtype=np.float64)
+
+    if kind == "hist":
+        edges = np.empty(eval_points.size + 1, dtype=np.float64)
+        edges[1:-1] = 0.5 * (eval_points[:-1] + eval_points[1:])
+        edges[0] = eval_points[0] - 0.5 * (eval_points[1] - eval_points[0])
+        edges[-1] = eval_points[-1] + 0.5 * (eval_points[-1] - eval_points[-2])
+        h, _ = np.histogram(data, bins=edges, density=True)
+        return h
+    if kind != "kde":
+        raise ValueError(f"unknown kind={kind!r}; want 'kde' or 'hist'")
+
+    if data.size < 2:
+        return np.zeros_like(eval_points)
+
+    # Work in the transformed coordinate.
+    if log_space:
+        sample = np.log(data)
+        eval_t = np.log(eval_points)
+        bounds_t = (
+            (np.log(bounds[0]), np.log(bounds[1])) if bounds is not None else None
+        )
+    else:
+        sample = data
+        eval_t = eval_points
+        bounds_t = bounds
+
+    # Silverman bandwidth from the *original* sample so reflection does
+    # not artificially widen the kernel.
+    sigma_orig = float(sample.std(ddof=1)) + 1e-30
+    n_orig = sample.size
+    if bw_method is None:
+        h = 1.06 * sigma_orig * (n_orig ** (-1.0 / 5.0))
+    else:
+        # Caller-supplied; gaussian_kde will interpret.
+        h = None  # delegate to scipy
+
+    if bounds_t is not None:
+        lo, hi = bounds_t
+        extended = np.concatenate([sample, 2 * lo - sample, 2 * hi - sample])
+        if h is not None:
+            sigma_ext = float(extended.std(ddof=1)) + 1e-30
+            kde = gaussian_kde(extended, bw_method=h / sigma_ext)
+        else:
+            kde = gaussian_kde(extended, bw_method=bw_method)
+    else:
+        if h is not None:
+            kde = gaussian_kde(sample, bw_method=h / sigma_orig)
+        else:
+            kde = gaussian_kde(sample, bw_method=bw_method)
+
+    density_t = kde(eval_t)
+
+    # Apply Jacobian if we worked in log-space (dN/dlogm → dN/dm).
+    if log_space:
+        density_t = density_t / eval_points
+    return density_t
+
+
 def _smoke_plot_marginals(
     populations: dict[int, tuple[np.ndarray, np.ndarray]],
     out_dir: Path,
+    *,
+    kind: str = "kde",
+    m_min: float = 4.0,
+    m_max: float = 80.0,
 ) -> None:
+    """Per-generation single-BH mass and spin marginals.
+
+    Uses :func:`make_marginal` so the user can flip between KDE (default,
+    smooth, reveals MC-realisation noise as wiggles in the tails) and
+    histogram (raw bin counts; sharper but artefact-prone). The KDE is
+    boundary-reflected at ``[m_min, m_max]`` for mass and ``[0, 1]`` for
+    spin so half-normal-near-0 distributions don't leak across.
+    """
     import matplotlib.pyplot as plt  # local import; not a top-level dep
 
     K = max(populations.keys())
     colors = plt.cm.viridis(np.linspace(0.15, 0.85, K))
 
-    # Per-generation mass spectrum, peak-normalised, log-y.
+    # Evaluation grids — fine, so KDE detail is visible at the figure level.
+    m_eval = np.geomspace(m_min, m_max * 2.0, 400)
+    chi_eval = np.linspace(0.0, 1.0, 400)
+
+    # ---- Mass ----
     fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    bins_m = np.geomspace(2.0, 200.0, 80)
     for k in range(1, K + 1):
         m_k, _ = populations[k]
-        if m_k.size == 0:
+        if m_k.size < 2:
             continue
-        h, edges = np.histogram(m_k, bins=bins_m)
-        if h.max() == 0:
+        dN_dm = make_marginal(
+            m_k, m_eval, kind=kind, bounds=(m_min, m_max * 2.0), log_space=True
+        )
+        if dN_dm.max() <= 0:
             continue
-        centers = 0.5 * (edges[:-1] + edges[1:])
         ax.loglog(
-            centers, np.maximum(h, 1) / h.max(),
+            m_eval, np.maximum(dN_dm, 1e-30) / dN_dm.max(),
             lw=2.0, color=colors[k - 1], label=f"{k}G ({m_k.size} BHs)",
         )
     ax.set_xlabel(r"single-BH mass $m \;[M_\odot]$")
-    ax.set_ylabel("per-generation count (peak-normalised, log-y)")
-    ax.set_title("Phase 0 simulator — per-generation single-BH mass")
+    ax.set_ylabel(f"per-generation $dN/dm$ (peak-normalised, {kind})")
+    ax.set_title(f"Phase 0 simulator — per-generation $dN/dm$ ({kind})")
     ax.set_ylim(1e-4, 2.0)
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend(loc="upper right", frameon=False, title="Generation")
@@ -375,25 +501,25 @@ def _smoke_plot_marginals(
     plt.close(fig)
     print(f"  wrote {out}")
 
-    # Per-generation spin spectrum, log-y.
+    # ---- Spin ----
     fig, ax = plt.subplots(figsize=(7.5, 5.0))
-    bins_c = np.linspace(0.0, 1.0, 40)
     for k in range(1, K + 1):
         _, chi_k = populations[k]
-        if chi_k.size == 0:
+        if chi_k.size < 2:
             continue
-        h, edges = np.histogram(chi_k, bins=bins_c)
-        if h.max() == 0:
+        dN_dchi = make_marginal(
+            chi_k, chi_eval, kind=kind, bounds=(0.0, 1.0), log_space=False
+        )
+        if dN_dchi.max() <= 0:
             continue
-        centers = 0.5 * (edges[:-1] + edges[1:])
         ax.semilogy(
-            centers, np.maximum(h, 1) / h.max(),
+            chi_eval, np.maximum(dN_dchi, 1e-30) / dN_dchi.max(),
             lw=2.0, color=colors[k - 1], label=f"{k}G",
         )
-    ax.axvline(0.6865, color="0.4", lw=0.7, ls=":")
+    ax.axvline(0.6865, color="0.4", lw=0.7, ls=":", label=r"$\chi_{\rm rem}(1,0)$")
     ax.set_xlabel(r"single-BH spin $\chi$")
-    ax.set_ylabel("per-generation count (peak-normalised, log-y)")
-    ax.set_title("Phase 0 simulator — per-generation single-BH spin")
+    ax.set_ylabel(f"per-generation $dN/d\\chi$ (peak-normalised, {kind})")
+    ax.set_title(f"Phase 0 simulator — per-generation $dN/d\\chi$ ({kind})")
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(1e-4, 2.0)
     ax.grid(True, which="both", ls=":", alpha=0.4)
@@ -405,7 +531,7 @@ def _smoke_plot_marginals(
     print(f"  wrote {out}")
 
 
-def _smoke_driver(run_hash: Optional[str] = None) -> None:
+def _smoke_driver(run_hash: Optional[str] = None, kind: str = "kde") -> None:
     here = Path(__file__).parent
     rh = run_hash or secrets.token_hex(3)
     fig_dir = here / f"figures_{rh}"
@@ -455,8 +581,11 @@ def _smoke_driver(run_hash: Optional[str] = None) -> None:
     print(f"  wrote {art_dir / 'sim_phase0_populations.npz'}")
 
     # Plots.
-    print("Plotting per-generation marginals ...")
-    _smoke_plot_marginals(populations, fig_dir)
+    print(f"Plotting per-generation marginals ({kind}) ...")
+    _smoke_plot_marginals(
+        populations, fig_dir, kind=kind,
+        m_min=cfg.m_min, m_max=cfg.m_max,
+    )
 
 
 if __name__ == "__main__":
@@ -468,5 +597,11 @@ if __name__ == "__main__":
         default=None,
         help="Output dir suffix; default: random 6-char hex.",
     )
+    parser.add_argument(
+        "--hist",
+        action="store_true",
+        help="Use raw histograms instead of boundary-reflected KDE for the "
+        "marginal plots. Useful for seeing the raw MC realization.",
+    )
     args = parser.parse_args()
-    _smoke_driver(run_hash=args.run_hash)
+    _smoke_driver(run_hash=args.run_hash, kind="hist" if args.hist else "kde")
