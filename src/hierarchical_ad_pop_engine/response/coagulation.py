@@ -181,6 +181,19 @@ class CoagulationResponse(eqx.Module):
     kernel_params: dict
     log_R_env: Array
     natal_mass_kind: str = eqx.field(static=True, default="pl_peak")
+    # Solver dispatch. "perturbative" is the legacy generational accumulator
+    # in :meth:`_solve`; "implicit" is the all-orders damped Picard fixed-
+    # point in :mod:`hierarchical_ad_pop_engine.response.implicit`. The
+    # implicit path is the physics-correct one (it includes the loss term
+    # and sums the Volterra series to all orders); the perturbative path
+    # is retained as a diagnostic and as the AD-safe baseline until the
+    # implicit solver gets its custom VJP. See
+    # ``demo/PLAN_engine_v2_production.md``.
+    solver: str = eqx.field(static=True, default="perturbative")
+    # Coupling × time used by the implicit solver. Has absolute physical
+    # meaning — ε ≈ 1 is a fully-developed cascade, ε ≪ 1 leaves the
+    # natal pool intact. Ignored when ``solver == "perturbative"``.
+    epsilon: Array = eqx.field(default_factory=lambda: jnp.asarray(1.0))
 
     def _natal_log_density(self) -> Array:
         spin_dist = build_natal_spin(**self.natal_spin_params)
@@ -268,7 +281,19 @@ class CoagulationResponse(eqx.Module):
         return jnp.stack(log_n, axis=0)
 
     def _log_total_density(self, v_esc: Array) -> Array:
-        """``log N(m, χ) = log Σ_k n_k(m, χ)`` on the binary grid."""
+        """``log N(m, χ) = log Σ_k n_k(m, χ)`` on the binary grid.
+
+        Dispatches on :attr:`solver`. With ``solver == "perturbative"`` we
+        return ``logsumexp_k log n_k`` from the generational accumulator;
+        with ``solver == "implicit"`` we return the converged ``log N*``
+        from :func:`response.implicit.solve_implicit_fixed_point`.
+        """
+        if self.solver == "implicit":
+            # Local import to break the implicit ↔ coagulation cycle.
+            from .implicit import solve_implicit_fixed_point
+
+            result = solve_implicit_fixed_point(self, v_esc, epsilon=self.epsilon)
+            return result.log_N
         log_n_k = self._solve(v_esc)  # (K, N_m, N_chi)
         return _logsumexp_axis(log_n_k, axis=0)
 
@@ -325,6 +350,8 @@ def build_gaussian_coagulation(
     log_R_env: ArrayLike = 0.0,
     k_max: int = 4,
     grid: Optional[BinaryGrid] = None,
+    solver: str = "perturbative",
+    epsilon: ArrayLike = 1.0,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -358,6 +385,8 @@ def build_gaussian_coagulation(
         ),
         log_R_env=jnp.asarray(log_R_env),
         natal_mass_kind="gaussian",
+        solver=solver,
+        epsilon=jnp.asarray(epsilon),
     )
 
 
@@ -377,6 +406,8 @@ def build_default_coagulation(
     log_R_env: ArrayLike = 0.0,
     k_max: int = 4,
     grid: Optional[BinaryGrid] = None,
+    solver: str = "perturbative",
+    epsilon: ArrayLike = 1.0,
 ) -> CoagulationResponse:
     """Convenience constructor with reasonable defaults for a single AGN-disk-like environment."""
     if grid is None:
@@ -405,4 +436,6 @@ def build_default_coagulation(
             b=jnp.asarray(kernel_b),
         ),
         log_R_env=jnp.asarray(log_R_env),
+        solver=solver,
+        epsilon=jnp.asarray(epsilon),
     )
