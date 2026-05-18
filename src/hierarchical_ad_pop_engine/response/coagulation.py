@@ -197,8 +197,34 @@ class CoagulationResponse(eqx.Module):
         return log_f_m[:, None] + log_g_chi[None, :]  # (N_m, N_chi)
 
     def _solve(self, v_esc: Array) -> Array:
-        """Return ``log n_k(m, χ)`` for ``k = 1..k_max``; shape ``(K, N_m, N_chi)``."""
+        """Return ``log n_k(m, χ)`` for ``k = 1..k_max``; shape ``(K, N_m, N_chi)``.
+
+        Each ``n_k`` is a **density** on (m, χ) — units of dN / dm / dχ —
+        consistent with ``log_n[0]`` from :meth:`_natal_log_density`. The
+        :func:`_step_one_generation` bilinear scatter returns *count per
+        output cell* (the 4D progenitor cell-measure ``dm1·dχ1·dm2·dχ2``
+        is already absorbed). Dividing by the output cell area
+        ``dm_out · dχ_out`` converts back to a density, so that
+        :meth:`log_rate_density`'s bilinear ``K · N · N`` evaluation has
+        consistent units across generations.
+        """
         log_K_mm = log_pairing_kernel_grid(self.grid.m, **self.kernel_params)
+
+        # Output cell area for converting bilinear-scatter weight per cell
+        # → density on (m, χ). Trapezoidal-rule weights matching
+        # ``_step_one_generation``'s progenitor measure.
+        m = self.grid.m
+        chi = self.grid.chi
+        dlog_m = jnp.diff(self.grid.log_m)
+        dlog_m_full = jnp.concatenate(
+            [dlog_m[:1], 0.5 * (dlog_m[:-1] + dlog_m[1:]), dlog_m[-1:]]
+        )
+        dchi = jnp.diff(chi)
+        dchi_full = jnp.concatenate(
+            [dchi[:1], 0.5 * (dchi[:-1] + dchi[1:]), dchi[-1:]]
+        )
+        dm_out = m * dlog_m_full  # (N_m,)
+        cell_area = dm_out[:, None] * dchi_full[None, :]  # (N_m, N_chi)
 
         log_n = [self._natal_log_density()]
         for k in range(2, self.k_max + 1):
@@ -218,7 +244,15 @@ class CoagulationResponse(eqx.Module):
                         sym,
                     )
                 else:
-                    sym = 1.0  # (j, l) and (l, j) handled symmetrically by integrating over both
+                    # K, M_rem, P_retain are all symmetric in (m1, m2), so the
+                    # 4D ``_step_one_generation`` integral with ``n_j`` on axis 1
+                    # and ``n_l`` on axis 2 already captures the full
+                    # ``∫∫ K n_j n_l dm1 dm2`` contribution. Adding a swapped
+                    # ``(n_l, n_j)`` call would double-count the same unordered
+                    # pair. (Red-team Phase 1 validation found this: 1G and 2G
+                    # had no j != l cross terms and matched to JS ≈ 1e-4; 3G+
+                    # showed JS ≈ 0.2-0.35 from the 2× over-count.)
+                    sym = 1.0
                     contrib = _step_one_generation(
                         log_n[j - 1],
                         log_n[l - 1],
@@ -226,15 +260,10 @@ class CoagulationResponse(eqx.Module):
                         self.grid,
                         v_esc,
                         sym,
-                    ) + _step_one_generation(
-                        log_n[l - 1],
-                        log_n[j - 1],
-                        log_K_mm,
-                        self.grid,
-                        v_esc,
-                        sym,
                     )
-                n_lin = n_lin + contrib
+                # contrib is count per output cell; divide by cell area to
+                # convert to density so that n_k is consistent with n_1.
+                n_lin = n_lin + contrib / cell_area
             log_n.append(jnp.log(jnp.maximum(n_lin, 1e-30)))
         return jnp.stack(log_n, axis=0)
 

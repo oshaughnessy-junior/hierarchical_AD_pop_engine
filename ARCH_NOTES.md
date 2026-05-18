@@ -53,12 +53,26 @@ dense.
 implicit-solve wrapper with custom JVP / implicit diff, half a session
 for unit tests against the explicit `k_max = 10` reference.
 
-**Triggering event.** Don't pull this forward until either:
+**Triggering event.** ~~Don't pull this forward until either~~ **Triggered.**
+Red-team Phase 1 found that the engine matches Backup 2 (Doctor implicit
+Picard) *only* at the unphysically small effective coupling ε ≈ 0.025.
+For natural hierarchical-merger physics (visible 2G/3G peaks in GW
+catalogues), the effective coupling is order unity, which the current
+perturbative truncation cannot reach. See
+`demo/PLAN_implicit_engine.md` for the refactor plan and
+`red_team/engine_v2_implicit.py` for a working 2D prototype.
 
-a. The red-team validation (`PLAN_red_team_validation.md`) flags a
-   missing-tail disagreement at large k.
-b. A physics motivation appears for very light seeds (e.g. primordial
-   BHs, NS-BH hierarchical, AGN-disk accretion-dominated regime).
+**Status (2026-05-17).**
 
-Until then the perturbative sum is the right tool and the
-`k_max ≤ 4` ceiling is appropriate.
+a. ✅ Red-team Phase 1 fired the trigger — `compare_all.py` shows
+   engine vs Backup 2 implicit agree only at ε ≈ 0.025; engine vs
+   Backup 1 (pure particle MC) agree only at depletion fraction ≈ 0.01.
+b. ✅ 2D `(m, χ)` implicit Picard prototype shipped at
+   `red_team/engine_v2_implicit.py`. Reuses engine grid +
+   `_step_one_generation` for gain; adds 4D loss term
+   `⟨K · N · P_retain⟩(m, χ)`. Damped Picard, ~100 iterations to
+   converge for the Stage 1 configuration.
+c. ⏳ Refactor `CoagulationResponse._solve` to call the new solver, or
+   add `_solve_implicit` as a parallel method — pending validation
+   pass and AD-via-implicit-function-theorem custom VJP work. See
+   `demo/PLAN_implicit_engine.md`.

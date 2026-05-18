@@ -228,31 +228,53 @@ def sample_pairs_weighted_by_K(
 def simulate_cascade(
     cfg: SimConfig, rng: np.random.Generator
 ) -> tuple[dict[int, tuple[np.ndarray, np.ndarray]], np.ndarray]:
-    """Run the discrete coagulation cascade.
+    """Run the discrete coagulation cascade with correct (j, l) weighting.
 
-    Algorithm (mirrors ``_solve``'s accumulator, but as particle MC):
+    Mirrors the engine's accumulator structure but as particle MC. For each
+    ``k = 2..k_max``, the engine's ``n_k`` is
 
-        populations[1] = natal sample
-        for k = 2..k_max:
-            for j ∈ {1, ..., k-1}:
-                pair populations[j] × populations[k-1]
-                apply retention; compute M_rem, chi_rem; advance.
-            populations[k] = retained remnants from all (j, k-1) passes.
+        n_k = Σ_{j=1..k-1} c(j, k-1) · ∫∫ K · n_j · n_{k-1} · P_retain dω
+        c(j, l) = 1/2  if j == l    (unordered indistinguishable pair)
+                = 1    if j != l    (distinguishable; no double-count)
+
+    The simulator reproduces this mixture by:
+
+        1. For each (j, l) combo, draw a uniform sample of candidate pairs
+           from populations[j] × populations[l].
+        2. Weight each candidate by ``c(j, l) · K · P_retain`` (i.e. the
+           differential rate density for that pair).
+        3. Pool weighted candidates across all (j, l) combos.
+        4. Resample without replacement weights → unweighted size-``n_seed``
+           draw representing ``n_k``, ready for use in subsequent generations.
+
+    This is **importance sampling**: the proposal is the uniform pair
+    distribution, the target is the K·P_retain-weighted distribution, and the
+    resampling step converts importance weights to an unweighted draw.
+
+    Parameters
+    ----------
+    cfg
+        Physics + sample-size knobs.
+    rng
+        Numpy random Generator.
 
     Returns
     -------
     populations : dict[int, (m, χ)]
-        Per-generation single-BH populations (only retained BHs).
-        ``populations[k]`` is a tuple of two float64 arrays of equal length.
-    merger_events : np.ndarray, shape (N_events, 7)
-        Per-event record (m1, m2, χ1, χ2, g1, g2, retained), with m1 ≥ m2.
-        ``g1`` is the generation of the heavier progenitor.
-        ``retained`` is 1.0 if the merger was retained, else 0.0.
+        Per-generation **unweighted** retained single-BH populations. Each
+        entry holds two float64 arrays of equal length; the length is
+        ``cfg.n_seed`` for k=1, and ``cfg.n_seed`` for k≥2 (resampled).
+    merger_events : np.ndarray, shape (N_events, 8)
+        Per-event record ``(m1, m2, χ1, χ2, g1, g2, retained, weight)`` with
+        ``m1 ≥ m2``. ``weight`` is the importance weight before
+        normalisation — useful for downstream weighted analyses.
     """
     populations: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     populations[1] = sample_natals(cfg, rng)
 
-    event_records: list[np.ndarray] = []  # collect (N_pairs, 7) blocks
+    event_records: list[np.ndarray] = []
+    n_uniform_per_combo = cfg.n_pairs_per_generation_pair
+    n_resample = cfg.n_seed
 
     for k in range(2, cfg.k_max + 1):
         l = k - 1
@@ -261,38 +283,41 @@ def simulate_cascade(
             populations[k] = (np.empty(0), np.empty(0))
             continue
 
-        # k-th gen accumulator: collect retained remnants from all (j, l) passes.
-        m_k_parts: list[np.ndarray] = []
-        chi_k_parts: list[np.ndarray] = []
+        # Pool of weighted candidate remnants from all (j, l) contributions.
+        M_pool_parts: list[np.ndarray] = []
+        chi_pool_parts: list[np.ndarray] = []
+        w_pool_parts: list[np.ndarray] = []
 
         for j in range(1, l + 1):
             m_j, chi_j = populations[j]
             if m_j.size == 0:
                 continue
-            # NOTE: the engine's _solve applies a sym=0.5 factor when j == l
-            # (unordered → ordered double-counting correction). The simulator
-            # below treats all pairs as ordered samples, so absolute event
-            # counts are 2× the engine's expectation for j == l passes.
-            # Irrelevant for Phase 1 shape comparison; will need to be
-            # corrected (e.g. halve n_pairs when j == l) for Phase 3 absolute-
-            # rate parity with the engine.
-            idx_j, idx_l = sample_pairs_weighted_by_K(
-                m_j, m_l, cfg, cfg.n_pairs_per_generation_pair, rng
-            )
-            m_a, chi_a = m_j[idx_j], chi_j[idx_j]
-            m_b, chi_b = m_l[idx_l], chi_l[idx_l]
 
-            # Retention check — Heaviside on aligned-kick magnitude.
+            # Step 1 — uniform proposal over populations[j] × populations[l].
+            ia = rng.integers(0, m_j.size, size=n_uniform_per_combo)
+            ib = rng.integers(0, m_l.size, size=n_uniform_per_combo)
+            m_a, chi_a = m_j[ia], chi_j[ia]
+            m_b, chi_b = m_l[ib], chi_l[ib]
+
+            K_vals = kernel_K(m_a, m_b, cfg.kernel_a, cfg.kernel_b)
             retain_arr = retention_aligned(m_a, m_b, chi_a, chi_b, cfg.v_esc)
             retained = retain_arr > 0.5
 
-            # Compute remnants (Lousto-Zlochower / Barausse-Rezzolla via engine).
-            M_new = M_rem(m_a, m_b, chi_a, chi_b)
-            chi_new = chi_rem(m_a, m_b, chi_a, chi_b)
-            m_k_parts.append(M_new[retained])
-            chi_k_parts.append(chi_new[retained])
+            # Step 2 — importance weight = c(j, l) · K · P_retain.
+            sym = 0.5 if j == l else 1.0
+            w = sym * K_vals * retained.astype(np.float64)
 
-            # Record events with m1 ≥ m2 convention; swap spins/gens to match.
+            # Remnants for retained-only (zero-weight candidates would
+            # contribute nothing on resample).
+            keep = w > 0
+            if keep.any():
+                M_new = M_rem(m_a[keep], m_b[keep], chi_a[keep], chi_b[keep])
+                chi_new = chi_rem(m_a[keep], m_b[keep], chi_a[keep], chi_b[keep])
+                M_pool_parts.append(M_new)
+                chi_pool_parts.append(chi_new)
+                w_pool_parts.append(w[keep])
+
+            # Event log — all candidates with their weights, retained or not.
             swap = m_a < m_b
             m1 = np.where(swap, m_b, m_a)
             m2 = np.where(swap, m_a, m_b)
@@ -301,13 +326,25 @@ def simulate_cascade(
             g1 = np.where(swap, l, j).astype(np.float64)
             g2 = np.where(swap, j, l).astype(np.float64)
             r = retained.astype(np.float64)
-            block = np.stack([m1, m2, c1, c2, g1, g2, r], axis=1)
+            block = np.stack(
+                [m1, m2, c1, c2, g1, g2, r, sym * K_vals * r], axis=1
+            )
             event_records.append(block)
 
-        if m_k_parts:
+        # Step 3-4 — pool, normalise weights, resample to fixed size.
+        if M_pool_parts:
+            M_pool = np.concatenate(M_pool_parts)
+            chi_pool = np.concatenate(chi_pool_parts)
+            w_pool = np.concatenate(w_pool_parts)
+            W = float(w_pool.sum())
+            if W <= 0:
+                populations[k] = (np.empty(0), np.empty(0))
+                continue
+            p = w_pool / W
+            idx = rng.choice(M_pool.size, size=n_resample, replace=True, p=p)
             populations[k] = (
-                np.concatenate(m_k_parts).astype(np.float64),
-                np.concatenate(chi_k_parts).astype(np.float64),
+                M_pool[idx].astype(np.float64),
+                chi_pool[idx].astype(np.float64),
             )
         else:
             populations[k] = (np.empty(0), np.empty(0))
@@ -315,7 +352,7 @@ def simulate_cascade(
     if event_records:
         merger_events = np.concatenate(event_records, axis=0)
     else:
-        merger_events = np.empty((0, 7), dtype=np.float64)
+        merger_events = np.empty((0, 8), dtype=np.float64)
     return populations, merger_events
 
 
