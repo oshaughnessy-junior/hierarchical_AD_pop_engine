@@ -191,14 +191,15 @@ def solve_implicit(
 
     .. math::
 
-        f_{\\rm dep}(\\epsilon)
-            = \\frac{\\epsilon \\int L[N^*](m, \\chi)\\, dm\\, d\\chi}
-                   {\\int N_{\\rm natal}(m, \\chi)\\, dm\\, d\\chi}
+        f_{\\rm dep} = 1 - \\frac{\\int N^*(m,\\chi)\\,dm\\,d\\chi}
+                                {\\int N_{\\rm natal}(m,\\chi)\\,dm\\,d\\chi}
 
-    This is the principled mapping between the implicit coupling ε and
-    the closed-system particle-MC stopping fraction: backup1 should be
-    run until ``f_dep(ε)`` of its initial pool has merged for an
-    apples-to-apples comparison with the implicit fixed point.
+    **Why not** ``ε·∫L/∫N_natal``: integrating the steady-state equation
+    and using ``∫G = (1/2)·∫L`` (gain counts each pair once; the double
+    integral in L counts it twice) gives
+    ``∫N* = ∫N_natal − (ε/2)·∫L``, so ``ε·∫L/∫N_natal`` overestimates
+    the true depletion by a factor of 2.  The formula above is exact at
+    the Picard fixed point.
     """
     log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
     log_N_natal = response._natal_log_density()
@@ -235,12 +236,12 @@ def solve_implicit(
     loss = loss_density(N, response, v_esc)
     loss_integral = float(jnp.einsum("ij,i,j->", loss, dm_w, dchi_w))
     natal_integral = float(jnp.einsum("ij,i,j->", N_natal, dm_w, dchi_w))
-    # f_dep = ε · ∫L[N*] / ∫N_natal. Note ∫L counts *progenitor* removals;
-    # each merger removes 2 progenitors, so ∫L = 2 · merger_rate. The
-    # bilinear ``gain`` term uses sym=1/2 to undo this double-count, so
-    # ∫L is also the natural unit for "natal mass consumed per unit time"
-    # in the closed-system MC analogue. Clip to [0, 1] for safety.
-    f_natal_depleted = max(0.0, min(1.0, epsilon * loss_integral / max(natal_integral, 1e-30)))
+    n_star_integral = float(jnp.einsum("ij,i,j->", N, dm_w, dchi_w))
+    # f_dep = 1 - ∫N*/∫N_natal.  Integrating the steady-state equation gives
+    # ∫N* = ∫N_natal - (ε/2)·loss_integral, so using ε·loss_integral/∫N_natal
+    # directly overestimates the true depletion by 2×.  The formula below is
+    # exact at the Picard fixed point with no factor-of-2 ambiguity.
+    f_natal_depleted = max(0.0, min(1.0, 1.0 - n_star_integral / max(natal_integral, 1e-30)))
 
     return dict(
         log_N=jnp.log(jnp.maximum(N, 1e-30)),

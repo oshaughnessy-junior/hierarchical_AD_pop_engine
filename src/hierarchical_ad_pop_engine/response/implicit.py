@@ -20,14 +20,25 @@ omits.
 rate constant. ε ≪ 1 leaves the natal pool mostly intact; ε ≈ 1 sets
 the cascade to a fully-developed steady state.
 
-The Picard iteration is implemented as a :func:`jax.lax.while_loop`, so
-the whole solver is ``jax.jit``-traceable end-to-end. Step 3 of
-``demo/PLAN_engine_v2_production.md`` will register a custom VJP at the
-fixed point so AD doesn't unroll the iterations. Until that lands, raw
-``solver="implicit"`` is correct for forward evaluation and gives
-approximately-correct gradients (the unrolled-loop gradient converges to
-the implicit-function-theorem gradient as iteration count rises, but is
-brittle when the loop hasn't fully converged).
+The Picard iteration is implemented as a :func:`jax.lax.while_loop`
+(Step 2) with an implicit-function-theorem VJP registered via a
+hand-rolled ``@jax.custom_vjp`` factory (Step 3 of
+``demo/PLAN_engine_v2_production.md``). Reverse-mode AD
+(``jax.grad``, ``jax.vjp``) solves the transposed linearised system
+
+    (I − ∂F/∂N)ᵀ · v = λ
+
+via GMRES at ``N*``, then pulls back through ``∂F/∂θ``. Forward eval,
+jit, and grad are all supported end-to-end. ``solver="implicit"`` is
+now the right physics *and* the right gradient — safe for NUTS / SVI.
+
+Note: ``jax.lax.custom_root`` was attempted first but raised
+``NotImplementedError`` on ``jax.grad`` due to closure over an
+``equinox.Module`` with mixed static/dynamic fields. The hand-rolled
+``@jax.custom_vjp`` factory (:func:`_make_picard_solve_fn`) sidesteps
+this by making ``response``, ``v_esc``, and ``epsilon`` explicit
+positional arguments and fixing the hyperparameters (``max_iter``,
+``tol``, ``damping``) via :func:`functools.lru_cache`.
 
 The cell-area Jacobian fix (``project_engine_cell_area_fix.md``) is
 applied in :func:`gain_density`: ``_step_one_generation`` returns
@@ -37,6 +48,7 @@ density on the same measure scale as ``N_natal`` and :func:`loss_density`.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import equinox as eqx
@@ -171,18 +183,40 @@ class ImplicitSolveResult(eqx.Module):
     epsilon : Array
         Coupling × time used (echoed for downstream diagnostics).
     n_iter : Array
-        Number of Picard iterations actually run. JAX int32 scalar.
+        Number of Picard iterations actually run. Cast to the float dtype
+        of ``N`` (not int) so that the custom-VJP aux pytree can carry
+        well-defined tangents under AD — JAX's custom-VJP machinery
+        rejects integer tangents in any output, including pass-through
+        aux. Read back with ``int(result.n_iter)`` at the eager boundary.
     final_diff : Array
         ``‖ΔN‖∞`` at the final iteration. Should be ``< tol`` on success.
     loss_integral : Array
-        ``∫ L[N*](m, χ) dm dχ`` at the fixed point.
+        ``∫ L[N*](m, χ) dm dχ`` at the fixed point — diagnostic only.
+        Note: the double integral ``∫∫ K P_retain N* N* dm dχ dm' dχ'``
+        counts each merger pair **twice** (once as (i,j) and once as
+        (j,i)), so this quantity is 2 × the physical merger rate.  Do
+        not use it directly as a depletion fraction; use
+        :attr:`f_natal_depleted` instead.
     natal_integral : Array
         ``∫ N_natal(m, χ) dm dχ``.
     f_natal_depleted : Array
-        ``ε · loss_integral / natal_integral``, clipped to ``[0, 1]``.
-        This is the principled mapping between ε and the closed-system
-        particle-MC stopping fraction (see
-        ``project_engine_implicit_refactor.md`` for the derivation).
+        ``1 − ∫N*(m,χ) dm dχ / ∫N_natal(m,χ) dm dχ``, clipped to
+        ``[0, 1]``.
+
+        This is the fraction of the natal pool depleted by the cascade
+        at the converged fixed point — the principled stopping-fraction
+        for the closed-system particle-MC backstop.
+
+        **Derivation.** Integrating the steady-state equation over
+        ``(m, χ)`` and using ``∫G[N*] = (1/2)·loss_integral``
+        (the gain counts each pair once; the loss double-integral counts
+        it twice) gives::
+
+            ∫N* = ∫N_natal − (ε/2)·loss_integral
+
+        so ``f = 1 − ∫N*/∫N_natal`` exactly at the Picard fixed point.
+        Using ``ε·loss_integral/∫N_natal`` directly would overestimate
+        by a factor of 2.
 
     Notes
     -----
@@ -206,13 +240,262 @@ class ImplicitSolveResult(eqx.Module):
 
 
 # ---------------------------------------------------------------------------
-# Solver.
+# Picard map F — explicit in all arguments for the custom VJP.
+# ---------------------------------------------------------------------------
+def _F_map(
+    N: Array,
+    response: "CoagulationResponse",
+    v_esc_arr: Array,
+    epsilon_arr: Array,
+) -> Array:
+    """Picard RHS: N_natal(θ) + ε·(gain[N, θ] − loss[N, θ]).
+
+    No clipping at 0 here — at the converged fixed point N* ≥ 0 by
+    construction (the forward while_loop clips), so the linearisation
+    used by the IFT backward is evaluated where the clip is inactive
+    and the gradient is correct.  Do **not** use this for the forward
+    solve; use :func:`_picard_while_loop` instead.
+    """
+    log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
+    log_N_natal = response._natal_log_density()
+    N_natal = jnp.exp(log_N_natal)
+    gain = gain_density(N, log_K_mm, response, v_esc_arr)
+    loss = loss_density(N, response, v_esc_arr)
+    return N_natal + epsilon_arr * (gain - loss)
+
+
+# ---------------------------------------------------------------------------
+# Raw Picard while_loop (no AD support; used inside the custom VJP forward).
+# ---------------------------------------------------------------------------
+def _picard_while_loop(
+    response: "CoagulationResponse",
+    v_esc_arr: Array,
+    epsilon_arr: Array,
+    max_iter: int,
+    tol: float,
+    damping: float,
+) -> ImplicitSolveResult:
+    """Damped-Picard iteration via :func:`jax.lax.while_loop`.
+
+    JIT-traceable but not AD-safe in isolation.  Wrap via
+    :func:`_make_picard_solve_fn` (which registers the IFT VJP) before
+    calling inside ``jax.grad`` / ``jax.vjp``.
+    """
+    log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
+    log_N_natal = response._natal_log_density()
+    N_natal = jnp.exp(log_N_natal)
+
+    grid = response.grid
+    dm_w = _dm_log_weights(grid.m, grid.log_m)
+    dchi_w = _dchi_weights(grid.chi)
+    tol_arr = jnp.asarray(tol, dtype=N_natal.dtype)
+    max_iter_arr = jnp.asarray(max_iter, dtype=jnp.int32)
+
+    def F(N):
+        g = gain_density(N, log_K_mm, response, v_esc_arr)
+        l = loss_density(N, response, v_esc_arr)
+        return jnp.maximum(N_natal + epsilon_arr * (g - l), 0.0)
+
+    init_carry = (
+        N_natal,
+        jnp.zeros((), dtype=jnp.int32),
+        jnp.asarray(jnp.inf, dtype=N_natal.dtype),
+    )
+
+    def cond_fun(carry):
+        _, n_iter, diff = carry
+        return (diff > tol_arr) & (n_iter < max_iter_arr)
+
+    def body_fun(carry):
+        N, n_iter, _ = carry
+        # damped Picard: N_new = (1 - d)·N + d·F(N) = N - d·(N - F(N))
+        N_new = N - damping * (N - F(N))
+        diff = jnp.max(jnp.abs(N_new - N))
+        return (N_new, n_iter + 1, diff)
+
+    N_star, n_iter_final, diff_final = jax.lax.while_loop(
+        cond_fun, body_fun, init_carry
+    )
+
+    # Post-convergence diagnostics.
+    loss_final = loss_density(N_star, response, v_esc_arr)
+    loss_integral = jnp.einsum("ij,i,j->", loss_final, dm_w, dchi_w)
+    natal_integral = jnp.einsum("ij,i,j->", N_natal, dm_w, dchi_w)
+    n_star_integral = jnp.einsum("ij,i,j->", N_star, dm_w, dchi_w)
+    # f = 1 - ∫N*/∫N_natal.  Derived by integrating the steady-state
+    # equation: ∫G = (1/2)·loss_integral (each pair counted once in G,
+    # twice in the double integral of L), so
+    #   ∫N* = ∫N_natal - (ε/2)·loss_integral  →  f = 1 - ∫N*/∫N_natal.
+    # Using ε·loss_integral/∫N_natal directly would overestimate by 2×.
+    f_natal_depleted = jnp.clip(
+        1.0 - n_star_integral / jnp.maximum(natal_integral, 1e-30),
+        0.0,
+        1.0,
+    )
+
+    return ImplicitSolveResult(
+        N=N_star,
+        log_N=jnp.log(jnp.maximum(N_star, 1e-30)),
+        epsilon=epsilon_arr,
+        n_iter=n_iter_final.astype(N_natal.dtype),
+        final_diff=diff_final,
+        loss_integral=loss_integral,
+        natal_integral=natal_integral,
+        f_natal_depleted=f_natal_depleted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AD-safe solver factory — registers IFT VJP via @jax.custom_vjp.
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=16)
+def _make_picard_solve_fn(max_iter: int, tol: float, damping: float):
+    """Return an AD-safe Picard solver for fixed hyperparameters.
+
+    The returned callable carries a ``@jax.custom_vjp`` that implements
+    the implicit-function-theorem backward pass.
+
+    Using :func:`functools.lru_cache` keyed on ``(max_iter, tol,
+    damping)`` means that calls with the same hyperparameters return
+    the **same Python function object**.  ``jax.jit`` caches compiled
+    XLA kernels per function identity, so repeated calls with the same
+    hyperparameters do not retrace.
+
+    Why a factory instead of a single module-level
+    ``@jax.custom_vjp``?  ``@jax.custom_vjp`` cannot take static
+    (non-JAX-array) arguments without either tracing them as arrays
+    (introducing unnecessary trace instability) or closing over them
+    (which is exactly what this factory does).  The cache ensures we
+    don't pay new-closure overhead on every ``solve_implicit_fixed_point``
+    call.
+
+    Only ``response``, ``v_esc``, and ``epsilon`` carry gradients.
+    ``max_iter``, ``tol``, and ``damping`` are hyperparameters fixed at
+    trace time and are *not* differentiated.
+    """
+
+    @jax.custom_vjp
+    def _solve(
+        response: "CoagulationResponse",
+        v_esc_arr: Array,
+        epsilon_arr: Array,
+    ) -> ImplicitSolveResult:
+        return _picard_while_loop(
+            response, v_esc_arr, epsilon_arr, max_iter, tol, damping
+        )
+
+    def _solve_fwd(
+        response: "CoagulationResponse",
+        v_esc_arr: Array,
+        epsilon_arr: Array,
+    ):
+        result = _solve(response, v_esc_arr, epsilon_arr)
+        residuals = (result.N, response, v_esc_arr, epsilon_arr)
+        return result, residuals
+
+    def _solve_bwd(residuals, g: ImplicitSolveResult):
+        """IFT VJP at the Picard fixed point.
+
+        Given cotangent ``g`` on the :class:`ImplicitSolveResult`, return
+        cotangents on ``(response, v_esc_arr, epsilon_arr)``.
+
+        The implicit-function theorem for ``N* = F(N*, θ)``::
+
+            dN*/dθ = (I − ∂F/∂N)⁻¹ · ∂F/∂θ
+
+        In VJP (pull-back) form with incoming cotangent λ on N*:
+
+        1. Solve  ``(I − J_N)ᵀ · v = λ``  via GMRES  (J_N = ∂F/∂N|_{N*}).
+        2. ``cotangent_θ = vjp_θ(F(N*, ·))(v)``
+
+        The GMRES operator is a matvec-only call — we never form
+        ``(N_m·N_χ, N_m·N_χ)`` explicitly.  Each matvec is one VJP of
+        :func:`_F_map` with respect to N (one gain + one loss evaluation).
+        """
+        N_star, response, v_esc_arr, epsilon_arr = residuals
+
+        # ── Aggregate cotangent on N_star from result fields ────────────
+        # N field: direct cotangent.
+        # log_N field: chain rule log(max(N, 1e-30)) → dlog_N/dN = 1/N*.
+        # epsilon field: echoed verbatim → contributes to cotangent_eps below.
+        # natal_integral: ∫ N_natal dm dχ — no N* dependence, handled below.
+        # n_iter, final_diff: no differentiable path; cotangent is effectively 0.
+        # loss_integral, f_natal_depleted: depend on N* via loss_density; for
+        #   now treated as zero (inference losses never differentiate through
+        #   diagnostics — they use N / log_N exclusively).  TODO: add when needed.
+        g_N_star = g.N + g.log_N / jnp.maximum(N_star, 1e-30)
+
+        # ── GMRES: solve (I − J_N)ᵀ v = g_N_star ───────────────────────
+        shape = N_star.shape
+
+        def jac_N_T_v(v: Array) -> Array:
+            """(∂F/∂N)ᵀ v  via VJP of _F_map wrt N at N_star."""
+            _, vjp_fn = jax.vjp(
+                lambda N: _F_map(N, response, v_esc_arr, epsilon_arr),
+                N_star,
+            )
+            return vjp_fn(v)[0]
+
+        def linear_op_T_flat(v_flat: Array) -> Array:
+            v = v_flat.reshape(shape)
+            return (v - jac_N_T_v(v)).reshape(-1)
+
+        v_flat, _ = jax.scipy.sparse.linalg.gmres(
+            linear_op_T_flat,
+            g_N_star.reshape(-1),
+            tol=1e-7,
+            atol=0.0,
+            restart=20,
+            maxiter=200,
+        )
+        v = v_flat.reshape(shape)
+
+        # ── Propagate: cotangent_θ = vjp_θ(F(N*, ·))(v) ────────────────
+        _, vjp_theta_fn = jax.vjp(
+            lambda resp, ve, eps: _F_map(N_star, resp, ve, eps),
+            response,
+            v_esc_arr,
+            epsilon_arr,
+        )
+        cotangent_response, cotangent_v_esc, cotangent_eps = vjp_theta_fn(v)
+
+        # epsilon field of ImplicitSolveResult is epsilon_arr echoed verbatim;
+        # its cotangent feeds back directly into cotangent_eps.
+        cotangent_eps = cotangent_eps + g.epsilon
+
+        # natal_integral = ∫ N_natal dm dχ depends only on response, not N*.
+        # Gradient bypasses the IFT and flows directly into cotangent_response.
+        grid = response.grid
+        dm_w = _dm_log_weights(grid.m, grid.log_m)
+        dchi_w = _dchi_weights(grid.chi)
+        _, vjp_natal_fn = jax.vjp(
+            lambda resp: jnp.einsum(
+                "ij,i,j->",
+                jnp.exp(resp._natal_log_density()),
+                dm_w,
+                dchi_w,
+            ),
+            response,
+        )
+        ct_response_natal = vjp_natal_fn(g.natal_integral)[0]
+        cotangent_response = jax.tree_util.tree_map(
+            jnp.add, cotangent_response, ct_response_natal
+        )
+
+        return (cotangent_response, cotangent_v_esc, cotangent_eps)
+
+    _solve.defvjp(_solve_fwd, _solve_bwd)
+    return _solve
+
+
+# ---------------------------------------------------------------------------
+# Public solver.
 # ---------------------------------------------------------------------------
 def solve_implicit_fixed_point(
     response: "CoagulationResponse",
     v_esc: Array,
     *,
-    epsilon: Array | float = 1.0,
+    epsilon: "Array | float" = 1.0,
     max_iter: int = 200,
     tol: float = 1e-7,
     damping: float = 0.5,
@@ -242,79 +525,30 @@ def solve_implicit_fixed_point(
 
     Notes
     -----
-    The Picard loop is a :func:`jax.lax.while_loop` so the whole solver
-    is ``jax.jit``-traceable end-to-end. Step 3 of
-    ``demo/PLAN_engine_v2_production.md`` will register a custom VJP at
-    the fixed point so AD won't unroll the iterations; until then,
-    gradients through this function are mathematically correct only as
-    long as the loop converges (a non-converged loop produces noisy
-    gradients that scale with iteration count).
+    Reverse-mode AD (``jax.grad``, ``jax.vjp``) is supported via an
+    implicit-function-theorem VJP registered on the forward Picard
+    iteration.  The backward pass solves the linearised system
 
-    ``max_iter`` is taken statically — it is the upper bound on the
-    ``while_loop`` step count, not a runtime knob. Pass it as a Python
-    ``int``; the loop terminates early on ``final_diff < tol``.
+    .. math::
+
+        (I - \\partial F / \\partial N)^{\\mathsf T}\\, v = \\lambda
+
+    via GMRES at ``N*`` and then pulls back through
+    ``\\partial F / \\partial \\theta``.  This gives exact IFT gradients
+    regardless of the number of Picard iterations taken by the forward
+    pass — far cheaper and more accurate than unrolling the loop.
+
+    ``max_iter``, ``tol``, and ``damping`` are static hyperparameters
+    (not differentiated). Pass them as Python scalars; they are fixed
+    at ``jax.jit`` trace time via :func:`functools.lru_cache`.
     """
-    log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
-    log_N_natal = response._natal_log_density()
-    N_natal = jnp.exp(log_N_natal)
-
-    grid = response.grid
-    dm_w = _dm_log_weights(grid.m, grid.log_m)
-    dchi_w = _dchi_weights(grid.chi)
-
-    epsilon_arr = jnp.asarray(epsilon)
-    v_esc_arr = jnp.asarray(v_esc)
-    tol_arr = jnp.asarray(tol, dtype=N_natal.dtype)
-    max_iter_arr = jnp.asarray(max_iter, dtype=jnp.int32)
-
-    # Carry: (N, n_iter, final_diff). Initial final_diff = +inf ensures
-    # ``cond_fun`` is True at entry so the body runs at least once even
-    # in the degenerate ε = 0 case (one iter, then exits with diff = 0).
-    init_carry = (
-        N_natal,
-        jnp.zeros((), dtype=jnp.int32),
-        jnp.asarray(jnp.inf, dtype=N_natal.dtype),
-    )
-
-    def cond_fun(carry):
-        _, n_iter, final_diff = carry
-        return (final_diff > tol_arr) & (n_iter < max_iter_arr)
-
-    def body_fun(carry):
-        N, n_iter, _ = carry
-        gain = gain_density(N, log_K_mm, response, v_esc_arr)
-        loss = loss_density(N, response, v_esc_arr)
-        N_rhs = jnp.maximum(N_natal + epsilon_arr * (gain - loss), 0.0)
-        N_new = (1.0 - damping) * N + damping * N_rhs
-        diff = jnp.max(jnp.abs(N_new - N))
-        return (N_new, n_iter + 1, diff)
-
-    N, n_iter, final_diff = jax.lax.while_loop(cond_fun, body_fun, init_carry)
-
-    # Final loss evaluation at the converged N* — needed for f_natal_depleted.
-    loss_final = loss_density(N, response, v_esc_arr)
-    loss_integral = jnp.einsum("ij,i,j->", loss_final, dm_w, dchi_w)
-    natal_integral = jnp.einsum("ij,i,j->", N_natal, dm_w, dchi_w)
-    f_natal_depleted = jnp.clip(
-        epsilon_arr * loss_integral / jnp.maximum(natal_integral, 1e-30),
-        0.0,
-        1.0,
-    )
-
-    return ImplicitSolveResult(
-        N=N,
-        log_N=jnp.log(jnp.maximum(N, 1e-30)),
-        epsilon=epsilon_arr,
-        n_iter=n_iter,
-        final_diff=final_diff,
-        loss_integral=loss_integral,
-        natal_integral=natal_integral,
-        f_natal_depleted=f_natal_depleted,
-    )
+    _solve = _make_picard_solve_fn(max_iter, tol, damping)
+    return _solve(response, jnp.asarray(v_esc), jnp.asarray(epsilon))
 
 
 __all__ = [
     "ImplicitSolveResult",
+    "_F_map",
     "gain_density",
     "loss_density",
     "solve_implicit_fixed_point",
