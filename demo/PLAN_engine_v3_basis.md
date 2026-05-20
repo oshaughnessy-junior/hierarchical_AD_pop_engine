@@ -143,74 +143,293 @@ Cartesian product.
 
 **No physics yet at this step.** Just numerics on `basis/`.
 
-### Step 2 — Natal density on basis (0.5 session)
+### Step 2 — Natal density on basis (DONE 2026-05-19; log-path deprecated 2026-05-20)
 
-Project the natal Gaussian (or Talbot-Thrane PL+Peak in m) onto the
-basis:
+Module: ``src/hierarchical_ad_pop_engine/basis/natal.py``.
 
-```python
-def project_natal(response: CoagulationResponse, basis: TensorProductBasis) -> Array:
-    """Project ``log N_natal(m, χ)`` onto basis via Gauss-Lobatto quadrature.
-    Returns ``n_natal_α`` of shape (n_basis_m, n_basis_χ).
-    """
+**Production path:** :func:`project_natal_density` — LINEAR-space
+projection of ``N_natal``.  Works for any ``natal_mass_kind``.  Slight
+Gibbs ringing near sharp boundaries (e.g. Planck taper), bounded well
+below 1% of peak; small negatives near the boundary are clipped at
+zero downstream (matching v2's Picard solver behaviour).
+
+**Deprecated, retained in-module:** :func:`project_natal_log_density`
++ :func:`evaluate_natal_density_from_log` — LOG-space projection.  Two
+iterations were attempted before deprecation:
+
+1. *No input floor.*  Lets the polynomial fit the analytic
+   ``log N`` directly.  Achieves ``rel_err ≈ 1e-12`` at ``n_basis_m =
+   24`` for Gaussian — but this is "measuring an irrelevant thing
+   well": the polynomial is reproducing ``log N`` out to ``≈ -1e4`` at
+   the support boundary, six orders past float64 underflow, no
+   observable sensitivity.  Catastrophic ringing for any natal with a
+   true ``-∞`` inside the support (PL+Peak Planck taper).
+2. *Symmetric floor on both ends.*  Input clipped at ``_LOG_N_FLOOR =
+   -50``; output re-clipped before ``exp``.  Physically honest framing,
+   but the input clip introduces a C⁰ kink at the floor crossing and
+   Legendre's L² best-fit develops a stuck-amplitude overshoot near
+   the kink that bleeds into the peak region.  Empirically
+   (``outputs/probe_floored_log_projection.py``) ``rel_err ≈ 0.2``
+   even at ``n_basis_m = 128``.  Not useful at any practical
+   resolution.
+
+The linear path's accuracy is two orders of magnitude better than v2's
+bilinear-interp representation error at ``n_basis_m = 128``, so the
+deprecation costs no production capability.  Log-projection code is
+preserved in-module (with deprecation notices in docstrings) for
+possible future revival under a smoother floor design — e.g.
+softplus-style soft clip, or a compactly-supported polynomial basis
+such as Bernstein.
+
+**Realistic convergence (calibrated 2026-05-19 against the numpy
+mirror at ``outputs/validate_natal_projection.py``):**
+
+| natal kind                | path   | n_basis_m | rel_err     |
+|---------------------------|--------|-----------|-------------|
+| Gaussian (μ=8, σ=1)       | linear | 64        | 2e-3        |
+| Gaussian (μ=8, σ=1)       | linear | 128       | 1e-5        |
+| PL+Peak (Stage 1 θ\*)     | linear | 64        | 1e-3        |
+| PL+Peak (Stage 1 θ\*)     | linear | 128       | 3e-5        |
+| Gaussian (μ=8, σ=1)       | log, symmetric floor *(DEPRECATED)* | 128 | ≈ 2e-1 |
+
+The plan's original "1e-9 at n=64" target was aspirational; what is
+**actually** achievable for the linear path is dominated by the narrow
+Gaussian peak in log-mass coordinates (σ_ξ ≈ 0.06 for the PL+Peak's
+Gaussian peak).  Even so, the basis at n=128 (PL+Peak rel_err 3e-5)
+is two orders of magnitude better than v2's bilinear-interp
+representation error ``~2e-3`` — so Step 2 is a strict improvement and
+the original gating intent (basis ≥ v2 representation accuracy) is
+satisfied.
+
+**Stage 1 inference recommendation:** ``project_natal_density``
+(linear) with ``n_basis_m = 128, n_basis_chi = 32``.
+
+Tests live at ``tests/test_basis_natal.py``; thresholds per the table
+above, all gated by ``jax_enable_x64`` (matching the v2 test
+convention).  The two log-projection tests are present but
+``@pytest.mark.skip``-ed pending revival.
+
+### Step 3 — Remnant-scatter projection tensor (refactor; ~2 sessions)
+
+The big engineering piece.  The current `_step_one_generation` does a
+bilinear scatter of (M_rem, χ_rem) onto the (m, χ) grid; the basis
+analog is the rank-3 tensor ``T(θ)`` such that
+
+  G_γ = (1/2) Σ_α Σ_β K_{αβ}(θ) P_{αβ}(θ) n_α n_β T_{γ; α,β}(θ)
+
+where α, β index progenitor basis-coefficient pairs (m1, χ1) × (m2,
+χ2) and γ indexes the remnant basis.  ``T_{γ;α,β}(θ)`` is the
+basis-projection coefficient of the θ-dependent remnant map
+``(m1, m2, χ1, χ2) → (M_rem(·;θ), χ_rem(·;θ))``:
+
+  T_{γ; α,β}(θ) = ∫∫∫∫ φ_α(m1, χ1) φ_β(m2, χ2)
+                  · φ_γ(M_rem(m1,m2,χ1,χ2;θ), χ_rem(m1,m2,χ1,χ2;θ))
+                  dm1 dχ1 dm2 dχ2
+
+with Gauss-Lobatto quadrature at order ≥ 2·n_basis to maintain
+Galerkin orthogonality.  **This is the critical correctness step**;
+insufficient quadrature order silently reintroduces a measure mismatch
+(the v2 midpoint-vs-trapezoid bug pattern, but in a basis-shaped
+disguise).
+
+#### T(θ) is θ-dependent (no Stage 1 caching shortcut)
+
+The previous draft proposed absorbing ``K_αβ · P_αβ`` into ``T`` so
+that ``T`` would be θ-independent and could be cached across gradient
+steps.  **This was wrong even at Stage 1.**  Gradients of observables
+w.r.t. natal parameters (μ, σ, α_PL, β_kernel, …) flow through the
+remnant maps and the kernel, both of which sit inside ``T(θ)``.  The
+solver must:
+
+* Rebuild ``T(θ)`` on every forward call (no cross-call cache).
+* Differentiate through ``T(θ)`` for the cotangent pull-back (Step 4
+  IFT VJP).  ``jax.grad`` does this automatically as long as the
+  physics functions are AD-friendly — the retention cliff
+  (see below) is the only non-smooth piece and needs explicit care.
+
+Implication for performance: each gradient evaluation pays the
+``T``-build cost.  At ``n_basis_solve = 32×16``, the build is a
+quadruple Gauss-Lobatto integral with quadrature order ≈ 64 per axis
+and outer product onto a (512, 512, 512) tensor; on a modern CPU
+this is seconds.  On GPU, ms.  Acceptable for inference loops.
+
+#### Two-resolution architecture
+
+Step 2 sized the natal projection at ``n_basis_density = (128, 32)``
+to match v2's representation accuracy.  That resolution is wasteful
+for the propagator: ``T`` at ``(128·32)³ = 6.9e10`` entries is 550 GB
+at float64, never going to fit in memory and the einsum cost scales
+the same way.  ``T`` is instead built at a smaller, separate
+resolution ``n_basis_solve = (n_m_solve, n_χ_solve)``.  Density
+representation and solver discretisation are now two independent
+knobs:
+
+```
+natal pipeline
+      │ project at n_basis_density = (128, 32)        Step 2
+      ▼
+  n_natal_density  (n_m_d × n_χ_d coeffs)
+      │ restrict (modal truncation, exact for Legendre)
+      ▼
+  n_natal_solver   (n_m_s × n_χ_s coeffs)             Step 3
+      │ Picard iteration on T(θ) at solver resolution Step 4
+      ▼
+  n_star_solver
+      │ prolong (modal zero-pad, exact)
+      ▼
+  n_star_density   (n_m_d × n_χ_d coeffs)
+      │ evaluate observables at high resolution
+      ▼
+  dC/dm₁, dC/dM_c, …                                  Step 5
 ```
 
-Validation against the existing grid-eval natal density: evaluate the
-basis-projected natal on a dense (200, 200) test grid; relative error
-< 1e-9 vs the analytic Talbot-Thrane evaluation. This is the cleanest
-test that the projection / evaluation path is correct before we add
-any nonlinearity.
+Restrict and prolong are exact in the Legendre modal sense — they are
+truncation / zero-padding of orthogonal coefficient arrays at the
+same physical interval.  No quadrature, no interpolation error
+introduced by the operator itself.  All error sits in the truncation:
+modes ``n ∈ [n_solve, n_density)`` are dropped during restriction.
 
-### Step 3 — Remnant-scatter projection tensor (1.5 sessions)
+**Implementation form:** restrict and prolong are **class methods on
+``TensorProductBasis``** — ``self.restrict_to(coeffs, target_basis)``
+and ``self.prolong_to(coeffs, target_basis)``.  Not separate
+free-standing functions in a ``basis/restriction.py`` module.
+Class methods keep the validity checks (same physical interval,
+target is a strict modal subset/superset of source) close to the
+representation they're operating on and avoid style/logic drift
+across modules.  Decision 2026-05-20.
 
-The big engineering piece. The current `_step_one_generation` does a
-bilinear scatter of (M_rem, χ_rem) onto the (m, χ) grid; the basis
-analog is a precomputed tensor `T` such that
+For a smooth natal density (Gaussian-like) those high modes decay
+exponentially with ``n`` and the truncation is essentially free.  For
+the Talbot-Thrane PL+Peak, the Planck taper drives modes ``n ≳ 30`` to
+algebraic decay; we expect some truncation error and **the headline
+verification is whether the solver-resolution result, prolonged back
+to density resolution, still beats v2 in observable JS**.  This is the
+refactor risk the architecture buys; Step 5 is the test.
 
-  G_γ = (1/2) Σ_α Σ_β K_{αβ} P_{αβ} n_α n_β T_{γ; α,β}
+#### Memory at chosen resolution
 
-where α, β index progenitor basis-coefficient pairs (m1, χ1) × (m2, χ2)
-and γ indexes the remnant basis. `T_{γ; α,β}` is the basis-projection
-coefficient of the deterministic remnant map (m1, m2, χ1, χ2) →
-(M_rem(·), χ_rem(·)):
+| n_m_s | n_χ_s | n_basis_solve | T entries  | float64    |
+|-------|-------|---------------|------------|------------|
+| 24    | 8     | 192           | 7.1 × 10⁶  | 57 MB      |
+| 32    | 16    | 512           | 1.3 × 10⁸  | 1.1 GB     |
+| 48    | 16    | 768           | 4.5 × 10⁸  | 3.6 GB     |
+| 64    | 16    | 1024          | 1.1 × 10⁹  | 8.6 GB     |
 
-  T_{γ; α,β} = ∫∫∫∫ φ_α(m1, χ1) φ_β(m2, χ2)
-                · φ_γ(M_rem(m1,m2,χ1,χ2), χ_rem(m1,m2,χ1,χ2))
-                dm1 dχ1 dm2 dχ2
+Default ``n_basis_solve = (32, 16)``.  Easy to inspect, builds in
+seconds, leaves headroom on a workstation.  We can scale up if Step 5
+shows the solver resolution is the binding error; the architecture
+makes the bump cheap.
 
-with Gauss-Lobatto quadrature at order ≥ 2·n_basis to maintain Galerkin
-orthogonality. **This is the critical correctness step**; insufficient
-quadrature order silently reintroduces a measure mismatch (the v2
-midpoint-vs-trapezoid bug pattern, but in a basis-shaped disguise).
+#### Retention cliff
 
-Stage 1 simplification: `P_retain ≡ 1` to ~10⁻⁵ at v_esc = 1000 km/s
-for aligned-only; bake into T directly (i.e., absorb the K_αβ P_αβ
-factors into a single precomputed (n_basis², n_basis²) operator and
-the remnant-coupling tensor is then independent of θ — major speedup).
-Validate the constant-P_retain assumption with a one-off numerical
-sweep over the Stage 1 mass and spin ranges; report max(1 − P_retain)
-in the test output.
+The hard cutoff ``P_retain = 1[v_kick < v_esc]`` introduces a true
+discontinuity in the integrand for ``T``.  Two options were
+considered:
 
-**Storage**: at n_basis = 32 per axis, `T` is
-`(32·32)² · (32·32) = 1024² · 1024 ≈ 1 GB` at float64. Either:
-* (preferred) Build T at float32 (~500 MB), upcast individual matvec
-  outputs to float64 for the Picard iteration.
-* Or compute T on the fly per Picard iteration (10× slower forward,
-  no storage). Decide after benchmarking.
+(a) **Soft-sigmoid retention** ``P_retain(v_kick) =
+    σ((v_esc - v_kick) / w)`` with width ``w`` set as a fraction
+    of ``v_esc``.  Smooth integrand, clean AD.
 
-**Acceptance:**
+(b) **Hard cutoff, projected as-is.**  Galerkin-projects a
+    discontinuity → fixed-amplitude Gibbs ringing in ``T``.
+    Same failure pattern as the deprecated log-projection;
+    rules itself out at modest resolution.
+
+**Decision: (a).**  Two parameters:
+
+* ``v_esc`` — physics threshold; Stage 1 **default 300 km/s**, the
+  compromise across AGN-disk / NSC / mid-density host regimes
+  (Richard's typical working range).  Exposed in θ so inference can
+  vary it per cluster type when needed.  Previous "v_esc = ∞ at
+  Stage 1" framing was wrong — at v_esc = 300 km/s the sigmoid is
+  active for the high-v_kick tail of aligned-spin progenitors and
+  the retention is materially below 1 there.
+* ``w = w_over_v_esc · v_esc`` — sigmoid sharpness, **parameterized
+  as a fraction of v_esc, never as an absolute km/s.** Default
+  ``w_over_v_esc = 1.0``, expected range ``[1.0, 2.0]``.  Rule of
+  thumb (Richard 2026-05-20): "w is a fraction of v_esc (the
+  structure providing confinement is extended) — a good rule of
+  thumb is of order 1-2 * v_esc, so never an absolute scale."  The
+  physical broadening of the retention boundary scales with the
+  host's escape velocity itself; an artificially narrow w (say
+  0.1 · v_esc) is both unphysical and triggers the same
+  Galerkin-Gibbs failure as a hard cutoff.
+
+The retention sigmoid is **active in Stage 1**, not dormant.
+
+API signature: ``retention_fn(v_kick, v_esc, w_over_v_esc=1.0)``.
+Never pass ``w=<km/s>``.  When Stage 2+ fits ``w_over_v_esc``, it
+enters θ with a prior on ``[1.0, 2.0]``.
+
+Task #24 (sweep) targets ``w_over_v_esc ∈ {1.0, 1.5, 2.0}`` over the
+Stage 1 mass and spin ranges; observable JS should be insensitive
+to the choice (< 1e-4) at fiducial Stage 1 θ.  If sensitive, the
+chosen quadrature order in T was too low and needs bumping.
+
+#### Acceptance tests at n_basis_solve
+
 * `test_T_symmetric_in_α_β` — `T_{γ;α,β} = T_{γ;β,α}` to 1e-12.
-  Encodes the bosonic / unordered-pair structure.
+  Encodes the bosonic / unordered-pair structure; same failure mode
+  as the v2 j≠l double-count.
 * `test_T_conserves_count` — `Σ_γ T_{γ;α,β} · (basis weight on γ) =
-  1` to 1e-9 for every (α, β) with both progenitors in-grid. This is
-  the Galerkin restatement of "mass conservation through the scatter":
+  1` to 1e-9 for every (α, β) with both progenitors in-grid.  The
+  Galerkin restatement of "mass conservation through the scatter":
   every progenitor pair lands somewhere in remnant space.
+* `test_restriction_prolongation_identity` — for any Legendre
+  coefficient array ``c`` at the solver basis, ``restrict(prolong(c))
+  = c`` to machine precision.  Confirms the modal operators are
+  one-sided inverses.
 * `test_T_matches_grid_scatter` — for a basis projection of a known
   natal density and a fixed-θ kernel, the basis gain term
-  `G = ½ Σ_αβ K_αβ n_α n_β T_γ;αβ` evaluated on a dense grid agrees
-  with the v2 grid `_step_one_generation` to JS < 1e-4 on `dC/dm_f`.
-  **This is the headline parity check** that says the basis solver
-  shares the same physics as the v2 solver up to discretisation.
+  ``G = ½ Σ_αβ K_αβ n_α n_β T_γ;αβ``, prolonged to density resolution
+  and evaluated on a dense grid, agrees with the v2 grid
+  `_step_one_generation` to JS < 1e-4 on `dC/dm_f`.  **Headline
+  parity check** that says the basis solver shares the same physics
+  as the v2 solver up to discretisation.
+* `test_T_grad_finite_against_fd` — `jax.grad(Σ_γ T_γ;α,β · ψ_γ)(θ)`
+  matches central FD at low resolution (24×8) to rtol 1e-4.
+  Confirms AD flows through `T(θ)`; required for Step 4 IFT.
+
+#### Forward-looking constraints (don't straightjacket future refactors)
+
+Two refactors are explicitly **out of scope for v3 ship** but the Step
+3 API must not foreclose them.  Captured 2026-05-20 from Richard:
+"actionable now: don't straightjacket us re basis."  See also
+[[feedback_dont_straightjacket_basis]] memory.
+
+(i) **Split-basis projection for narrow seed populations.**  Eventually
+    the seeding population's depletion needs a different basis from
+    the merger continuum — e.g. δ-spin natals, or a narrow mass spike
+    thinner than the LGL node spacing.  The projection becomes
+    ``P = P_seed ⊕ P_continuum``.  An LGL polynomial basis cannot
+    represent these without Runge-Gibbs pollution, and a uniform
+    refinement of n_basis to cover them is wasteful.
+
+    **API rule:** solver code must address basis objects through the
+    methods (``project``, ``evaluate``, ``inner_product``,
+    ``restrict_to``, ``prolong_to``) and must not assume tensor-product
+    structure beyond what those methods expose.  Do not import
+    ``TensorProductBasis`` from solver modules; pass an instance in.
+    A future ``DirectSumBasis(SeedBasis, ContinuumBasis)`` must be a
+    drop-in replacement.
+
+(ii) **Brute-force C[N,N] as memory backstop.**  T storage is
+     ``O(n_basis³)`` — 1.1 GB at (32, 16), 8.6 GB at (64, 16),
+     70 GB at (64, 32).  If higher mass or spin resolution is
+     ever required, the brute-force path — recompute
+     ``C[N, N](χ_γ, m_γ)`` per output node by direct 4-D quadrature —
+     scales as ``O(n_basis · n_quad⁴)`` flops with ``O(n_basis)``
+     storage.  Trades flops for memory; viable when the wall hits.
+
+     **API rule:** the solver's Picard iteration consumes a callable
+     ``gain_fn(coeffs, theta) -> coeffs`` and does not assume a
+     T-tensor contraction recipe.  Step 3 ships ``TTensorGain``; a
+     future ``BruteForceGain`` swap-in must require zero changes to
+     the Picard loop or the IFT VJP.
+
+These constraints add no implementation cost to Step 3 itself — they
+just say "don't hardcode ``TensorProductBasis`` and don't hardcode
+the T-tensor contraction" in the surrounding solver glue.
 
 ### Step 4 — Picard map and IFT VJP on coefficients (1 session)
 
