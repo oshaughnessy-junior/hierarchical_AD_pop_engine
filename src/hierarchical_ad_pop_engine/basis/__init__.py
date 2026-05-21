@@ -47,6 +47,12 @@ from .natal import (
     project_natal_density,
     project_natal_log_density,  # DEPRECATED — see basis/natal.py
 )
+from .remnant_tensor import (
+    RemnantTensorTheta,
+    build_remnant_tensor,
+    make_t_tensor_gain,
+    retention_sigmoid,
+)
 from .tensor import TensorProductBasis
 
 # project_natal_log_density / evaluate_natal_density_from_log are deprecated
@@ -62,4 +68,8 @@ __all__ = [
     "evaluate_natal_density",
     "project_natal_log_density",
     "evaluate_natal_density_from_log",
+    "RemnantTensorTheta",
+    "build_remnant_tensor",
+    "make_t_tensor_gain",
+    "retention_sigmoid",
 ]

@@ -53,9 +53,23 @@ def chi_rem(m1: Array, m2: Array, chi1: Array, chi2: Array) -> Array:
     """Dimensionless remnant spin (aligned-spin progenitors, Barausse-Rezzolla 2009).
 
     Returns a value bounded in ``[-1, 1]`` for physical inputs.
+
+    .. warning::
+        **Convention: m1 ≥ m2 with χ1 the heavier-mass spin.**  The
+        Barausse-Rezzolla formula weights ``χ1`` by 1 and ``χ2`` by
+        ``q² = (m_light/m_heavy)²``, so the formula is NOT symmetric
+        under ``(m1, χ1) ↔ (m2, χ2)`` despite the ``q = min/max``
+        mass ratio.  Callers must canonicalise the spin labels
+        themselves; this function does not.
+
+        ``v_kick_aligned`` canonicalises internally, but this one
+        does not — preserved for differentiability semantics and
+        cheap call sites (callers like
+        :func:`response.coagulation._step_one_generation` and
+        :mod:`basis.remnant_tensor` do the swap once outside).  See
+        memory ``project_chi_rem_asymmetry_finding`` for the
+        history.
     """
-    # Convention: m1 >= m2 inside the engine, but the formula is symmetric
-    # if we use q = min/max.
     q = jnp.minimum(m1, m2) / jnp.maximum(m1, m2)
     eta_val = q / jnp.square(1.0 + q)
     l_val = _l(q, eta_val, chi1, chi2)

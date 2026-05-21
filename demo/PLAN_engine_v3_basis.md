@@ -211,6 +211,23 @@ convention).  The two log-projection tests are present but
 
 ### Step 3 — Remnant-scatter projection tensor (refactor; ~2 sessions)
 
+**Status 2026-05-20:** Step 3a (`restrict_to` / `prolong_to`) DONE and
+green.  Step 3c (retention sigmoid spot-check) DONE — see
+``outputs/probe_retention_sigmoid.py``; at Stage 1 v_esc = 300 km/s,
+``w_over_v_esc ∈ {1.0, 1.5, 2.0}`` gives smooth retention (⟨P⟩ ≈ 0.34,
+0.37, 0.39 vs hard 0.32), finite ∂⟨P⟩/∂v_esc and ∂⟨P⟩/∂(w/v_esc),
+sigmoid width O(300 km/s) broader than per-LGL-node Δv_kick.  Step 3d
+(`build_remnant_tensor`) DONE 2026-05-20 — see
+``src/hierarchical_ad_pop_engine/basis/remnant_tensor.py``.  Symmetry
+acceptance test (3.0e-11 abs / ~1e-15 rel at n_basis=(8,4)) and AD-vs-FD
+on every θ field (rel ≈ 1e-9 on kernel_a) green; pytest scaffold at
+``tests/test_basis_remnant_tensor.py``.  Caught a latent
+``chi_rem`` asymmetry under (m1,χ1)↔(m2,χ2) (the formula carries an
+implicit m1≥m2 convention that v2 was not enforcing) and fixed it
+at the T call site via canonical ordering — same pattern as the v2
+j≠l double-count discovery.  Step 3e (full acceptance + JS-against-
+v2 grid scatter at production resolution) pending.
+
 The big engineering piece.  The current `_step_one_generation` does a
 bilinear scatter of (M_rem, χ_rem) onto the (m, χ) grid; the basis
 analog is the rank-3 tensor ``T(θ)`` such that
@@ -432,6 +449,20 @@ just say "don't hardcode ``TensorProductBasis`` and don't hardcode
 the T-tensor contraction" in the surrounding solver glue.
 
 ### Step 4 — Picard map and IFT VJP on coefficients (1 session)
+
+**Status 2026-05-20 (evening):** Step 4 DONE — see
+``src/hierarchical_ad_pop_engine/response/basis.py`` and
+``src/hierarchical_ad_pop_engine/basis/loss_tensor.py``.  End-to-end
+probe (``outputs/probe_basis_solver.py``) passes: Picard converges in
+13 iters at Stage-1 ε=1e-4, perturbative limit ε=1e-8 matches natal
+to expected O(ε · 15) ≈ 4e-6 relative, all four ``jax.grad`` outputs
+(``v_esc``, ``w_over_v_esc``, ``epsilon``, response fields) finite,
+AD-vs-FD on ``epsilon`` rel 2.6e-5 (within IFT GMRES ``tol=1e-7``
+headroom), and ``jax.jit`` traces cleanly.  Pytest scaffold at
+``tests/test_basis_solver.py``; user must run on their machine.
+Notable: ``∂/∂v_esc`` is non-zero by construction (soft-sigmoid
+retention) — v2 Heaviside gives exactly zero here; a regression
+test pins this property.
 
 `response/basis.py`:
 

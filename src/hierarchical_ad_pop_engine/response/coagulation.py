@@ -113,8 +113,37 @@ def _step_one_generation(
     chi2 = chi[None, None, None, :]
 
     # Remnant mass / spin / retention on the 4D grid.
+    #
+    # ``chi_rem`` carries an implicit ``m1 ≥ m2`` convention — the
+    # Barausse-Rezzolla formula weights ``χ1`` by 1 and ``χ2`` by
+    # ``q² = (m_light/m_heavy)²``, which is only physically correct
+    # when ``χ1`` is the heavier-mass spin.  v2 originally called
+    # chi_rem(m1, m2, chi1, chi2) directly on the 4D mesh — so for
+    # the half of mass-index pairs with m1 < m2 the spin labels
+    # were backwards from the formula's intent.  We canonicalise
+    # here at the call site so the formula sees (m_heavy, m_light,
+    # χ_heavy, χ_light).  ``M_rem`` and ``P_retain`` are already
+    # (m1,χ1) ↔ (m2,χ2)-symmetric (M_rem uses χ_eff;
+    # P_retain → v_kick_aligned canonicalises internally), so we
+    # leave their calls unchanged for diff cleanliness.
+    #
+    # Discovered while building the v3 basis-Picard ``T`` tensor:
+    # the symmetry acceptance test ``T_{γ;αβ} = T_{γ;βα}`` failed
+    # by O(10⁵) until canonicalisation was applied — see memory
+    # ``project_chi_rem_asymmetry_finding`` and
+    # ``project_engine_v3_step3d_done``.  Applying it here brings
+    # v2 grid-Picard's 2G+ χ-tail into physical correctness; the
+    # change *will* shift any test baseline pinned to the v2-with-
+    # asymmetric-chi_rem output.  See PLAN_engine_v3_basis.md §5
+    # for the implications on the basis-vs-grid JS comparison.
     M = M_rem(m1, m2, chi1, chi2)
-    A = chi_rem(m1, m2, chi1, chi2)
+    heavier_first = m1 >= m2
+    A = chi_rem(
+        jnp.where(heavier_first, m1, m2),
+        jnp.where(heavier_first, m2, m1),
+        jnp.where(heavier_first, chi1, chi2),
+        jnp.where(heavier_first, chi2, chi1),
+    )
     P_ret = P_retain(m1, m2, chi1, chi2, jnp.asarray(v_esc))
 
     # Trapezoidal cell measure on each axis.
