@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Per-run demo / red-team outputs — figures, npz artifacts, scratch.
+# Hash-suffixed dirs are per-run; the non-suffixed ones are legacy
+# from earlier sessions and similarly transient.  Don't track.
+demo/artifacts/
+demo/artifacts_*/
+demo/figures/
+demo/figures_*/
+red_team/artifacts_*/
+red_team/figures_*/
+outputs/
+
+# Claude-related local state (per-machine, not source).
+.claude/

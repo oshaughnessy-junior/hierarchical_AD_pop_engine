@@ -228,9 +228,32 @@ def expected_event_count(
 # ---------------------------------------------------------------------------
 # 1. Build truth model + plot 1-D truth densities.
 # ---------------------------------------------------------------------------
-def build_truth_model_and_calibrate_rate(target_N_obs: int) -> CoagulationResponse:
+def build_truth_model_and_calibrate_rate(
+    target_N_obs: int, grid: BinaryGrid | None = None
+) -> CoagulationResponse:
     """Build θ* response, then back-compute ``log_rate`` so the expected
-    event count matches ``target_N_obs``."""
+    event count matches ``target_N_obs``.
+
+    Parameters
+    ----------
+    target_N_obs
+        Desired ``E[N_obs]`` at θ*; ``log_rate`` is calibrated to hit it.
+    grid
+        Optional override of the truth grid.  When ``None`` (the demo's
+        default), the truth lives on ``BinaryGrid.default(m_min, m_max)``
+        — that is, n_m=96, n_chi=32 — which is finer than the fit grid
+        and is the natural choice when the demo's purpose is to
+        illustrate that the inference can recover from data generated
+        on a richer support.  Pass ``_grid_for_fit()`` (or any other
+        ``BinaryGrid``) to force truth onto the same quadrature as the
+        fit; the integration test does this to isolate inference
+        behaviour from quadrature-resolution drift, since the engine's
+        grid is non-uniform (``jnp.geomspace`` in mass) and the
+        expected-count integral evaluated on 96×32 vs 64×20 differs
+        by enough to push the credible-interval gate.  Resolution and
+        robustness validation tracks (separate work) deliberately
+        decouple the two grids.
+    """
     truth = build_response(
         mu_natal=THETA_STAR["mu_natal"],
         sigma_natal=THETA_STAR["sigma_natal"],
@@ -239,6 +262,7 @@ def build_truth_model_and_calibrate_rate(target_N_obs: int) -> CoagulationRespon
         kernel_b=THETA_STAR["kernel_b"],
         log_rate=0.0,  # placeholder
         k_max=K_MAX_TRUTH,
+        grid=grid,
     )
     # Compute expected count at log_R = 0, then rescale.
     n_exp_unit = float(expected_event_count(truth, jnp.asarray(FIXED["v_esc"])))
@@ -254,6 +278,7 @@ def build_truth_model_and_calibrate_rate(target_N_obs: int) -> CoagulationRespon
         kernel_b=THETA_STAR["kernel_b"],
         log_rate=log_rate_star,
         k_max=K_MAX_TRUTH,
+        grid=grid,
     )
 
 
