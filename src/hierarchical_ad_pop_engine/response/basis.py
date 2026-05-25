@@ -108,6 +108,39 @@ class BasisSolveResult(eqx.Module):
     natal_integral: Array
     f_natal_depleted: Array
 
+    def evaluator(
+        self,
+        response: "CoagulationResponse",
+        basis_solver: "TensorProductBasis",
+    ):
+        r"""Return a :class:`RateDensityEvaluator` over this result.
+
+        Thin constructor for
+        :class:`hierarchical_ad_pop_engine.evaluation.BasisEvaluator`,
+        co-located on the result type per
+        ``demo/PLAN_arbitrary_point_evaluation.md`` § "Construction
+        sites".  Callers can write::
+
+            ev = result.evaluator(response, basis_solver)
+            N_at_obs = ev.density(m_obs, chi_obs)
+            R_at_obs = ev.rate_density_4d(m1, m2, chi1, chi2)
+
+        ``basis_solver`` is required because the result stores only
+        flat coefficients — the basis it ran on is needed both to
+        reshape and to evaluate the modal expansion.  Passing a
+        different basis here is undefined behaviour (the coefficients
+        refer to a specific Legendre polynomial set on a specific
+        physical domain).
+
+        Imported lazily to break the
+        ``response.basis ↔ evaluation.basis`` reference cycle —
+        same pattern as :meth:`ImplicitSolveResult.evaluator`.
+        """
+        from ..evaluation.basis import BasisEvaluator
+        return BasisEvaluator(
+            result=self, response=response, basis_solver=basis_solver
+        )
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers.
