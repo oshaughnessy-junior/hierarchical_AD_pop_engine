@@ -238,6 +238,31 @@ class ImplicitSolveResult(eqx.Module):
     natal_integral: Array
     f_natal_depleted: Array
 
+    def evaluator(self, response: "CoagulationResponse"):
+        r"""Return a :class:`RateDensityEvaluator` over this result.
+
+        Thin constructor for
+        :class:`hierarchical_ad_pop_engine.evaluation.ImplicitEvaluator`,
+        co-located on the result type per
+        ``demo/PLAN_arbitrary_point_evaluation.md`` § "Construction
+        sites".  Callers can write::
+
+            ev = result.evaluator(response)
+            N_at_obs = ev.density(m_obs, chi_obs)
+            R_at_obs = ev.rate_density_4d(m1, m2, chi1, chi2)
+
+        without naming the evaluator class.  Swapping in the (future)
+        basis evaluator at the same call site requires changing only
+        the solver invocation, not the evaluator construction.
+
+        Imported lazily to break the
+        ``response.implicit ↔ evaluation.implicit`` reference cycle —
+        same pattern as ``CoagulationResponse._log_total_density``'s
+        local import of :func:`solve_implicit_fixed_point`.
+        """
+        from ..evaluation.implicit import ImplicitEvaluator
+        return ImplicitEvaluator(result=self, response=response)
+
 
 # ---------------------------------------------------------------------------
 # Picard map F — explicit in all arguments for the custom VJP.
