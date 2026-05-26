@@ -138,8 +138,13 @@ from jaxtyping import Array
 
 from ..kernels import log_pairing_kernel
 from ..remnants.kick import v_kick_aligned
+from ..remnants.marginal import (
+    chi_rem_at_orientation,
+    v_kick_at_orientation,
+)
 from ..remnants.mass import M_rem
 from ..remnants.spin import chi_rem
+from ..spin_orientation import Aligned
 from .legendre import LegendreLobatto1D, _legendre_recurrence
 
 
@@ -285,11 +290,229 @@ def _affine_to_ref(x: Array, a: float, b: float) -> Array:
 # ---------------------------------------------------------------------------
 # Build T.
 # ---------------------------------------------------------------------------
+def _build_remnant_tensor_quadrature_data(
+    theta: RemnantTensorTheta,
+    basis_solver: "TensorProductBasis",
+    n_quad_factor: int,
+):
+    """Shared quadrature scaffolding for the aligned & marginalised paths.
+
+    Returns a bundle of ``(m1, m2, chi1, chi2, K, w_quad, jacobian,
+    a_m, b_m, a_chi, b_chi, n_m, n_chi, phi_m_q, phi_chi_q,
+    M_diag_2d)`` — everything except the per-orientation physics
+    (``v_kick``, ``chi_rem``, ``M_rem``, retention) which lives inside
+    the per-path body.
+    """
+    basis_m = basis_solver.basis_m
+    basis_chi = basis_solver.basis_chi
+    n_m = basis_m.n_basis
+    n_chi = basis_chi.n_basis
+    a_m, b_m = basis_m.domain
+    a_chi, b_chi = basis_chi.domain
+
+    n_quad_m = n_quad_factor * n_m
+    n_quad_chi = n_quad_factor * n_chi
+    xi_m_q_np, w_m_q_ref_np = _lgl_nodes_weights_np(n_quad_m)
+    xi_chi_q_np, w_chi_q_ref_np = _lgl_nodes_weights_np(n_quad_chi)
+    xi_m_q = jnp.asarray(xi_m_q_np)
+    w_m_q_ref = jnp.asarray(w_m_q_ref_np)
+    xi_chi_q = jnp.asarray(xi_chi_q_np)
+    w_chi_q_ref = jnp.asarray(w_chi_q_ref_np)
+
+    half_m = 0.5 * (b_m - a_m)
+    mid_m = 0.5 * (a_m + b_m)
+    half_chi = 0.5 * (b_chi - a_chi)
+    mid_chi = 0.5 * (a_chi + b_chi)
+
+    log_m_q = mid_m + half_m * xi_m_q
+    chi_q = mid_chi + half_chi * xi_chi_q
+    m_q = jnp.exp(log_m_q)
+
+    w_m_q = half_m * w_m_q_ref
+    w_chi_q = half_chi * w_chi_q_ref
+
+    phi_m_q = _legendre_table_for(basis_m, xi_m_q)
+    phi_chi_q = _legendre_table_for(basis_chi, xi_chi_q)
+
+    m1 = m_q[:, None, None, None]
+    chi1 = chi_q[None, :, None, None]
+    m2 = m_q[None, None, :, None]
+    chi2 = chi_q[None, None, None, :]
+
+    log_K = log_pairing_kernel(m1, m2, theta.kernel_a, theta.kernel_b)
+    K = jnp.exp(log_K)
+
+    w_quad = (
+        w_m_q[:, None, None, None]
+        * w_chi_q[None, :, None, None]
+        * w_m_q[None, None, :, None]
+        * w_chi_q[None, None, None, :]
+    )
+    jacobian = m1 * m2
+
+    M_diag_2d = basis_solver.mass_diag_2d()
+
+    return {
+        "m1": m1, "m2": m2, "chi1": chi1, "chi2": chi2,
+        "K": K, "w_quad": w_quad, "jacobian": jacobian,
+        "a_m": a_m, "b_m": b_m, "a_chi": a_chi, "b_chi": b_chi,
+        "n_m": n_m, "n_chi": n_chi,
+        "phi_m_q": phi_m_q, "phi_chi_q": phi_chi_q,
+        "M_diag_2d": M_diag_2d,
+    }
+
+
+def _contract_t_from_integrand(
+    integrand_no_basis: Array,
+    log_M_rem: Array,
+    chi_rem_arr: Array,
+    in_domain: Array,
+    qd: dict,
+) -> Array:
+    """Apply the (P_gamma_m · P_gamma_chi)-weighted contraction over
+    the 4-D progenitor quadrature to produce the dense ``T`` tensor.
+
+    Identical to the original ``build_remnant_tensor`` contraction
+    sequence; lifted out so the aligned and marginalised paths share
+    it.
+    """
+    n_m = qd["n_m"]
+    n_chi = qd["n_chi"]
+    a_m = qd["a_m"]; b_m = qd["b_m"]
+    a_chi = qd["a_chi"]; b_chi = qd["b_chi"]
+
+    xi_M = _affine_to_ref(log_M_rem, a_m, b_m)
+    xi_X = _affine_to_ref(chi_rem_arr, a_chi, b_chi)
+    P_gamma_m = _legendre_recurrence(n_m - 1, xi_M)
+    P_gamma_chi = _legendre_recurrence(n_chi - 1, xi_X)
+    P_gamma_m = jnp.where(in_domain[None], P_gamma_m, 0.0)
+    P_gamma_chi = jnp.where(in_domain[None], P_gamma_chi, 0.0)
+
+    integrand_no_basis = integrand_no_basis * jnp.where(in_domain, 1.0, 0.0)
+    integrand_g = (
+        integrand_no_basis[None, None, ...]
+        * P_gamma_m[:, None, ...]
+        * P_gamma_chi[None, :, ...]
+    )
+
+    phi_m_q = qd["phi_m_q"]
+    phi_chi_q = qd["phi_chi_q"]
+    step_a = jnp.einsum("GgIJKL,Ia->GgaJKL", integrand_g, phi_m_q)
+    step_b = jnp.einsum("GgaJKL,Jb->GgabKL", step_a, phi_chi_q)
+    step_c = jnp.einsum("GgabKL,Kc->GgabcL", step_b, phi_m_q)
+    T_dense = jnp.einsum("GgabcL,Ld->Ggabcd", step_c, phi_chi_q)
+
+    M_diag_2d = qd["M_diag_2d"]
+    T_dense = T_dense / M_diag_2d[:, :, None, None, None, None]
+    n_basis = n_m * n_chi
+    return T_dense.reshape(n_basis, n_basis, n_basis)
+
+
+def _build_remnant_tensor_aligned(
+    theta: RemnantTensorTheta,
+    basis_solver: "TensorProductBasis",
+    n_quad_factor: int,
+) -> Array:
+    """v1 aligned-only T-build — unchanged from pre-Session-B."""
+    qd = _build_remnant_tensor_quadrature_data(theta, basis_solver, n_quad_factor)
+    m1, m2, chi1, chi2 = qd["m1"], qd["m2"], qd["chi1"], qd["chi2"]
+
+    heavier_first = m1 >= m2
+    m1_c = jnp.where(heavier_first, m1, m2)
+    m2_c = jnp.where(heavier_first, m2, m1)
+    chi1_c = jnp.where(heavier_first, chi1, chi2)
+    chi2_c = jnp.where(heavier_first, chi2, chi1)
+
+    v_k = v_kick_aligned(m1_c, m2_c, chi1_c, chi2_c)
+    P_ret = retention_sigmoid(v_k, theta.v_esc, theta.w_over_v_esc)
+    M_rem_arr = M_rem(m1_c, m2_c, chi1_c, chi2_c)
+    chi_rem_arr = chi_rem(m1_c, m2_c, chi1_c, chi2_c)
+
+    log_M_rem = jnp.log(jnp.maximum(M_rem_arr, 1e-30))
+    in_domain = (
+        (log_M_rem >= qd["a_m"])
+        & (log_M_rem <= qd["b_m"])
+        & (chi_rem_arr >= qd["a_chi"])
+        & (chi_rem_arr <= qd["b_chi"])
+    )
+    integrand_no_basis = qd["K"] * P_ret * qd["jacobian"] * qd["w_quad"]
+    return _contract_t_from_integrand(
+        integrand_no_basis, log_M_rem, chi_rem_arr, in_domain, qd,
+    )
+
+
+def _build_remnant_tensor_marginalised(
+    theta: RemnantTensorTheta,
+    basis_solver: "TensorProductBasis",
+    orientation,
+    n_quad_factor: int,
+) -> Array:
+    """Marginalised T-build via ``jax.lax.scan`` over orientation quadrature.
+
+    One full-shape ``(n_basis, n_basis, n_basis)`` T-contribution alive
+    per scan iteration (carry) plus the per-iteration integrand
+    intermediates — peak memory the same order as the aligned build.
+    Compute cost is ``n_orient × aligned-build``.  Decision 3 of
+    ``demo/PLAN_misalignment_mode.md``.
+
+    Each scan iteration evaluates :func:`remnants.kick_vector.v_kick_vec`
+    and :func:`remnants.spin_vector.chi_rem_vec` at one orientation
+    quadrature point, feeds the soft retention sigmoid (which keeps
+    AD on ``v_esc`` everywhere — the basis side has always used
+    sigmoid retention, this preserves that), and accumulates a
+    ``w_orient``-weighted T-contribution.
+    """
+    qd = _build_remnant_tensor_quadrature_data(theta, basis_solver, n_quad_factor)
+    m1, m2, chi1, chi2 = qd["m1"], qd["m2"], qd["chi1"], qd["chi2"]
+    K = qd["K"]
+    w_quad = qd["w_quad"]
+    jacobian = qd["jacobian"]
+    a_m = qd["a_m"]; b_m = qd["b_m"]
+    a_chi = qd["a_chi"]; b_chi = qd["b_chi"]
+
+    quad = orientation.quadrature_3d()  # (n_orient, 4)
+    n_m = qd["n_m"]; n_chi = qd["n_chi"]
+    n_basis = n_m * n_chi
+    init_T = jnp.zeros((n_basis, n_basis, n_basis))
+
+    def scan_body(acc_T: Array, orient_pt: Array) -> tuple[Array, None]:
+        cos_t1 = orient_pt[0]
+        cos_t2 = orient_pt[1]
+        dphi = orient_pt[2]
+        w_orient = orient_pt[3]
+
+        chi1_z = chi1 * cos_t1
+        chi2_z = chi2 * cos_t2
+        M_k = M_rem(m1, m2, chi1_z, chi2_z)
+        # |χ_rem| at this orientation (chi_rem_vec canonicalises m1≥m2
+        # internally).
+        chi_rem_k = chi_rem_at_orientation(m1, m2, chi1, chi2, cos_t1, cos_t2, dphi)
+        v_k = v_kick_at_orientation(m1, m2, chi1, chi2, cos_t1, cos_t2, dphi)
+        P_ret = retention_sigmoid(v_k, theta.v_esc, theta.w_over_v_esc)
+
+        log_M_rem = jnp.log(jnp.maximum(M_k, 1e-30))
+        in_domain = (
+            (log_M_rem >= a_m)
+            & (log_M_rem <= b_m)
+            & (chi_rem_k >= a_chi)
+            & (chi_rem_k <= b_chi)
+        )
+        integrand_no_basis = K * P_ret * jacobian * w_quad * w_orient
+        contrib = _contract_t_from_integrand(
+            integrand_no_basis, log_M_rem, chi_rem_k, in_domain, qd,
+        )
+        return acc_T + contrib, None
+
+    T_total, _ = jax.lax.scan(scan_body, init_T, quad)
+    return T_total
+
+
 def build_remnant_tensor(
     theta: RemnantTensorTheta,
     basis_solver: "TensorProductBasis",
     *,
     n_quad_factor: int = 2,
+    orientation=None,
 ) -> Array:
     r"""Build the gain projection tensor ``T_{γ;α,β}(θ)``.
 
@@ -313,6 +536,17 @@ def build_remnant_tensor(
         ``≥ 2 n_basis``; the default satisfies that.  Bump to 3 if the
         Step 3c sweep shows residual sensitivity to retention
         sharpness.
+    orientation : OrientationModel, optional
+        Spin-orientation distribution.  Defaults to :class:`Aligned` —
+        the v1 aligned-only T-build, unchanged from pre-Session-B.
+        Any non-Aligned model engages a ``jax.lax.scan`` over the
+        flat 3-D orientation quadrature, evaluating the full vector
+        BR / LZ physics at each orientation point and accumulating a
+        ``w_orient``-weighted T-contribution.  Build cost scales
+        ``n_orient × aligned``; peak memory unchanged (one
+        T-contribution alive per scan iteration plus the running
+        accumulator).  Decision 3 of
+        ``demo/PLAN_misalignment_mode.md``.
 
     Returns
     -------
@@ -321,10 +555,9 @@ def build_remnant_tensor(
     every axis is ``α_m · n_basis_χ + α_χ`` — same as
     :py:meth:`TensorProductBasis.flatten`.
 
-    Gradient signature: AD-clean in every field of ``theta``.  Verified
-    against finite differences in ``tests/test_basis_remnant_tensor.py``
-    at low resolution; see acceptance criteria in
-    ``PLAN_engine_v3_basis.md`` §Step 3.
+    Gradient signature: AD-clean in every field of ``theta``, and also
+    in ``orientation.kappa`` when ``orientation`` is :class:`Fisher`
+    (the Fisher quadrature weights are smooth in ``κ``).
 
     Memory
     ------
@@ -334,213 +567,22 @@ def build_remnant_tensor(
     contracted ``gain_fn`` and want to potentially swap to a
     brute-force backend later (see module docstring).
     """
-    basis_m = basis_solver.basis_m
-    basis_chi = basis_solver.basis_chi
-    n_m = basis_m.n_basis
-    n_chi = basis_chi.n_basis
-    a_m, b_m = basis_m.domain
-    a_chi, b_chi = basis_chi.domain
-
-    # --- Quadrature nodes / weights on the progenitor axes ---------------
-    # ``n_quad_*`` are statically known (basis_solver carries n_basis as
-    # ``eqx.field(static=True)``).  Resolve the LGL data with the
-    # numpy mirror so that calling ``jax.jit(build_remnant_tensor)``
-    # doesn't trip the Python ``float(...)`` early-exit inside the
-    # jnp LGL solver.  The arrays are jnp.asarray'd in-place and end
-    # up as compile-time constants in the traced graph.
-    n_quad_m = n_quad_factor * n_m
-    n_quad_chi = n_quad_factor * n_chi
-    xi_m_q_np, w_m_q_ref_np = _lgl_nodes_weights_np(n_quad_m)
-    xi_chi_q_np, w_chi_q_ref_np = _lgl_nodes_weights_np(n_quad_chi)
-    xi_m_q = jnp.asarray(xi_m_q_np)
-    w_m_q_ref = jnp.asarray(w_m_q_ref_np)
-    xi_chi_q = jnp.asarray(xi_chi_q_np)
-    w_chi_q_ref = jnp.asarray(w_chi_q_ref_np)
-
-    # Physical nodes on the progenitor axes (in (log m, χ) — basis_m's
-    # domain is in log-mass already; see basis.tensor.for_binary_grid).
-    half_m = 0.5 * (b_m - a_m)
-    mid_m = 0.5 * (a_m + b_m)
-    half_chi = 0.5 * (b_chi - a_chi)
-    mid_chi = 0.5 * (a_chi + b_chi)
-
-    log_m_q = mid_m + half_m * xi_m_q  # (n_quad_m,) — these are log_m values
-    chi_q = mid_chi + half_chi * xi_chi_q  # (n_quad_chi,)
-    m_q = jnp.exp(log_m_q)  # physical mass at the quadrature nodes
-
-    # Physical quadrature weights ((b−a)/2) · ŵ_ref
-    w_m_q = half_m * w_m_q_ref
-    w_chi_q = half_chi * w_chi_q_ref
-
-    # --- Basis table at the progenitor quadrature nodes ------------------
-    # Legendre polynomials of the SOLVER basis evaluated at the
-    # progenitor quadrature reference points.  Shapes:
-    #   phi_m_q   : (n_quad_m,   n_m)
-    #   phi_chi_q : (n_quad_chi, n_chi)
-    phi_m_q = _legendre_table_for(basis_m, xi_m_q)
-    phi_chi_q = _legendre_table_for(basis_chi, xi_chi_q)
-
-    # --- Build the 4-D progenitor mesh -----------------------------------
-    # Shapes carry indices (i_m1, i_χ1, i_m2, i_χ2) over the quadrature
-    # nodes.  Build the physics integrand once.
-    m1 = m_q[:, None, None, None]            # (n_quad_m, 1, 1, 1)
-    chi1 = chi_q[None, :, None, None]        # (1, n_quad_chi, 1, 1)
-    m2 = m_q[None, None, :, None]            # (1, 1, n_quad_m, 1)
-    chi2 = chi_q[None, None, None, :]        # (1, 1, 1, n_quad_chi)
-
-    # Pairing kernel K(m1, m2; a, b).  Symmetric in (m1, m2) by construction.
-    log_K = log_pairing_kernel(m1, m2, theta.kernel_a, theta.kernel_b)
-    K = jnp.exp(log_K)  # (n_quad_m, 1, n_quad_m, 1)
-
-    # Canonical mass / spin ordering: the remnant fits
-    # (:func:`remnants.spin.chi_rem` in particular) carry an implicit
-    # "m1 ≥ m2" convention — χ1 enters with weight 1, χ2 with weight
-    # q² = (m_light/m_heavy)².  v_kick_aligned canonicalises
-    # internally, but chi_rem does not.  We canonicalise once here at
-    # the call site so that the integrand is exactly (m1,χ1) ↔ (m2,χ2)
-    # symmetric on every quadrature point.  Without this, T is *not*
-    # symmetric in α ↔ β and the bosonic-pair acceptance test fails
-    # by O(10^5).  Same fix pattern as the v2 j≠l double-count
-    # discovery (memory ``project_engine_jl_doublecount_fix``).
-    heavier_first = m1 >= m2
-    m1_c = jnp.where(heavier_first, m1, m2)
-    m2_c = jnp.where(heavier_first, m2, m1)
-    chi1_c = jnp.where(heavier_first, chi1, chi2)
-    chi2_c = jnp.where(heavier_first, chi2, chi1)
-
-    # Soft-sigmoid retention.  v_kick depends on all four progenitor
-    # variables so the full (1,1,1,1)→(qm,qχ,qm,qχ) broadcast happens.
-    v_k = v_kick_aligned(m1_c, m2_c, chi1_c, chi2_c)
-    P_ret = retention_sigmoid(v_k, theta.v_esc, theta.w_over_v_esc)
-
-    # Remnant maps — call with the canonically-ordered arguments so
-    # chi_rem's m1≥m2 convention is satisfied.
-    M_rem_arr = M_rem(m1_c, m2_c, chi1_c, chi2_c)
-    chi_rem_arr = chi_rem(m1_c, m2_c, chi1_c, chi2_c)
-
-    # In-domain mask for the remnant.  Out-of-domain remnants are
-    # dropped (see module docstring).  We use a *hard* mask in
-    # ``jnp.where`` form rather than a sigmoid — the boundary is a
-    # numerical artefact of the finite basis domain, not a physics
-    # threshold, and AD through the boundary is unobservable to a
-    # likelihood that itself is dominated by the integrated rate.
-    log_M_rem = jnp.log(jnp.maximum(M_rem_arr, 1e-30))
-    in_domain = (
-        (log_M_rem >= a_m)
-        & (log_M_rem <= b_m)
-        & (chi_rem_arr >= a_chi)
-        & (chi_rem_arr <= b_chi)
+    if orientation is None or isinstance(orientation, Aligned):
+        return _build_remnant_tensor_aligned(theta, basis_solver, n_quad_factor)
+    return _build_remnant_tensor_marginalised(
+        theta, basis_solver, orientation, n_quad_factor,
     )
-
-    # --- Evaluate γ-basis at the remnant points -------------------------
-    # We need P_{γ_m}(\xi_logm(log M_rem)) and P_{γ_χ}(\xi_chi(χ_rem))
-    # on the 4-D progenitor mesh.  Use the Bonnet recurrence directly
-    # (numerically stable; arbitrary point evaluation).
-    xi_M = _affine_to_ref(log_M_rem, a_m, b_m)
-    xi_X = _affine_to_ref(chi_rem_arr, a_chi, b_chi)
-    # _legendre_recurrence returns shape (n_basis, *xi.shape).  We
-    # want trailing-axis broadcasts so we can einsum cleanly.
-    P_gamma_m = _legendre_recurrence(n_m - 1, xi_M)         # (n_m,  qm,qχ,qm,qχ)
-    P_gamma_chi = _legendre_recurrence(n_chi - 1, xi_X)     # (n_χ,  qm,qχ,qm,qχ)
-
-    # Clip outside the domain so the polynomial-evaluation overflow at
-    # large |ξ| can't bleed into the result.  ``in_domain`` is multiplied
-    # at the end; this is belt-and-braces.
-    P_gamma_m = jnp.where(in_domain[None], P_gamma_m, 0.0)
-    P_gamma_chi = jnp.where(in_domain[None], P_gamma_chi, 0.0)
-
-    # --- Integrand pre-multiplied by quadrature weights + Jacobians ------
-    # Lebesgue physical measure is dm dχ, but our basis sits on
-    # (log m, χ).  Quadrature is on the (log m, χ) reference, so we
-    # carry the Jacobian dm = m d(log m) explicitly: factor m1 and m2
-    # multiply the quadrature weights.
-    #
-    # Weight bundle per 4-D node:
-    #   w[i_m1, i_χ1, i_m2, i_χ2] = w_m_q[i_m1] · w_chi_q[i_χ1]
-    #                              · w_m_q[i_m2] · w_chi_q[i_χ2]
-    #                              · m1 · m2
-    w_quad = (
-        w_m_q[:, None, None, None]
-        * w_chi_q[None, :, None, None]
-        * w_m_q[None, None, :, None]
-        * w_chi_q[None, None, None, :]
-    )
-    jacobian = m1 * m2  # broadcasts to (qm, 1, qm, 1)
-
-    integrand_no_basis = K * P_ret * jacobian * w_quad
-    # in_domain mask folded in via P_gamma_*; keep the integrand
-    # finite everywhere so AD doesn't pick up spurious NaN tangents.
-    integrand_no_basis = integrand_no_basis * jnp.where(in_domain, 1.0, 0.0)
-
-    # --- The contraction ------------------------------------------------
-    # T[γ_m, γ_χ, α_m, α_χ, β_m, β_χ]
-    #   = Σ_{i,j,k,l} integrand[i,j,k,l]
-    #     · P_gamma_m[γ_m, i,j,k,l] · P_gamma_chi[γ_χ, i,j,k,l]
-    #     · phi_m_q[i, α_m] · phi_chi_q[j, α_χ]
-    #     · phi_m_q[k, β_m] · phi_chi_q[l, β_χ]
-    # then divided by M_γγ.
-    #
-    # We perform this as a sequence of three contractions on (i, j, k, l)
-    # to keep peak memory bounded — the full einsum would materialise
-    # intermediates of size O(n_quad^4 · n_basis^2) ≈ 4e6 · 5e4 = 2e11
-    # which is unworkable.  Order:
-    #   step a)  contract over i  (the m1 quadrature axis)
-    #   step b)  contract over j  (the χ1 quadrature axis)
-    #   step c)  contract over k  (the m2 quadrature axis)
-    #   step d)  contract over l  (the χ2 quadrature axis)
-    #
-    # After step (a) the integrand-shaped tensor has carried in an
-    # axis α_m via phi_m_q.  We also fold P_gamma_m and P_gamma_chi
-    # into the integrand BEFORE the contractions because they share
-    # the same (i,j,k,l) index set — this is one of the few times
-    # JAX einsum's path planner benefits from explicit ordering.
-    #
-    # Concretely we group the work as
-    #     integrand_g = integrand_no_basis[None, None, ...]
-    #                   * P_gamma_m[:, None, ...]
-    #                   * P_gamma_chi[None, :, ...]
-    # which is shape (n_m, n_χ, qm, qχ, qm, qχ), and then do four
-    # tensordots to bring in (α_m, α_χ, β_m, β_χ).
-    #
-    # Memory check at (32, 16) and n_quad_factor=2: integrand_g is
-    # 32·16·64·32·64·32 = 7.0e7 floats = 540 MB.  Acceptable.
-    # The final T is 1.1 GB.  Peak transient through the chain
-    # caps around the size of T + one or two intermediates.
-    integrand_g = (
-        integrand_no_basis[None, None, ...]
-        * P_gamma_m[:, None, ...]
-        * P_gamma_chi[None, :, ...]
-    )  # (n_m, n_χ, qm, qχ, qm, qχ)
-
-    # Contract m1 quadrature axis (axis 2) against α_m.
-    # einsum: "GgIJKL,Ia->GgaJKL"
-    step_a = jnp.einsum("GgIJKL,Ia->GgaJKL", integrand_g, phi_m_q)
-    # Contract χ1 quadrature axis (was axis 3) against α_χ.
-    step_b = jnp.einsum("GgaJKL,Jb->GgabKL", step_a, phi_chi_q)
-    # Contract m2 quadrature axis against β_m.
-    step_c = jnp.einsum("GgabKL,Kc->GgabcL", step_b, phi_m_q)
-    # Contract χ2 quadrature axis against β_χ.
-    T_dense = jnp.einsum("GgabcL,Ld->Ggabcd", step_c, phi_chi_q)
-    # Shape: (n_m, n_χ, n_m, n_χ, n_m, n_χ) — (γ_m, γ_χ, α_m, α_χ, β_m, β_χ).
-
-    # Divide by the 2-D mass-matrix diagonal on γ — the Galerkin
-    # projection's (1/M_γγ) normalisation that converts the raw
-    # quadrature into a modal coefficient.
-    M_diag_2d = basis_solver.mass_diag_2d()  # (n_m, n_χ)
-    T_dense = T_dense / M_diag_2d[:, :, None, None, None, None]
-
-    # Flatten to (n_basis, n_basis, n_basis) — matches the einsum
-    # signature in PLAN_engine_v3_basis.md §Step 4 and tightens the
-    # interface for the Picard map.
-    n_basis = n_m * n_chi
-    T_flat = T_dense.reshape(n_basis, n_basis, n_basis)
-    return T_flat
 
 
 # ---------------------------------------------------------------------------
 # Gain closure — keeps the Picard loop polymorphic over the gain backend.
 # ---------------------------------------------------------------------------
-def make_t_tensor_gain(basis_solver: "TensorProductBasis", *, n_quad_factor: int = 2):
+def make_t_tensor_gain(
+    basis_solver: "TensorProductBasis",
+    *,
+    n_quad_factor: int = 2,
+    orientation=None,
+):
     r"""Return ``gain_fn(coeffs_flat, theta) -> coeffs_flat`` using the
     T-tensor recipe.
 
@@ -554,6 +596,9 @@ def make_t_tensor_gain(basis_solver: "TensorProductBasis", *, n_quad_factor: int
     ----------
     basis_solver, n_quad_factor
         Forwarded to :func:`build_remnant_tensor`.
+    orientation : OrientationModel, optional
+        Spin-orientation distribution; forwarded.  Defaults to
+        :class:`Aligned` (v1 behaviour).
 
     Returns
     -------
@@ -572,7 +617,9 @@ def make_t_tensor_gain(basis_solver: "TensorProductBasis", *, n_quad_factor: int
 
     def gain_fn(coeffs_flat: Array, theta: RemnantTensorTheta) -> Array:
         T = build_remnant_tensor(
-            theta, basis_solver, n_quad_factor=n_quad_factor
+            theta, basis_solver,
+            n_quad_factor=n_quad_factor,
+            orientation=orientation,
         )
         # G_γ = 1/2 Σ_α,β T_{γ;α,β} · n_α · n_β
         return 0.5 * jnp.einsum("gab,a,b->g", T, coeffs_flat, coeffs_flat)

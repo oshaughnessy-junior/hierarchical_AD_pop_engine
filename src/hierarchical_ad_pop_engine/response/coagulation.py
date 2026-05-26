@@ -28,9 +28,10 @@ arbitrary binary parameter points uses bilinear interpolation in
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import ArrayLike
@@ -40,9 +41,15 @@ from ..interp import log_density_at
 from ..kernels import log_pairing_kernel_grid
 from ..natal.mass import log_natal_mass, log_natal_mass_gaussian
 from ..natal.spin import build_natal_spin, log_natal_spin
+from ..remnants.kick_vector import v_kick_vec
+from ..remnants.marginal import (
+    chi_rem_at_orientation,
+    v_kick_at_orientation,
+)
 from ..remnants.mass import M_rem
 from ..remnants.spin import chi_rem
 from ..retention import P_retain
+from ..spin_orientation import Aligned
 
 
 def _bilinear_scatter(
@@ -87,55 +94,52 @@ def _bilinear_scatter(
     return flat
 
 
-def _step_one_generation(
-    log_n_j: Array,  # (N_m, N_chi) progenitor j density
-    log_n_l: Array,  # (N_m, N_chi) progenitor l density
-    log_K_mm: Array,  # (N_m, N_m) pairing kernel
+def _trapezoidal_cell_widths(grid: BinaryGrid) -> tuple[Array, Array]:
+    """Trapezoidal-rule progenitor-cell widths ``(dm1[i], dchi1[j])``.
+
+    Shared by both the aligned and the marginalised
+    :func:`_step_one_generation` paths.  ``dm = m · d(log m)`` is the
+    Jacobian converting d(log m) to dm.
+    """
+    dlog_m = jnp.diff(grid.log_m)
+    dlog_m_full = jnp.concatenate(
+        [dlog_m[:1], 0.5 * (dlog_m[:-1] + dlog_m[1:]), dlog_m[-1:]]
+    )
+    dchi = jnp.diff(grid.chi)
+    dchi_full = jnp.concatenate(
+        [dchi[:1], 0.5 * (dchi[:-1] + dchi[1:]), dchi[-1:]]
+    )
+    dm1 = grid.m * dlog_m_full
+    dchi1 = dchi_full
+    return dm1, dchi1
+
+
+def _step_one_generation_aligned(
+    log_n_j: Array,
+    log_n_l: Array,
+    log_K_mm: Array,
     grid: BinaryGrid,
     v_esc: ArrayLike,
-    symmetry_factor: float,  # 1/2 if j==l else 1
+    symmetry_factor: float,
 ) -> Array:
-    """Compute the contribution of one ``(j, l)`` progenitor pair to ``n_k(m, χ)``.
+    """Aligned-only bilinear scatter — v1 path, **unchanged** from
+    pre-Session-B.  Returns ``(N_m, N_chi)`` count-per-cell.
 
-    Returns a ``(N_m, N_chi)`` linear-scale density (positive) — the caller
-    accumulates across all ``(j, l)`` pairs and finally takes the log.
+    Spin convention here is the v1 signed-χ convention: ``chi1`` and
+    ``chi2`` are signed scalars (``∈ [-1, 1]`` mathematically; the
+    default grid has positive support).  ``chi_rem`` canonicalises
+    ``m1 ≥ m2`` externally at this call site (memory
+    ``project_chi_rem_asymmetry_finding``).
     """
-    m = grid.m  # (N_m,)
-    chi = grid.chi  # (N_chi,)
-    N_m = m.size
-    N_chi = chi.size
+    m = grid.m
+    chi = grid.chi
 
-    # 4D progenitor grid: (m1, chi1, m2, chi2). To save memory we vectorise
-    # one axis at a time. Here we just broadcast and reduce.
-    m1 = m[:, None, None, None]  # (N_m, 1, 1, 1)
+    m1 = m[:, None, None, None]
     chi1 = chi[None, :, None, None]
     m2 = m[None, None, :, None]
     chi2 = chi[None, None, None, :]
 
     # Remnant mass / spin / retention on the 4D grid.
-    #
-    # ``chi_rem`` carries an implicit ``m1 ≥ m2`` convention — the
-    # Barausse-Rezzolla formula weights ``χ1`` by 1 and ``χ2`` by
-    # ``q² = (m_light/m_heavy)²``, which is only physically correct
-    # when ``χ1`` is the heavier-mass spin.  v2 originally called
-    # chi_rem(m1, m2, chi1, chi2) directly on the 4D mesh — so for
-    # the half of mass-index pairs with m1 < m2 the spin labels
-    # were backwards from the formula's intent.  We canonicalise
-    # here at the call site so the formula sees (m_heavy, m_light,
-    # χ_heavy, χ_light).  ``M_rem`` and ``P_retain`` are already
-    # (m1,χ1) ↔ (m2,χ2)-symmetric (M_rem uses χ_eff;
-    # P_retain → v_kick_aligned canonicalises internally), so we
-    # leave their calls unchanged for diff cleanliness.
-    #
-    # Discovered while building the v3 basis-Picard ``T`` tensor:
-    # the symmetry acceptance test ``T_{γ;αβ} = T_{γ;βα}`` failed
-    # by O(10⁵) until canonicalisation was applied — see memory
-    # ``project_chi_rem_asymmetry_finding`` and
-    # ``project_engine_v3_step3d_done``.  Applying it here brings
-    # v2 grid-Picard's 2G+ χ-tail into physical correctness; the
-    # change *will* shift any test baseline pinned to the v2-with-
-    # asymmetric-chi_rem output.  See PLAN_engine_v3_basis.md §5
-    # for the implications on the basis-vs-grid JS comparison.
     M = M_rem(m1, m2, chi1, chi2)
     heavier_first = m1 >= m2
     A = chi_rem(
@@ -144,34 +148,180 @@ def _step_one_generation(
         jnp.where(heavier_first, chi1, chi2),
         jnp.where(heavier_first, chi2, chi1),
     )
+    # P_retain default routes to retention_aligned (Heaviside) under
+    # the Aligned shortcut — v1 semantics preserved bit-for-bit.
     P_ret = P_retain(m1, m2, chi1, chi2, jnp.asarray(v_esc))
 
-    # Trapezoidal cell measure on each axis.
-    dlog_m = jnp.diff(grid.log_m)
-    dlog_m_full = jnp.concatenate([dlog_m[:1], 0.5 * (dlog_m[:-1] + dlog_m[1:]), dlog_m[-1:]])
-    dchi = jnp.diff(chi)
-    dchi_full = jnp.concatenate([dchi[:1], 0.5 * (dchi[:-1] + dchi[1:]), dchi[-1:]])
-    # Convert d(log m) to d(m): dm = m × d(log m)
-    dm1 = m * dlog_m_full  # (N_m,)
-    dchi1 = dchi_full  # (N_chi,)
+    dm1, dchi1 = _trapezoidal_cell_widths(grid)
 
-    # Differential weight per progenitor cell.
     log_weight = (
-        log_K_mm[:, None, :, None]  # K(m1, m2)
+        log_K_mm[:, None, :, None]
         + log_n_j[:, :, None, None]
         + log_n_l[None, None, :, :]
         + jnp.log(jnp.maximum(P_ret, 1e-30))
     )
-    cell = dm1[:, None, None, None] * dchi1[None, :, None, None] * dm1[None, None, :, None] * dchi1[None, None, None, :]
+    cell = (
+        dm1[:, None, None, None]
+        * dchi1[None, :, None, None]
+        * dm1[None, None, :, None]
+        * dchi1[None, None, None, :]
+    )
     weight = jnp.exp(log_weight) * cell * symmetry_factor
 
-    # Scatter onto the output grid.
     return _bilinear_scatter(
         grid.log_m,
         grid.chi,
         M.reshape(-1),
         A.reshape(-1),
         weight.reshape(-1),
+    )
+
+
+def _step_one_generation_marginalised(
+    log_n_j: Array,
+    log_n_l: Array,
+    log_K_mm: Array,
+    grid: BinaryGrid,
+    v_esc: ArrayLike,
+    symmetry_factor: float,
+    orientation,
+    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    w_over_v_esc: float = 1.0,
+) -> Array:
+    """Orientation-marginalised bilinear scatter via ``jax.lax.scan``.
+
+    Iterates the orientation quadrature points from
+    ``orientation.quadrature_3d()`` and accumulates one
+    ``(N_m, N_chi)`` contribution per iteration into the output
+    density.  **One full-shape 4-D progenitor tensor alive at a time**
+    (Decision 3 of ``demo/PLAN_misalignment_mode.md``) — naïve vmap
+    over orientation would multiply the 4-D tensor by ``n_orient`` and
+    blow peak memory.
+
+    Spin convention here is the misalignment-mode convention:
+    ``chi1, chi2`` are magnitudes ``|χ_i| ∈ [0, 1]``.  Per orientation,
+    the L̂-component is ``χ_z = χ_mag · cos θ`` (signed) and feeds into
+    ``M_rem``'s ``χ_eff``.  Full vector spins feed into
+    :func:`remnants.spin_vector.chi_rem_vec` (returning the scalar
+    magnitude ``|χ_rem|``) and
+    :func:`remnants.kick_vector.v_kick_vec` (scalar km/s).
+
+    ``retention_kind="heaviside"`` reproduces the v1 hard-cut at each
+    orientation point — same retention surface as the aligned path on
+    a per-orientation basis but smoothed by the orientation
+    averaging.  ``retention_kind="sigmoid"`` makes the per-orientation
+    retention smooth, recovering ``∂/∂v_esc`` gradients through JAX
+    (see ``remnants/kick.py`` module docstring).
+    """
+    m = grid.m
+    chi = grid.chi
+    N_m = m.size
+    N_chi = chi.size
+
+    m1 = m[:, None, None, None]
+    chi1 = chi[None, :, None, None]
+    m2 = m[None, None, :, None]
+    chi2 = chi[None, None, None, :]
+
+    dm1, dchi1 = _trapezoidal_cell_widths(grid)
+    cell = (
+        dm1[:, None, None, None]
+        * dchi1[None, :, None, None]
+        * dm1[None, None, :, None]
+        * dchi1[None, None, None, :]
+    )
+
+    log_K_4d = log_K_mm[:, None, :, None]
+    log_n_j_4d = log_n_j[:, :, None, None]
+    log_n_l_4d = log_n_l[None, None, :, :]
+    # Pair-physics part of the integrand (no orientation dep):
+    log_pair = log_K_4d + log_n_j_4d + log_n_l_4d
+    cell_sym = cell * symmetry_factor
+
+    quad = orientation.quadrature_3d()  # (n_quad, 4)
+    v_esc_arr = jnp.asarray(v_esc)
+
+    def scan_body(acc: Array, orient_pt: Array) -> tuple[Array, None]:
+        cos_t1 = orient_pt[0]
+        cos_t2 = orient_pt[1]
+        dphi = orient_pt[2]
+        w_orient = orient_pt[3]
+
+        # χ_z per progenitor = |χ| · cos θ.  Signed; feeds M_rem.
+        chi1_z = chi1 * cos_t1
+        chi2_z = chi2 * cos_t2
+
+        M_k = M_rem(m1, m2, chi1_z, chi2_z)
+        # |χ_rem| from the vector BR formula at this orientation
+        # quadrature point.  chi_rem_at_orientation canonicalises
+        # m_1 ≥ m_2 internally via chi_rem_vec.
+        chi_rem_k = chi_rem_at_orientation(
+            m1, m2, chi1, chi2, cos_t1, cos_t2, dphi
+        )
+        v_kick_k = v_kick_at_orientation(
+            m1, m2, chi1, chi2, cos_t1, cos_t2, dphi
+        )
+
+        if retention_kind == "heaviside":
+            P_ret_k = jnp.where(v_kick_k < v_esc_arr, 1.0, 0.0)
+        else:
+            w_v = w_over_v_esc * v_esc_arr
+            P_ret_k = jax.nn.sigmoid((v_esc_arr - v_kick_k) / w_v)
+
+        log_weight = log_pair + jnp.log(jnp.maximum(P_ret_k, 1e-30))
+        weight = jnp.exp(log_weight) * cell_sym * w_orient
+
+        contrib = _bilinear_scatter(
+            grid.log_m,
+            grid.chi,
+            M_k.reshape(-1),
+            chi_rem_k.reshape(-1),
+            weight.reshape(-1),
+        )
+        return acc + contrib, None
+
+    init = jnp.zeros((N_m, N_chi))
+    out, _ = jax.lax.scan(scan_body, init, quad)
+    return out
+
+
+def _step_one_generation(
+    log_n_j: Array,  # (N_m, N_chi) progenitor j density
+    log_n_l: Array,  # (N_m, N_chi) progenitor l density
+    log_K_mm: Array,  # (N_m, N_m) pairing kernel
+    grid: BinaryGrid,
+    v_esc: ArrayLike,
+    symmetry_factor: float,  # 1/2 if j==l else 1
+    orientation=None,
+    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    w_over_v_esc: float = 1.0,
+) -> Array:
+    """Compute the contribution of one ``(j, l)`` progenitor pair to ``n_k(m, χ)``.
+
+    Dispatches on the orientation model at trace time:
+
+    * ``orientation is None`` or ``isinstance(orientation, Aligned)``:
+      routes to :func:`_step_one_generation_aligned` — v1 code path,
+      bit-for-bit unchanged.  Spins are signed scalars in the v1 sense.
+    * Any non-Aligned :class:`spin_orientation.OrientationModel`:
+      routes to :func:`_step_one_generation_marginalised` — scan over
+      orientation quadrature, vector remnant physics per point.
+      Spins are magnitudes ``|χ_i|``; orientation distribution
+      carries tilt.
+
+    Returns a ``(N_m, N_chi)`` linear-scale density (positive) — the
+    caller accumulates across all ``(j, l)`` pairs and finally takes
+    the log.
+    """
+    if orientation is None or isinstance(orientation, Aligned):
+        return _step_one_generation_aligned(
+            log_n_j, log_n_l, log_K_mm, grid, v_esc, symmetry_factor
+        )
+    return _step_one_generation_marginalised(
+        log_n_j, log_n_l, log_K_mm, grid, v_esc, symmetry_factor,
+        orientation,
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
     )
 
 
@@ -223,6 +373,23 @@ class CoagulationResponse(eqx.Module):
     # meaning — ε ≈ 1 is a fully-developed cascade, ε ≪ 1 leaves the
     # natal pool intact. Ignored when ``solver == "perturbative"``.
     epsilon: Array = eqx.field(default_factory=lambda: jnp.asarray(1.0))
+    # Spin-orientation model.  Defaults to Aligned() — preserves the v1
+    # signed-χ semantics bit-for-bit at every internal call site.
+    # Setting to Isotropic / Fisher engages the full vector remnant
+    # physics path inside ``_step_one_generation`` via the
+    # ``isinstance(orientation, Aligned)`` dispatch.  The orientation
+    # model is a pytree (leaf-bearing for Fisher's κ); jit cache keys
+    # on its tree structure, so swapping orientation types triggers a
+    # retrace, but changing κ inside Fisher is a normal leaf update.
+    # See ``demo/PLAN_misalignment_mode.md`` § Session B.
+    orientation: object = eqx.field(default_factory=Aligned)
+    # Per-orientation retention model under non-Aligned (ignored when
+    # ``orientation`` is Aligned, which always routes to the Heaviside
+    # path).  ``"heaviside"`` preserves the v1 hard-cut at each
+    # orientation point; ``"sigmoid"`` smooths each cut, recovering
+    # ``∂/∂v_esc`` gradients through JAX.
+    retention_kind: str = eqx.field(static=True, default="heaviside")
+    w_over_v_esc: float = eqx.field(static=True, default=1.0)
 
     def _natal_log_density(self) -> Array:
         spin_dist = build_natal_spin(**self.natal_spin_params)
@@ -284,6 +451,9 @@ class CoagulationResponse(eqx.Module):
                         self.grid,
                         v_esc,
                         sym,
+                        orientation=self.orientation,
+                        retention_kind=self.retention_kind,
+                        w_over_v_esc=self.w_over_v_esc,
                     )
                 else:
                     # K, M_rem, P_retain are all symmetric in (m1, m2), so the
@@ -302,6 +472,9 @@ class CoagulationResponse(eqx.Module):
                         self.grid,
                         v_esc,
                         sym,
+                        orientation=self.orientation,
+                        retention_kind=self.retention_kind,
+                        w_over_v_esc=self.w_over_v_esc,
                     )
                 # contrib is count per output cell; divide by cell area to
                 # convert to density so that n_k is consistent with n_1.
