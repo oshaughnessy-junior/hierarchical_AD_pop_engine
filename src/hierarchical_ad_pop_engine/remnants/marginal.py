@@ -279,32 +279,63 @@ def P_retain_marginalised(
     """
     if isinstance(orientation, Aligned):
         return retention_aligned(m1, m2, chi1_mag, chi2_mag, v_esc)
-    v_q, w = v_kick_distribution(m1, m2, chi1_mag, chi2_mag, orientation)
-    # v_q shape is ``(n_quad, *progenitor_broadcast_shape)`` — the
-    # vmap inside ``v_kick_distribution`` puts the quadrature axis
-    # leading.  At scalar progenitor inputs the trailing shape is
-    # empty; at the implicit solver's 4-D progenitor-mesh broadcast
-    # ``(m1, m2, chi1, chi2)`` it is ``(N_m, N_chi, N_m, N_chi)``.
-    # ``w`` is always ``(n_quad,)`` and must be reshaped to broadcast
-    # over the trailing axes; the sum reduces *only* over the
-    # orientation axis, returning a per-cell marginalised retention.
-    if retention_kind == "heaviside":
-        retain_q = jnp.where(v_q < v_esc, 1.0, 0.0)
-    elif retention_kind == "sigmoid":
-        w_v = jnp.asarray(w_over_v_esc) * v_esc
-        retain_q = jax.nn.sigmoid((v_esc - v_q) / w_v)
-    else:
+    # Validate at trace time (before lax.scan starts).
+    if retention_kind not in ("heaviside", "sigmoid"):
         raise ValueError(
             f"Unknown retention_kind {retention_kind!r}; expected "
             "'heaviside' or 'sigmoid'."
         )
-    # Reshape ``w`` to ``(n_quad, 1, ..., 1)`` so it broadcasts cleanly
-    # over any trailing progenitor-mesh shape.  At scalar inputs
-    # (``retain_q.ndim == 1``) the reshape is a no-op so the original
-    # scalar-output behaviour is preserved exactly (no breaking
-    # change to Session B callers).
-    w_b = w.reshape((w.shape[0],) + (1,) * (retain_q.ndim - 1))
-    return jnp.sum(w_b * retain_q, axis=0)
+
+    # ---------------------------------------------------------------
+    # Decision-3 memory contract: one full-shape progenitor tensor
+    # alive per scan iteration, *not* (n_quad, *progenitor_mesh).
+    #
+    # The earlier broadcast-then-reduce implementation materialised
+    # the orientation axis explicitly (via ``v_kick_distribution``'s
+    # vmap-over-quadrature) and required ``O(n_quad ·
+    # progenitor_mesh)`` memory — fine for scalar progenitor inputs
+    # but ~75 GB at production resolution (96, 32, 96, 32) ×
+    # n_quad=1024 inside ``loss_density``.  Mirrors the
+    # ``_step_one_generation_marginalised`` scan-over-orientations
+    # pattern on the gain side (Decision 3 of
+    # ``demo/PLAN_misalignment_mode.md``).
+    # ---------------------------------------------------------------
+    quad = orientation.quadrature_3d()  # (n_quad, 4)
+    v_esc_arr = jnp.asarray(v_esc)
+
+    # Broadcast-shape of the inputs sans orientation.  jnp.broadcast_shapes
+    # is concrete at trace time as long as the inputs' shapes are
+    # static — true under every caller (loss_density's 4-D mesh,
+    # scalar test inputs, basis grid points).
+    bcast_shape = jnp.broadcast_shapes(
+        jnp.shape(m1),
+        jnp.shape(m2),
+        jnp.shape(chi1_mag),
+        jnp.shape(chi2_mag),
+        jnp.shape(v_esc_arr),
+    )
+
+    def scan_body(acc: Array, orient_pt: Array) -> tuple[Array, None]:
+        cos_t1 = orient_pt[0]
+        cos_t2 = orient_pt[1]
+        dphi = orient_pt[2]
+        w_orient = orient_pt[3]
+        v_k = v_kick_at_orientation(
+            m1, m2, chi1_mag, chi2_mag, cos_t1, cos_t2, dphi
+        )
+        # retention_kind is a Python closure on a static string —
+        # dispatch is at trace time, not at scan time.  Same pattern
+        # as ``_step_one_generation_marginalised``.
+        if retention_kind == "heaviside":
+            retain = jnp.where(v_k < v_esc_arr, 1.0, 0.0)
+        else:  # "sigmoid", validated above
+            w_v = jnp.asarray(w_over_v_esc) * v_esc_arr
+            retain = jax.nn.sigmoid((v_esc_arr - v_k) / w_v)
+        return acc + w_orient * retain, None
+
+    init_acc = jnp.zeros(bcast_shape)
+    out, _ = jax.lax.scan(scan_body, init_acc, quad)
+    return out
 
 
 # ---------------------------------------------------------------------------

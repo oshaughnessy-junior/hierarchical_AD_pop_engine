@@ -108,17 +108,18 @@ def loss_density(
     Under Aligned (default), builds a ``(N_m, N_chi, N_m, N_chi)``
     4-D array — at (96, 32) and float64 ~75 MB, comfortable.
 
-    Under non-Aligned, ``P_retain_marginalised`` internally materialises
-    a ``(n_quad, N_m, N_chi, N_m, N_chi)`` intermediate (the
-    orientation axis is vmap-led).  At ``n_quad=1024`` and (96, 32)
-    that is ~75 GB — *not* viable.  The gain side already handles
-    this with ``jax.lax.scan`` inside
-    ``_step_one_generation_marginalised``; the loss side needs the
-    equivalent refactor for production resolutions.  For Step-11
-    test fixtures (16, 16) with ``n_quad ≤ 128`` the intermediate is
-    ~70 MB — fine.  Tracked in handoff memory; **do not run this
-    path at production resolution under non-Aligned until the scan
-    refactor lands.**
+    Under non-Aligned, ``P_retain_marginalised`` now scans over the
+    orientation quadrature internally
+    (``remnants/marginal.py:P_retain_marginalised`` uses
+    ``jax.lax.scan`` — mirroring the Decision-3 pattern already in
+    ``_step_one_generation_marginalised`` on the gain side), so the
+    per-iteration memory is bounded by ~3 × the same
+    ``(N_m, N_chi, N_m, N_chi)`` tensor and does **not** scale with
+    ``n_quad``.  At ``n_quad=1024`` and (96, 32) that is ~225 MB
+    peak — comfortable.  A round-2 broadcast-then-reduce
+    implementation (c0e6236) was OOM-fragile here; commit c0e6236
+    is still in the history but the implementation it documented
+    has been superseded by the scan refactor.
 
     Forwards ``response.orientation`` / ``retention_kind`` /
     ``w_over_v_esc`` to :func:`P_retain` so the misalignment dispatch
