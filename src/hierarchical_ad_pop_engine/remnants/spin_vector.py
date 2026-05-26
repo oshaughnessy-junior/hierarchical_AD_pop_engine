@@ -16,8 +16,8 @@ For aligned progenitors (``χ_i_vec = χ_i ẑ``) this module reduces to
 (verified by ``tests/test_remnant_vector.py``); the ``z``-component of
 the returned vector matches the scalar value to machine precision.
 
-Formula (this project's simplified-BR variant)
-----------------------------------------------
+Formula (canonical Barausse-Rezzolla 2009)
+------------------------------------------
 Approximate ``J_fin ≈ S_1 + S_2 + L̃`` with ``L̃`` along ``L̂``,
 neglecting radiated angular momentum.  Then::
 
@@ -25,30 +25,25 @@ neglecting radiated angular momentum.  Then::
               ≈ (χ_1_vec + q² χ_2_vec + q · l̃ · L̂) / (1 + q)²
 
 with ``q = m_2 / m_1`` (``q ≤ 1`` after canonicalisation) and the
-ISCO orbital-angular-momentum magnitude::
+ISCO orbital-angular-momentum magnitude (BR 2009 eq. (10))::
 
     l̃(q, η, χ_1_vec, χ_2_vec)
-        = s_4 / (1+q²)² · (|χ_1|² + |χ_2|² q⁴)
+        = s_4 / (1+q²)² · (|χ_1|² + |χ_2|² q⁴ + 2 q² χ_1·χ_2)
         + (s_5 η + t_0 + 2) / (1+q²) · (χ_1_z + q² χ_2_z)
         + 2√3 + t_2 η + t_3 η²
 
 with the same coefficients ``(s_4, s_5, t_0, t_2, t_3)`` as the scalar
-formula.  The aligned reduction is bit-equivalent: ``|χ_i| cos β_i =
-χ_i_z`` since ``L̂ = ẑ`` — no division by spin magnitudes is needed
-(so ``|χ_i| = 0`` is handled cleanly).
+formula.  The first parenthesised group is ``|χ_1 + q² χ_2|²``.
 
-.. note::
-    The canonical Barausse-Rezzolla 2009 ``l̃`` formula carries an
-    extra ``+ s_4 / (1+q²)² · 2 q² χ_1·χ_2 cos α`` cross term that
-    the project's scalar :mod:`remnants.spin` ``chi_rem`` does NOT
-    include.  This vector module mirrors the scalar choice
-    deliberately, so the aligned-reduction invariant (vector at
-    ẑ-aligned input → scalar exactly, machine precision) holds.
-    A separate decision is whether to upgrade *both* the scalar and
-    vector formulas to canonical BR 2009 in a later session; that
-    would re-baseline a small handful of pinned scalar outputs and
-    is *not* in scope for Session A.  This discrepancy is recorded
-    in the Session A handoff memory.
+Written entirely in dot products (``|χ_i| cos β_i = χ_i_z`` since
+``L̂ = ẑ``, ``|χ_1||χ_2| cos α = χ_1·χ_2``), so no division by spin
+magnitudes is needed — ``|χ_i| = 0`` is handled cleanly.
+
+Aligned-reduction invariant: with ``χ_i_vec = χ_i ẑ`` we have
+``χ_1·χ_2 = χ_1 χ_2`` (signed scalar product), so ``l̃`` reduces
+*exactly* to the canonical scalar form in :mod:`remnants.spin`.
+The ``z``-component of ``a_fin_vec`` matches scalar ``chi_rem`` to
+machine precision, the ``x, y`` components are zero.
 
 The output magnitude is clipped to ``[0, 0.999]`` for safety (matches
 the scalar code's ``±0.999`` clip).
@@ -95,16 +90,25 @@ def _l_vec(
 ) -> Array:
     """ISCO orbital-angular-momentum magnitude for vector inputs.
 
-    See module docstring.  Written entirely in dot products so
-    ``|χ_i| = 0`` is well-defined.  Mirrors the simplified-BR ``l`` in
-    :mod:`remnants.spin` (no ``χ_1·χ_2`` cross term — see module note).
+    Canonical Barausse-Rezzolla 2009 eq. (10).  Written entirely in
+    dot products: ``|χ_1 + q² χ_2|² = |χ_1|² + q⁴ |χ_2|² + 2 q² χ_1·χ_2``,
+    ``|χ_i| cos β_i = χ_i_z``.  No division by spin magnitudes, so
+    ``|χ_i| = 0`` is well-defined.  Reduces exactly to the canonical
+    scalar ``_l`` in :mod:`remnants.spin` when both spins are along
+    ``ẑ``.
     """
     one_plus_q2 = 1.0 + jnp.square(q)
     mag1_sq = jnp.sum(jnp.square(chi1_vec), axis=-1)
     mag2_sq = jnp.sum(jnp.square(chi2_vec), axis=-1)
+    chi1_dot_chi2 = jnp.sum(chi1_vec * chi2_vec, axis=-1)
     chi1_z = chi1_vec[..., 2]
     chi2_z = chi2_vec[..., 2]
-    a_sum_sq = mag1_sq + mag2_sq * jnp.square(jnp.square(q))
+    # |χ_1 + q² χ_2|².
+    a_sum_sq = (
+        mag1_sq
+        + mag2_sq * jnp.square(jnp.square(q))
+        + 2.0 * jnp.square(q) * chi1_dot_chi2
+    )
     parallel_combo = chi1_z + jnp.square(q) * chi2_z
     return (
         _S4 / jnp.square(one_plus_q2) * a_sum_sq
