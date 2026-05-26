@@ -105,6 +105,15 @@ def loss_density(
 
     Memory footprint: builds a ``(N_m, N_chi, N_m, N_chi)`` 4-D array.
     At (96, 32) and float64 that is ~75 MB — comfortable.
+
+    Forwards ``response.orientation`` / ``retention_kind`` /
+    ``w_over_v_esc`` to :func:`P_retain` so the misalignment dispatch
+    set at construction time fires through the production implicit
+    solver.  ``Aligned`` (the default) routes to the bit-for-bit v1
+    Heaviside; non-Aligned routes to the marginalised retention.
+    Without this forward, the implicit solver silently ignored the
+    orientation field — caught by
+    ``tests/test_misalignment_invariants.py`` Step 11.
     """
     grid = response.grid
     m = grid.m
@@ -116,7 +125,12 @@ def loss_density(
     chi2 = chi[None, None, None, :]
 
     log_K = log_pairing_kernel(m1, m2, **response.kernel_params)  # (N_m, 1, N_m, 1)
-    P = P_retain(m1, m2, chi1, chi2, v_esc)  # (N_m, N_chi, N_m, N_chi)
+    P = P_retain(
+        m1, m2, chi1, chi2, v_esc,
+        orientation=response.orientation,
+        retention_kind=response.retention_kind,
+        w_over_v_esc=response.w_over_v_esc,
+    )  # (N_m, N_chi, N_m, N_chi)
     K_P = jnp.exp(log_K) * P  # broadcasts on j
 
     integrand = K_P * N[None, None, :, :]  # multiply by N(m', χ')
@@ -145,7 +159,16 @@ def gain_density(
     response: "CoagulationResponse",
     v_esc: Array,
 ) -> Array:
-    """Density-form gain term ``(1/2) ∫∫ K · N · N · P_retain`` on the grid."""
+    """Density-form gain term ``(1/2) ∫∫ K · N · N · P_retain`` on the grid.
+
+    Forwards ``response.orientation`` / ``retention_kind`` /
+    ``w_over_v_esc`` to :func:`_step_one_generation` so the
+    misalignment dispatch fires through the production implicit
+    solver — same wiring as :func:`loss_density`.  Without this
+    forward, the bilinear gain accumulator ignored the orientation
+    field while the per-generation perturbative ``_solve`` honoured
+    it, producing a silent divergence between the two solver paths.
+    """
     log_N_safe = jnp.log(jnp.maximum(N, 1e-30))
     raw_weight_per_cell = _step_one_generation(
         log_N_safe,
@@ -154,6 +177,9 @@ def gain_density(
         response.grid,
         v_esc,
         0.5,  # (1/2) ∫∫ K N N P_retain — unordered-pair correction
+        orientation=response.orientation,
+        retention_kind=response.retention_kind,
+        w_over_v_esc=response.w_over_v_esc,
     )
     grid = response.grid
     dm_out = _dm_log_weights(grid.m, grid.log_m)
