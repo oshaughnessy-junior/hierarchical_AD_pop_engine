@@ -19,6 +19,28 @@ If this disagrees with the engine, the engine has a bug. If it agrees
 with the Doctor-perturbative-with-loss backup (Backup 2), we have two
 independent witnesses to the "correct" total ``N(m, χ)``.
 
+Misalignment mode — Session C wiring
+------------------------------------
+``MCConfig.orientation`` accepts any concrete :mod:`spin_orientation`
+model (``Aligned`` / ``Isotropic`` / ``Fisher(κ)``).  Defaults to
+``None`` which is treated as ``Aligned()``: the per-merger code path is
+the **bit-for-bit existing** scalar ``chi_rem`` / ``v_kick_aligned`` /
+``retention_aligned`` triple.  Under any non-``Aligned`` model the MC
+draws one orientation realisation per accepted pair from
+``orientation.sample(key, 1)``, promotes the natal spin magnitudes to
+vectors, evaluates the full vector Barausse-Rezzolla 2009 remnant spin
+and Lousto-Zlochower 2008/2011 kick, and applies a per-event Heaviside
+retention against the per-event ``v_kick`` (no MC-side marginalisation
+needed; each accepted pair is a single physical event).  The
+``v_kicks`` 1-D array on the return dict carries the per-event kick
+magnitude alongside the existing ``mergers`` 8-column schema, which is
+left untouched for downstream-reader compatibility.
+
+The natal ``chi`` distribution is sampled in ``[0, 1]`` and interpreted
+as **signed χ** under ``Aligned`` (v1 semantics) and as ``|χ|`` under
+non-``Aligned`` (the orientation distribution carries the sign / tilt).
+Same numerical values, different interpretation — no schema change.
+
 Run::
 
     python -m red_team.backup_particle_mc       # smoke at Stage 1 θ*
@@ -28,10 +50,12 @@ from __future__ import annotations
 
 import argparse
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from scipy.stats import truncnorm
 
@@ -42,7 +66,13 @@ from hierarchical_ad_pop_engine.remnants.mass import M_rem as _M_rem_jax
 from hierarchical_ad_pop_engine.remnants.spin import chi_rem as _chi_rem_jax
 from hierarchical_ad_pop_engine.remnants.kick import (
     retention_aligned as _retention_aligned_jax,
+    v_kick_aligned as _v_kick_aligned_jax,
 )
+from hierarchical_ad_pop_engine.remnants.marginal import (
+    chi_rem_at_orientation as _chi_rem_at_orientation_jax,
+    v_kick_at_orientation as _v_kick_at_orientation_jax,
+)
+from hierarchical_ad_pop_engine.spin_orientation import Aligned as _Aligned
 
 from red_team.sim_coagulation import make_marginal
 
@@ -100,10 +130,91 @@ class MCConfig:
     # `compare_all` output, where engine ≈ Backup 2 implicit at ε ≈ 0.025.
     # Running to full depletion (the original default) leaves only a
     # handful of high-generation remnants and the KDE looks featureless.
+    #
+    # Per `feedback-mc-depletion-tracks-engine` this is **not** a free
+    # knob in production fits: the demo / acceptance harnesses set it
+    # from the engine's ``f_natal_depleted`` so the two paths sample the
+    # same regime.  Left as a config field here because the standalone
+    # MC smoke (this module's ``__main__``) doesn't have an engine in
+    # the loop.
     depletion_fraction: float = 0.05
     # Sample budget on each call to the K-rejection batch — bigger means
     # less Python overhead but more wasted work if acceptance is high.
     rejection_batch: int = 1024
+    # Misalignment mode — Session C.  ``None`` is treated as
+    # :class:`~hierarchical_ad_pop_engine.spin_orientation.Aligned` and
+    # routes every accepted pair through the existing scalar v1
+    # ``chi_rem`` / ``v_kick_aligned`` / ``retention_aligned`` code path
+    # bit-for-bit.  Any other concrete ``OrientationModel`` activates the
+    # per-event vector-physics path (see
+    # ``demo/PLAN_misalignment_mode.md`` § Session C, step 8).
+    orientation: object = None
+    # Master jax PRNG seed used to derive per-event sampling keys under
+    # non-``Aligned`` orientations.  Independent of the numpy ``rng`` so
+    # that switching orientation models does not perturb the pair-
+    # rejection sequence (Aligned bit-for-bit invariant relies on the
+    # numpy ``rng`` driving everything that touches the active pool).
+    orientation_key_seed: int = 0
+
+
+def _orientation_is_aligned(orientation: object) -> bool:
+    """``True`` if ``orientation`` should route to the v1 scalar path.
+
+    ``None`` is treated as ``Aligned()`` so callers that pre-date Session
+    C continue to land on the bit-for-bit existing code path.
+    """
+    return orientation is None or isinstance(orientation, _Aligned)
+
+
+def _per_event_remnant_misaligned(
+    key: jax.Array,
+    m1: float,
+    m2: float,
+    chi1_mag: float,
+    chi2_mag: float,
+    v_esc: float,
+    orientation: object,
+) -> tuple[float, float, float, bool]:
+    """One MC-event remnant evaluation under a non-``Aligned`` orientation.
+
+    Samples ``(θ_1, φ_1, θ_2, φ_2)`` from ``orientation.sample(key, 1)``,
+    promotes the scalar progenitor magnitudes to vector spins via the
+    convention ``φ_1 = 0``, ``φ_2 = Δφ`` (azimuthal-symmetry collapse:
+    ``|χ_rem|`` and ``v_kick`` are invariant under rigid rotation about
+    ``L̂``), and returns the scalar ``(m_rem, |χ_rem|, v_kick, retain)``
+    for this event.
+
+    ``m_rem`` uses the parallel projection ``χ_z = χ_mag · cos θ`` —
+    matches the convention the engine's ``_step_one_generation``
+    marginalised path uses for ``M_rem``'s ``chi_eff`` input (see
+    ``project-misalignment-session-b-done``).
+
+    Retention is **per-event Heaviside** ``v_kick < v_esc``.  No
+    orientation-side marginalisation: each accepted pair is one physical
+    event with a definite outcome.
+    """
+    theta_1, phi_1, theta_2, phi_2 = orientation.sample(key, n_events=1)
+    cos_t1 = float(jnp.cos(theta_1[0]))
+    cos_t2 = float(jnp.cos(theta_2[0]))
+    dphi = float(phi_2[0] - phi_1[0])
+
+    # Parallel projection feeds M_rem's chi_eff input.
+    chi_z_1 = chi1_mag * cos_t1
+    chi_z_2 = chi2_mag * cos_t2
+    m_rem = float(_M_rem_jax(m1, m2, chi_z_1, chi_z_2))
+
+    chi_rem_mag = float(
+        _chi_rem_at_orientation_jax(
+            m1, m2, chi1_mag, chi2_mag, cos_t1, cos_t2, dphi
+        )
+    )
+    v_kick = float(
+        _v_kick_at_orientation_jax(
+            m1, m2, chi1_mag, chi2_mag, cos_t1, cos_t2, dphi
+        )
+    )
+    retain = v_kick < float(v_esc)
+    return m_rem, chi_rem_mag, v_kick, retain
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +260,14 @@ def particle_mc(
         ``m_active``, ``chi_active``, ``gen_active`` — surviving particles.
         ``mergers``  : structured array shape ``(N_accept, 8)`` of accepted
             merger events: (m1, m2, χ1, χ2, g1, g2, retained, m_remnant_or_nan).
-            Heavier first.
+            Heavier first.  Under non-``Aligned`` orientation the χ columns
+            are the **progenitor magnitudes** ``|χ_1|, |χ_2|`` (the
+            orientation distribution carries the sign / tilt).
+        ``v_kicks`` : 1-D array shape ``(N_accept,)`` of the per-event
+            recoil ``v_kick`` (km/s).  Under ``Aligned`` this is the
+            scalar :func:`v_kick_aligned`; under any other orientation
+            the per-event sample.  Added in Session C — older readers
+            that only consume ``mergers`` are unaffected.
         ``stats`` : dict with n_attempts, n_accepted, n_retained, n_active_final.
 
     Notes
@@ -159,7 +277,17 @@ def particle_mc(
     batch the *K-rejection step* (drawing many candidate pairs at once)
     because that's where ~all the wallclock goes — typically O(1/⟨K⟩)
     rejections per accepted pair.
+
+    Aligned bit-for-bit invariant: when ``cfg.orientation is None`` or
+    ``Aligned()`` the only numerical change versus pre-Session-C code is
+    the new ``v_kicks`` array on the return dict — every other quantity
+    (active particles, mergers list, stats counters, rng draws) is
+    literally unchanged.  The Heaviside retention is what was already
+    routed; the new ``v_kick_aligned`` evaluation on each accepted pair
+    is read-only and does not perturb the numpy ``rng`` sequence.
     """
+    aligned_path = _orientation_is_aligned(cfg.orientation)
+    orient_key_state = jax.random.PRNGKey(int(cfg.orientation_key_seed))
     m_arr, chi_arr = sample_natals(cfg, rng)
     n_init = m_arr.size
     gen_arr = np.ones(n_init, dtype=np.int32) if track_generations else None
@@ -178,6 +306,11 @@ def particle_mc(
     n_active_floor = max(2, int(n_init * (1.0 - cfg.depletion_fraction))) if cfg.n_max_mergers is None else 2
 
     mergers_records: list[np.ndarray] = []
+    # Per-event v_kick (km/s).  Aligned: v_kick_aligned scalar.
+    # Non-Aligned: per-event vector-LZ sample.  Indexed in lockstep with
+    # ``mergers_records`` so the i-th entry corresponds to the i-th
+    # accepted merger.
+    v_kicks_records: list[float] = []
 
     n_attempts = 0
     n_accepted = 0
@@ -247,11 +380,34 @@ def particle_mc(
             ca = chi_arr[i_a]; cb = chi_arr[i_b]
             ga = (gen_arr[i_a] if gen_arr is not None else 1)
             gb = (gen_arr[i_b] if gen_arr is not None else 1)
-            retain = bool(retention_aligned(ma, mb, ca, cb, cfg.v_esc) > 0.5)
+
+            if aligned_path:
+                # ---------- Aligned bit-for-bit existing v1 path. ----------
+                retain = bool(retention_aligned(ma, mb, ca, cb, cfg.v_esc) > 0.5)
+                if retain:
+                    m_new = float(M_rem(ma, mb, ca, cb))
+                    chi_new = float(chi_rem_(ma, mb, ca, cb))
+                # v_kick for the v_kicks return array — read-only, does
+                # not affect the active-pool sequence.  Evaluating both
+                # branches keeps the per-event work uniform regardless of
+                # whether the pair was retained.
+                v_kick_evt = float(_v_kick_aligned_jax(ma, mb, ca, cb))
+            else:
+                # ---------- Non-Aligned: per-event vector physics. ---------
+                # Advance the orientation key stream.  Independent of the
+                # numpy ``rng`` so the active-pool sequence stays in lock-
+                # step with the Aligned baseline up to the retention
+                # decision.
+                orient_key_state, evt_key = jax.random.split(orient_key_state)
+                m_new, chi_new, v_kick_evt, retain = (
+                    _per_event_remnant_misaligned(
+                        evt_key, float(ma), float(mb),
+                        float(ca), float(cb),
+                        cfg.v_esc, cfg.orientation,
+                    )
+                )
 
             if retain:
-                m_new = float(M_rem(ma, mb, ca, cb))
-                chi_new = float(chi_rem_(ma, mb, ca, cb))
                 # Replace heavier-slot with the remnant; deactivate the
                 # other. Heavier slot first so the bookkeeping conserves
                 # m1 ≥ m2 cosmetically.
@@ -275,6 +431,7 @@ def particle_mc(
             else:
                 rec = (mb, ma, cb, ca, gb, ga, float(retain), event_rem)
             mergers_records.append(rec)
+            v_kicks_records.append(v_kick_evt)
 
             if n_accepted >= n_max_mergers:
                 break
@@ -288,6 +445,10 @@ def particle_mc(
             np.asarray(mergers_records, dtype=np.float64)
             if mergers_records else np.empty((0, 8), dtype=np.float64)
         ),
+        v_kicks=(
+            np.asarray(v_kicks_records, dtype=np.float64)
+            if v_kicks_records else np.empty((0,), dtype=np.float64)
+        ),
         stats=dict(
             n_attempts=n_attempts,
             n_accepted=n_accepted,
@@ -296,6 +457,7 @@ def particle_mc(
             n_init=n_init,
             stop_reason=stop_reason,
             depletion=1.0 - (int(active.sum()) / max(n_init, 1)),
+            orientation=type(cfg.orientation).__name__ if cfg.orientation is not None else "Aligned",
         ),
     )
 

@@ -554,6 +554,9 @@ def build_gaussian_coagulation(
     grid: Optional[BinaryGrid] = None,
     solver: str = "perturbative",
     epsilon: ArrayLike = 1.0,
+    orientation: object = None,
+    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    w_over_v_esc: float = 1.0,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -562,13 +565,27 @@ def build_gaussian_coagulation(
     ``μ = 8 M⊙``, ``σ = 1 M⊙`` give a narrow Gaussian centred on the natal
     8 M⊙ BHs of Doctor+2020's working example, so successive generations
     pile up at the expected ``M_rem(m, m)`` cascade locations.
+
+    Misalignment-mode arguments
+    ---------------------------
+    ``orientation`` — defaults to ``None`` which keeps the v1 ``Aligned``
+    behaviour bit-for-bit at every internal call site (the orientation
+    field falls back to ``CoagulationResponse``'s default factory).  Pass
+    a concrete :mod:`spin_orientation` model (``Isotropic`` / ``Fisher``)
+    to engage the per-orientation vector physics path inside
+    ``_step_one_generation``.
+
+    ``retention_kind`` and ``w_over_v_esc`` configure the per-orientation
+    retention under non-``Aligned`` models (ignored otherwise).  See
+    ``CoagulationResponse`` and
+    :func:`remnants.marginal.P_retain_marginalised` for details.
     """
     if grid is None:
         grid = BinaryGrid.default(
             m_min=float(jnp.asarray(m_min)),
             m_max=float(jnp.asarray(m_max)),
         )
-    return CoagulationResponse(
+    kwargs = dict(
         grid=grid,
         k_max=k_max,
         natal_mass_params=dict(
@@ -589,7 +606,12 @@ def build_gaussian_coagulation(
         natal_mass_kind="gaussian",
         solver=solver,
         epsilon=jnp.asarray(epsilon),
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
     )
+    if orientation is not None:
+        kwargs["orientation"] = orientation
+    return CoagulationResponse(**kwargs)
 
 
 def build_default_coagulation(

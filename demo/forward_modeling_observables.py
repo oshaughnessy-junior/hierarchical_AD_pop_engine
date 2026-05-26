@@ -101,8 +101,73 @@ from hierarchical_ad_pop_engine.response.coagulation import (  # noqa: E402
 from hierarchical_ad_pop_engine.response.implicit import (  # noqa: E402
     solve_implicit_fixed_point,
 )
+from hierarchical_ad_pop_engine.spin_orientation import (  # noqa: E402
+    Aligned, Fisher, Isotropic,
+)
 
 from red_team import backup_particle_mc as B1  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# --orientation CLI parsing.
+# ---------------------------------------------------------------------------
+def parse_orientation(spec: str):
+    r"""Parse the ``--orientation`` CLI value into an OrientationModel.
+
+    Recognised forms (case-insensitive):
+
+    * ``aligned``                 — :class:`Aligned`, v1 default
+    * ``isotropic``               — :class:`Isotropic.default`
+    * ``fisher:κ``                — :class:`Fisher.default(kappa=κ)`
+      where ``κ`` is parsed as ``float`` (e.g. ``fisher:5.0``).
+
+    ``κ`` may also be passed as ``inf`` to nominally select the
+    ``Aligned`` limit — but since Fisher's quadrature loses tail
+    accuracy for very large κ, the explicit ``aligned`` keyword is the
+    right way to request the bit-for-bit aligned path.
+    """
+    s = spec.strip().lower()
+    if s in ("aligned", "a"):
+        return Aligned()
+    if s in ("isotropic", "iso", "i"):
+        return Isotropic.default()
+    if s.startswith("fisher:") or s.startswith("f:"):
+        _, _, kappa_s = s.partition(":")
+        kappa_s = kappa_s.strip()
+        if not kappa_s:
+            raise argparse.ArgumentTypeError(
+                "--orientation 'fisher:κ' requires a concentration value, "
+                "e.g. 'fisher:5.0'"
+            )
+        try:
+            kappa = float(kappa_s)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"--orientation 'fisher:{kappa_s}' — could not parse κ "
+                f"as float: {exc}"
+            ) from exc
+        if not (kappa >= 0.0):
+            raise argparse.ArgumentTypeError(
+                f"--orientation 'fisher:{kappa}' — κ must be ≥ 0 "
+                "(κ = 0 ≡ isotropic, κ → ∞ ≡ aligned).  Use 'isotropic' "
+                "or 'aligned' for the endpoints."
+            )
+        return Fisher.default(kappa=kappa)
+    raise argparse.ArgumentTypeError(
+        f"--orientation {spec!r} not recognised; expected 'aligned', "
+        "'isotropic', or 'fisher:κ' (e.g. 'fisher:5.0')"
+    )
+
+
+def orientation_tag(orientation: object) -> str:
+    """Short label for the orientation, suitable for filenames / titles."""
+    if isinstance(orientation, Aligned):
+        return "aligned"
+    if isinstance(orientation, Isotropic):
+        return "isotropic"
+    if isinstance(orientation, Fisher):
+        return f"fisher_k{float(orientation.kappa):g}"
+    return type(orientation).__name__.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +387,16 @@ def _gaussian_smooth_1d(y: np.ndarray, sigma_bins: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Engine path — build response, run implicit solver, compute observables.
 # ---------------------------------------------------------------------------
-def build_response(theta: dict, n_m: int, n_chi: int, epsilon: float):
+def build_response(
+    theta: dict,
+    n_m: int,
+    n_chi: int,
+    epsilon: float,
+    *,
+    orientation: object | None = None,
+    retention_kind: str = "heaviside",
+    w_over_v_esc: float = 1.0,
+):
     r"""Build a :class:`CoagulationResponse` at ``θ*`` with the given grid.
 
     Forces ``solver="implicit"`` so any caller that uses
@@ -331,6 +405,10 @@ def build_response(theta: dict, n_m: int, n_chi: int, epsilon: float):
     :func:`solve_implicit_fixed_point` directly (gives explicit
     hyperparameter control), so the ``solver`` field is informational —
     but keeping it pinned makes the build call self-describing.
+
+    ``orientation`` defaults to ``None`` (engine falls back to Aligned()
+    bit-for-bit).  Pass any concrete OrientationModel to engage the
+    misalignment-mode path inside ``_step_one_generation``.
     """
     grid = BinaryGrid.default(
         m_min=float(theta["m_min"]),
@@ -352,6 +430,37 @@ def build_response(theta: dict, n_m: int, n_chi: int, epsilon: float):
         grid=grid,
         solver="implicit",
         epsilon=epsilon,
+        orientation=orientation,
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
+    )
+
+
+def engine_total_rate_at_v_esc(
+    response, v_esc, *, epsilon: float,
+):
+    r"""Closed-form ``v_esc → total_rate`` map at fixed ``response``.
+
+    Routes through the production implicit solver
+    (``solve_implicit_fixed_point``) — same path as
+    :func:`engine_solve` — so ``jax.grad`` cashes in the IFT custom-VJP
+    plumbing already in ``response/implicit.py``.  Used for the
+    Session C step-10 demo-level confirmation that
+    ``∂total_rate/∂v_esc`` is finite and non-zero under any non-Aligned
+    orientation + sigmoid retention (Session B sandbox verified the
+    same property at the lower-level ``_solve`` surface; this is the
+    end-to-end demo-level cash-in).
+    """
+    result = solve_implicit_fixed_point(
+        response,
+        v_esc,
+        epsilon=epsilon,
+        max_iter=200,
+        tol=1e-7,
+        damping=0.4,
+    )
+    return obs.total_rate(
+        result.N, response.grid, response.kernel_params, response.log_R_env,
     )
 
 
@@ -360,12 +469,21 @@ def engine_solve(
     n_m: int,
     n_chi: int,
     epsilon: float,
+    *,
+    orientation: object | None = None,
+    retention_kind: str = "heaviside",
+    w_over_v_esc: float = 1.0,
 ):
     r"""Run the production implicit Picard solver.  Returns the response
     object, the converged density ``N(m, χ)``, and the solver diagnostic
     dict (``n_iter``, ``f_natal_depleted``, ...).
     """
-    response = build_response(theta, n_m, n_chi, epsilon)
+    response = build_response(
+        theta, n_m, n_chi, epsilon,
+        orientation=orientation,
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
+    )
     t0 = time.time()
     result = solve_implicit_fixed_point(
         response,
@@ -431,6 +549,9 @@ def engine_observables(
     theta: dict, n_m: int, n_chi: int, epsilon: float,
     *,
     smooth_sigma_bins: float = 0.7,
+    orientation: object | None = None,
+    retention_kind: str = "heaviside",
+    w_over_v_esc: float = 1.0,
 ):
     r"""Compute all engine observables on a single grid resolution.
 
@@ -459,7 +580,12 @@ def engine_observables(
     All histograms returned are densities (units: per unit on each axis),
     so they integrate to ``total_rate`` over the relevant volume.
     """
-    response, N_mchi, diag = engine_solve(theta, n_m, n_chi, epsilon)
+    response, N_mchi, diag = engine_solve(
+        theta, n_m, n_chi, epsilon,
+        orientation=orientation,
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
+    )
     grid = response.grid
     kp = response.kernel_params
     log_R = response.log_R_env
@@ -630,13 +756,21 @@ def engine_observables(
 # ---------------------------------------------------------------------------
 def run_mc(
     theta: dict, n_seed: int, depletion_fraction: float, seed: int,
-) -> tuple[dict, np.ndarray]:
-    r"""Run the particle-MC cascade.  Returns ``(stats_dict, mergers_array)``.
+    *,
+    orientation: object | None = None,
+    orientation_key_seed: int = 0,
+) -> tuple[dict, np.ndarray, np.ndarray]:
+    r"""Run the particle-MC cascade.  Returns ``(stats, mergers, v_kicks)``.
 
     The cascade stops when the active pool has shrunk by
     ``depletion_fraction``; ``depletion_fraction`` is taken from the
     implicit solver's ``f_natal_depleted`` per
     [[feedback-mc-depletion-tracks-engine]].
+
+    ``orientation`` defaults to ``None`` → Aligned bit-for-bit
+    (existing behaviour).  Any other concrete OrientationModel triggers
+    the per-event vector-physics path in
+    :func:`red_team.backup_particle_mc.particle_mc`.
     """
     cfg = B1.MCConfig(
         n_seed=int(n_seed),
@@ -650,6 +784,8 @@ def run_mc(
         kernel_a=theta["kernel_a"],
         kernel_b=theta["kernel_b"],
         v_esc=theta["v_esc"],
+        orientation=orientation,
+        orientation_key_seed=int(orientation_key_seed),
     )
     rng = np.random.default_rng(seed)
     t0 = time.time()
@@ -657,7 +793,7 @@ def run_mc(
     t_mc = time.time() - t0
     stats = dict(result["stats"])
     stats["wall_seconds"] = t_mc
-    return stats, result["mergers"]
+    return stats, result["mergers"], result["v_kicks"]
 
 
 def _hist_density(
@@ -1222,27 +1358,62 @@ def main() -> int:
              "1.0 to disable the gate (recovers the unmodified k-NN "
              "balloon estimator).  Scale-free.",
     )
+    parser.add_argument(
+        "--orientation", type=parse_orientation, default="aligned",
+        help="Spin-orientation model.  'aligned' (default) routes both "
+             "engine and MC through the v1 bit-for-bit scalar path.  "
+             "'isotropic' draws each spin uniformly on the 2-sphere.  "
+             "'fisher:κ' uses von Mises-Fisher concentrated on L̂ with "
+             "concentration κ ≥ 0 (κ → 0 == isotropic, κ → ∞ == aligned).",
+    )
+    parser.add_argument(
+        "--retention-kind", type=str, default="heaviside",
+        choices=["heaviside", "sigmoid"],
+        help="Per-orientation retention model under non-Aligned "
+             "orientations (ignored if --orientation is 'aligned'): "
+             "'heaviside' (default; preserves the v1 hard-cut at each "
+             "orientation quadrature point) or 'sigmoid' (soft cut, "
+             "recovers ∂/∂v_esc through JAX).",
+    )
+    parser.add_argument(
+        "--w-over-v-esc", type=float, default=1.0,
+        help="Sigmoid sharpness fraction (ignored unless "
+             "--retention-kind=sigmoid).  Default 1.0 → soft transition "
+             "of width v_esc around v_esc.",
+    )
     args = parser.parse_args()
 
     theta = dict(THETA_STAR)
     if args.v_esc is not None:
         theta["v_esc"] = float(args.v_esc)
 
+    orientation = args.orientation
+    o_tag = orientation_tag(orientation)
+
     here = Path(__file__).parent
     rh = args.out_hash or secrets.token_hex(3)
-    fig_dir = here / f"figures_fmobs_{rh}"
-    art_dir = here / f"artifacts_fmobs_{rh}"
+    # Tag the run-hash with the orientation choice so per-orientation
+    # runs at the same θ* and seed don't clobber each other's figures.
+    # Per [[feedback-demo-output-conventions]] each run gets its own
+    # figures_/artifacts_ dir.
+    rh_full = f"{rh}_{o_tag}"
+    fig_dir = here / f"figures_fmobs_{rh_full}"
+    art_dir = here / f"artifacts_fmobs_{rh_full}"
     fig_dir.mkdir(exist_ok=True)
     art_dir.mkdir(exist_ok=True)
-    print(f"forward_modeling_observables — run hash: {rh}")
+    print(f"forward_modeling_observables — run hash: {rh_full}")
     print(f"  figures   → {fig_dir.relative_to(here.parent)}/")
     print(f"  artifacts → {art_dir.relative_to(here.parent)}/")
     print(f"  resolutions: {args.resolutions}")
     print(f"  ε={args.epsilon}  v_esc={theta['v_esc']}  n_mc={args.n_mc}  seed={args.seed}")
+    print(
+        f"  orientation={o_tag}  retention_kind={args.retention_kind}"
+        + (f"  w/v_esc={args.w_over_v_esc}" if args.retention_kind == "sigmoid" else "")
+    )
 
     rows = []
     metadata = dict(
-        run_hash=rh,
+        run_hash=rh_full,
         theta_star=theta,
         epsilon=args.epsilon,
         seed=args.seed,
@@ -1251,6 +1422,9 @@ def main() -> int:
         void_h_ratio=args.void_h_ratio,
         engine_smooth_sigma_bins=args.engine_smooth_sigma,
         mc_kde_scheme="knn_balloon_uniform_kernel_with_void_gate",
+        orientation=o_tag,
+        retention_kind=args.retention_kind,
+        w_over_v_esc=args.w_over_v_esc,
         resolutions=[list(r) for r in args.resolutions],
         per_resolution=[],
     )
@@ -1261,7 +1435,46 @@ def main() -> int:
         engine_obs = engine_observables(
             theta, n_m, n_chi, args.epsilon,
             smooth_sigma_bins=args.engine_smooth_sigma,
+            orientation=orientation,
+            retention_kind=args.retention_kind,
+            w_over_v_esc=args.w_over_v_esc,
         )
+
+        # Session C step 10 — demo-level confirmation that
+        # ``∂total_rate/∂v_esc`` is finite and non-zero under any non-
+        # Aligned orientation + sigmoid retention.  Under Aligned +
+        # Heaviside the v1 path returns *exactly* 0 (the engine docstring
+        # documents this; gradients flow through every other parameter).
+        # See [[project-misalignment-session-b-done]] for the lower-
+        # level ``_solve``-surface verification.
+        v_esc_grad = None
+        if not isinstance(orientation, Aligned):
+            grad_response = build_response(
+                theta, n_m, n_chi, args.epsilon,
+                orientation=orientation,
+                retention_kind=args.retention_kind,
+                w_over_v_esc=args.w_over_v_esc,
+            )
+            grad_fn = jax.grad(
+                lambda v: engine_total_rate_at_v_esc(
+                    grad_response, v, epsilon=args.epsilon,
+                )
+            )
+            v_esc_jax = jnp.asarray(theta["v_esc"])
+            t0 = time.time()
+            v_esc_grad = float(grad_fn(v_esc_jax))
+            t_grad = time.time() - t0
+            sign = "+" if v_esc_grad >= 0 else "-"
+            print(
+                f"      ∂(total_rate)/∂(v_esc) = {sign}{abs(v_esc_grad):.4e}"
+                f"  (wall={t_grad:.1f}s, [{args.retention_kind}])"
+            )
+            if v_esc_grad == 0.0:
+                print(
+                    "      WARNING: v_esc gradient is exactly zero — "
+                    "expected non-zero under non-Aligned orientation.  "
+                    "Check retention_kind / sigmoid sharpness."
+                )
         d = engine_obs["diag"]
         print(
             f"      converged in {d['n_iter']} iters; "
@@ -1274,11 +1487,16 @@ def main() -> int:
         # MC stopping fraction tracks the engine's f_natal_depleted.
         f_dep = max(d["f_natal_depleted"], 1e-3)
         print(f"[2/3] particle MC (n_seed={args.n_mc}, depletion={f_dep:.4g}) ...")
-        stats, mergers = run_mc(
+        stats, mergers, v_kicks = run_mc(
             theta,
             n_seed=args.n_mc,
             depletion_fraction=f_dep,
             seed=args.seed + n_m * 1009 + n_chi,
+            orientation=orientation,
+            # Deterministic per-resolution orientation key — keeps the
+            # run reproducible without colliding the orientation stream
+            # against the numpy seed used for the active-pool dynamics.
+            orientation_key_seed=args.seed + n_m * 7919 + n_chi * 31,
         )
         print(
             f"      n_accepted={stats['n_accepted']}  "
@@ -1313,11 +1531,32 @@ def main() -> int:
         rows.append(dict(
             n_m=n_m, n_chi=n_chi, engine=engine_obs, mc=mc_obs,
         ))
+        # Per-resolution kick-distribution summary — Session C diagnostic.
+        # Under Aligned: v_kicks are the scalar v_kick_aligned values
+        # (small, O(10) km/s at θ*).  Under Isotropic / Fisher: the per-
+        # event vector-LZ kicks include the v_⊥ "superkick" branch and
+        # can reach O(few×10³) km/s — this is what activates retention.
+        if v_kicks.size:
+            kick_summary = dict(
+                v_kick_median=float(np.median(v_kicks)),
+                v_kick_p90=float(np.percentile(v_kicks, 90)),
+                v_kick_max=float(np.max(v_kicks)),
+                v_kick_frac_above_v_esc=float(
+                    np.mean(v_kicks > theta["v_esc"])
+                ),
+            )
+        else:
+            kick_summary = dict(
+                v_kick_median=0.0, v_kick_p90=0.0, v_kick_max=0.0,
+                v_kick_frac_above_v_esc=0.0,
+            )
         metadata["per_resolution"].append(dict(
             n_m=n_m, n_chi=n_chi,
             engine_diag=d,
             engine_total_rate=engine_obs["total_rate"],
+            v_esc_grad=v_esc_grad,
             mc_stats=stats,
+            mc_kicks=kick_summary,
             rate_scale_ordered=rate_scale_ordered,
         ))
 
