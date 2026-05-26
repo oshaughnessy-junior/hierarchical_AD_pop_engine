@@ -280,6 +280,14 @@ def P_retain_marginalised(
     if isinstance(orientation, Aligned):
         return retention_aligned(m1, m2, chi1_mag, chi2_mag, v_esc)
     v_q, w = v_kick_distribution(m1, m2, chi1_mag, chi2_mag, orientation)
+    # v_q shape is ``(n_quad, *progenitor_broadcast_shape)`` — the
+    # vmap inside ``v_kick_distribution`` puts the quadrature axis
+    # leading.  At scalar progenitor inputs the trailing shape is
+    # empty; at the implicit solver's 4-D progenitor-mesh broadcast
+    # ``(m1, m2, chi1, chi2)`` it is ``(N_m, N_chi, N_m, N_chi)``.
+    # ``w`` is always ``(n_quad,)`` and must be reshaped to broadcast
+    # over the trailing axes; the sum reduces *only* over the
+    # orientation axis, returning a per-cell marginalised retention.
     if retention_kind == "heaviside":
         retain_q = jnp.where(v_q < v_esc, 1.0, 0.0)
     elif retention_kind == "sigmoid":
@@ -290,7 +298,13 @@ def P_retain_marginalised(
             f"Unknown retention_kind {retention_kind!r}; expected "
             "'heaviside' or 'sigmoid'."
         )
-    return jnp.sum(w * retain_q)
+    # Reshape ``w`` to ``(n_quad, 1, ..., 1)`` so it broadcasts cleanly
+    # over any trailing progenitor-mesh shape.  At scalar inputs
+    # (``retain_q.ndim == 1``) the reshape is a no-op so the original
+    # scalar-output behaviour is preserved exactly (no breaking
+    # change to Session B callers).
+    w_b = w.reshape((w.shape[0],) + (1,) * (retain_q.ndim - 1))
+    return jnp.sum(w_b * retain_q, axis=0)
 
 
 # ---------------------------------------------------------------------------
