@@ -1,23 +1,32 @@
-"""NR-calibrated remnant fits: M_rem, χ_rem, v_kick (aligned-only).
+"""NR-calibrated remnant fits: M_rem, χ_rem, v_kick — aligned and vector.
 
 References:
 
 - mass: Buonanno-Kidder-Lehner 2008 / Barausse-Morozova-Rezzolla 2012
   polynomial fit in (η, χ_eff).
-- spin: Barausse-Rezzolla 2009 aligned-spin "final spin formula".
-- kick: Lousto-Zlochower 2008/2011 aligned-spin. Retention is a Heaviside
-  step in v_esc — see ``remnants.kick`` module docstring for the AD
-  consequences.
+- spin (aligned): Barausse-Rezzolla 2009 "final spin formula".
+- spin (vector): Barausse-Rezzolla 2009 full vector form — see
+  :mod:`remnants.spin_vector`.
+- kick (aligned): Lousto-Zlochower 2008/2011 aligned-spin. Retention
+  is a Heaviside step in v_esc — see ``remnants.kick`` module docstring
+  for the AD consequences.
+- kick (vector): Lousto-Zlochower with in-plane "superkick" term —
+  see :mod:`remnants.kick_vector`.  Marginalisation over a prescribed
+  orientation distribution (Session B) recovers smoothness in v_esc.
 """
 
 from .kick import retention_aligned, v_kick_aligned
+from .kick_vector import v_kick_vec
 from .mass import M_rem, chi_effective, E_rad_fraction, eta
 from .spin import chi_rem
+from .spin_vector import chi_rem_vec
 
 __all__ = [
     "M_rem",
     "chi_rem",
+    "chi_rem_vec",
     "v_kick_aligned",
+    "v_kick_vec",
     "retention_aligned",
     "chi_effective",
     "E_rad_fraction",
