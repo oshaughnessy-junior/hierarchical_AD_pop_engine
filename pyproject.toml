@@ -56,6 +56,9 @@ Repository = "https://github.com/oshaughn/hierarchical_AD_pop_engine"
 [tool.pytest.ini_options]
 addopts = ["-v", "--color=yes"]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that take longer than a few seconds; opt in with `pytest -m slow` or run the full default suite to include them.",
+]
 
 [tool.ruff]
 line-length = 100
