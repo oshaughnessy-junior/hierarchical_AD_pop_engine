@@ -58,7 +58,7 @@ def P_retain(
     v_esc: Array,
     orientation: Optional[object] = None,
     *,
-    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
 ) -> Array:
     """Retention probability, dispatched on the orientation model.
@@ -83,18 +83,24 @@ def P_retain(
         for :class:`Aligned` (which always shortcuts to the
         :func:`remnants.kick.retention_aligned` Heaviside).
 
-        * ``"heaviside"`` (default): hard cut at each orientation
-          quadrature point.  Function value is the correct
-          orientation-weighted retention, but ``jax.grad`` w.r.t.
-          ``v_esc`` is 0 almost everywhere (the discrete quadrature
-          is a finite sum of Heavisides — analytically a smooth CDF,
-          numerically a step function with many tiny steps).
-        * ``"sigmoid"``: ``σ((v_esc - v_kick)/w)`` per orientation
-          with ``w = w_over_v_esc · v_esc``.  Smooth ``v_esc``
-          gradients — the AD-on-``v_esc`` two-for-one win from the
-          PLAN.  Bias from the soft cut is ``O(w_over_v_esc)``
-          relative to the Heaviside; for population-level work the
-          two agree to a few percent at ``w_over_v_esc = 1``.
+        * ``"sigmoid"`` (default; 2026-05-27 flip — see
+          ``spin_orientation.py`` Convergence Notes): ``σ((v_esc -
+          v_kick)/w)`` per orientation with ``w = w_over_v_esc ·
+          v_esc``.  Smooth in ``θ̂_1, θ̂_2, Δφ`` ⇒ the
+          ``spin_orientation``-module ``(4, 8) = 128``-point default
+          quadrature converges spectrally; ``jax.grad`` w.r.t.
+          ``v_esc`` flows naturally (the AD-on-``v_esc`` two-for-one
+          win from the PLAN).  Bias from the soft cut is
+          ``O(w_over_v_esc)`` relative to the Heaviside; for
+          population-level work the two agree to a few percent at
+          ``w_over_v_esc = 1``.
+        * ``"heaviside"`` (opt-in for v1 bit-equality): hard cut at
+          each orientation quadrature point.  The integrand becomes
+          piecewise-discontinuous in orientation, so the (4, 8)
+          default quadrature drops from spectral to ``O(1/n²)``
+          convergence — pass ``Isotropic(n_theta=8, n_dphi=16)`` to
+          recover the v1 1024-point accuracy.  ``jax.grad`` w.r.t.
+          ``v_esc`` is 0 almost everywhere under this path.
     w_over_v_esc : float
         Sigmoid sharpness as a fraction of ``v_esc`` (only used when
         ``retention_kind="sigmoid"``).  See ``demo/PLAN_engine_v3_basis.md``

@@ -30,8 +30,10 @@ Concrete models
 ``Isotropic()``
     Uniform on the 2-sphere for each spin.  Product Gauss-Legendre on
     ``cos θ_1 × cos θ_2`` plus uniform-trapezoidal on ``Δφ`` (default
-    ``(n_θ, n_θ, n_Δφ) = (8, 8, 16) = 1024`` quadrature points).  The
-    ``κ → 0`` limit of ``Fisher``.
+    ``(n_θ, n_θ, n_Δφ) = (4, 4, 8) = 128`` quadrature points; see the
+    Convergence Notes at the top of this module for the smooth-
+    integrand rationale for the 128-point default and the Heaviside-
+    retention caveat).  The ``κ → 0`` limit of ``Fisher``.
 
 ``Fisher(κ)``
     Per-spin von Mises-Fisher on the 2-sphere concentrated along
@@ -87,8 +89,62 @@ from jaxtyping import Float
 
 
 # Default quadrature resolutions.
-_DEFAULT_N_THETA = 8
-_DEFAULT_N_DPHI = 16
+#
+# 2026-05-27 update: dropped from ``(n_θ, n_Δφ) = (8, 16) = 1024`` to
+# ``(4, 8) = 128`` points per merger cell — an 8× compute speedup on
+# both the gain and loss sides of the implicit solver (each scans
+# ``n_quad`` per Picard iteration).  Rationale and accuracy bound:
+#
+# Smooth-integrand argument
+# -------------------------
+# The orientation-marginal integrands are smooth in
+# ``(cos θ_1, cos θ_2, Δφ)`` under the **recommended** sigmoid
+# retention path (see ``CoagulationResponse``):
+#
+# * ``chi_rem_vec`` is degree-2 in the spin vectors (BR 2009 quadratic
+#   form) ⇒ degree-2 polynomial in ``cos θ_i``.  Gauss-Legendre with
+#   ``n_θ = 4`` is exact for degree-7 polynomials → machine precision.
+# * ``v_kick_vec`` has Fourier content in ``Δφ`` up to order ~3
+#   (in-plane + superkick terms).  Periodic trapezoidal with
+#   ``n_Δφ = 8`` resolves Fourier modes up to order 4 (Nyquist) → also
+#   machine precision on the smooth part.
+# * The smooth ``sigmoid`` retention preserves smoothness.
+#
+# So ``(4, 8) = 128`` points is more than enough for the sigmoid path.
+#
+# Heaviside-retention caveat
+# --------------------------
+# Under ``retention_kind="heaviside"`` the orientation integrand is
+# piecewise-discontinuous wherever ``v_kick(θ̂_1, θ̂_2, Δφ) = v_esc``,
+# and Gauss-Legendre convergence drops from spectral to ``O(1/n²)``.
+# In that regime the default ``(4, 8)`` will leave a few-percent
+# integration error.  Two workarounds:
+#
+# 1. Switch to sigmoid retention (the new default — see
+#    ``CoagulationResponse.retention_kind``).  Recovers AD-on-``v_esc``
+#    as a bonus.
+# 2. Pass a hand-built ``Isotropic(n_theta=8, n_dphi=16)`` or finer.
+#    All concrete models expose ``n_theta`` and ``n_dphi`` for
+#    per-call override.
+#
+# Override paths
+# --------------
+# * Code: ``Isotropic(n_theta=N, n_dphi=M)`` or
+#   ``Fisher(kappa=κ, n_theta=N, n_dphi=M)`` constructs an explicit
+#   higher / lower-resolution model.
+# * CLI: ``--n-theta`` / ``--n-dphi`` on both
+#   ``demo/forward_modeling_observables.py`` and
+#   ``demo/misalignment_observable_parity.py``.
+#
+# The old ``(8, 16)`` defaults were chosen with no convergence study
+# (they predated the Session-D performance debugging); the new
+# defaults are chosen against the smooth-integrand analytic argument
+# above and validated by the eight invariant-based tests in
+# ``tests/test_orientation_models.py`` + ``tests/test_remnant_marginal.py``
+# (Σw=1, ⟨cos θ⟩=0, ⟨cos² θ⟩=1/3, Fisher Langevin, MC-vs-quadrature
+# 5σ backstops at n_mc=200k — all hold at any quadrature ≥ (3, 6)).
+_DEFAULT_N_THETA = 4
+_DEFAULT_N_DPHI = 8
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +245,9 @@ class Isotropic(eqx.Module):
     """Uniform-on-the-sphere orientation for each spin (independent).
 
     Quadrature: product Gauss-Legendre on ``(cos θ_1, cos θ_2)`` × periodic
-    trapezoidal on ``Δφ``.  Default ``(n_θ, n_θ, n_Δφ) = (8, 8, 16) =
-    1024`` quadrature points per merger cell.
+    trapezoidal on ``Δφ``.  Default ``(n_θ, n_θ, n_Δφ) = (4, 4, 8) =
+    128`` quadrature points per merger cell (was 1024 before
+    2026-05-27; see Convergence Notes at the top of the module).
     """
 
     n_theta: int = eqx.field(static=True)

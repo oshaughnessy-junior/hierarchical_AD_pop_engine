@@ -111,26 +111,22 @@ from red_team import backup_particle_mc as B1  # noqa: E402
 # ---------------------------------------------------------------------------
 # --orientation CLI parsing.
 # ---------------------------------------------------------------------------
-def parse_orientation(spec: str):
-    r"""Parse the ``--orientation`` CLI value into an OrientationModel.
+def parse_orientation_spec(spec: str) -> tuple[str, float | None]:
+    r"""Parse the raw ``--orientation`` string into ``(kind, kappa_or_None)``.
 
-    Recognised forms (case-insensitive):
-
-    * ``aligned``                 — :class:`Aligned`, v1 default
-    * ``isotropic``               — :class:`Isotropic.default`
-    * ``fisher:κ``                — :class:`Fisher.default(kappa=κ)`
-      where ``κ`` is parsed as ``float`` (e.g. ``fisher:5.0``).
-
-    ``κ`` may also be passed as ``inf`` to nominally select the
-    ``Aligned`` limit — but since Fisher's quadrature loses tail
-    accuracy for very large κ, the explicit ``aligned`` keyword is the
-    right way to request the bit-for-bit aligned path.
+    Two-stage parsing: this function turns the CLI string into a kind
+    tag + optional ``κ``; :func:`build_orientation` then composes the
+    OrientationModel using whatever ``n_theta`` / ``n_dphi`` overrides
+    the CLI is also carrying.  Two stages because ``argparse`` calls
+    ``type=`` *before* it has parsed the other flags, so the
+    orientation parsing can't depend on the ``--n-theta`` / ``--n-dphi``
+    values yet.
     """
     s = spec.strip().lower()
     if s in ("aligned", "a"):
-        return Aligned()
+        return "aligned", None
     if s in ("isotropic", "iso", "i"):
-        return Isotropic.default()
+        return "isotropic", None
     if s.startswith("fisher:") or s.startswith("f:"):
         _, _, kappa_s = s.partition(":")
         kappa_s = kappa_s.strip()
@@ -152,11 +148,49 @@ def parse_orientation(spec: str):
                 "(κ = 0 ≡ isotropic, κ → ∞ ≡ aligned).  Use 'isotropic' "
                 "or 'aligned' for the endpoints."
             )
-        return Fisher.default(kappa=kappa)
+        return "fisher", kappa
     raise argparse.ArgumentTypeError(
         f"--orientation {spec!r} not recognised; expected 'aligned', "
         "'isotropic', or 'fisher:κ' (e.g. 'fisher:5.0')"
     )
+
+
+def build_orientation(
+    kind: str, kappa: float | None,
+    *, n_theta: int | None = None, n_dphi: int | None = None,
+):
+    r"""Compose an OrientationModel from a (kind, κ) pair and optional
+    quadrature overrides.
+
+    ``n_theta`` and ``n_dphi`` ``None`` ⇒ use the
+    :mod:`spin_orientation` module defaults (currently ``(4, 8) =
+    128`` points; see that module's Convergence Notes for the
+    smoothness-vs-cost trade-off).
+    """
+    if kind == "aligned":
+        return Aligned()  # Aligned ignores n_theta/n_dphi (single point)
+    extra = {}
+    if n_theta is not None:
+        extra["n_theta"] = int(n_theta)
+    if n_dphi is not None:
+        extra["n_dphi"] = int(n_dphi)
+    if kind == "isotropic":
+        return Isotropic.default(**extra)
+    if kind == "fisher":
+        return Fisher.default(kappa=float(kappa), **extra)
+    raise ValueError(f"unknown orientation kind: {kind!r}")
+
+
+def parse_orientation(spec: str):
+    r"""Back-compat wrapper: parse ``--orientation`` directly into an
+    OrientationModel at the module-default quadrature.
+
+    Kept for any external callers that import the symbol.  New code
+    should use the two-stage ``parse_orientation_spec`` +
+    ``build_orientation`` so ``--n-theta`` / ``--n-dphi`` can override.
+    """
+    kind, kappa = parse_orientation_spec(spec)
+    return build_orientation(kind, kappa)
 
 
 def orientation_tag(orientation: object) -> str:
@@ -394,7 +428,7 @@ def build_response(
     epsilon: float,
     *,
     orientation: object | None = None,
-    retention_kind: str = "heaviside",
+    retention_kind: str = "sigmoid",
     w_over_v_esc: float = 1.0,
 ):
     r"""Build a :class:`CoagulationResponse` at ``θ*`` with the given grid.
@@ -471,7 +505,7 @@ def engine_solve(
     epsilon: float,
     *,
     orientation: object | None = None,
-    retention_kind: str = "heaviside",
+    retention_kind: str = "sigmoid",
     w_over_v_esc: float = 1.0,
 ):
     r"""Run the production implicit Picard solver.  Returns the response
@@ -550,7 +584,7 @@ def engine_observables(
     *,
     smooth_sigma_bins: float = 0.7,
     orientation: object | None = None,
-    retention_kind: str = "heaviside",
+    retention_kind: str = "sigmoid",
     w_over_v_esc: float = 1.0,
 ):
     r"""Compute all engine observables on a single grid resolution.
@@ -1359,21 +1393,41 @@ def main() -> int:
              "balloon estimator).  Scale-free.",
     )
     parser.add_argument(
-        "--orientation", type=parse_orientation, default="aligned",
+        "--orientation", type=parse_orientation_spec, default="aligned",
         help="Spin-orientation model.  'aligned' (default) routes both "
              "engine and MC through the v1 bit-for-bit scalar path.  "
              "'isotropic' draws each spin uniformly on the 2-sphere.  "
              "'fisher:κ' uses von Mises-Fisher concentrated on L̂ with "
-             "concentration κ ≥ 0 (κ → 0 == isotropic, κ → ∞ == aligned).",
+             "concentration κ ≥ 0 (κ → 0 == isotropic, κ → ∞ == aligned). "
+             "Use --n-theta / --n-dphi to override the orientation "
+             "quadrature size.",
     )
     parser.add_argument(
-        "--retention-kind", type=str, default="heaviside",
+        "--n-theta", type=int, default=None,
+        help="Override the per-spin Gauss-Legendre node count on "
+             "(cos θ_1, cos θ_2).  Default uses the spin_orientation "
+             "module default (currently 4 — see that module's "
+             "Convergence Notes).  Bump to 8 to recover the v1 "
+             "1024-point accuracy under Heaviside retention.",
+    )
+    parser.add_argument(
+        "--n-dphi", type=int, default=None,
+        help="Override the periodic-trapezoidal node count on Δφ.  "
+             "Default uses the spin_orientation module default "
+             "(currently 8).  Bump to 16 alongside --n-theta=8 for "
+             "the v1 1024-point quadrature.",
+    )
+    parser.add_argument(
+        "--retention-kind", type=str, default="sigmoid",
         choices=["heaviside", "sigmoid"],
         help="Per-orientation retention model under non-Aligned "
              "orientations (ignored if --orientation is 'aligned'): "
-             "'heaviside' (default; preserves the v1 hard-cut at each "
-             "orientation quadrature point) or 'sigmoid' (soft cut, "
-             "recovers ∂/∂v_esc through JAX).",
+             "'sigmoid' (default after 2026-05-27; soft cut, smooth "
+             "integrand in orientation, AD-friendly through JAX) or "
+             "'heaviside' (v1 hard-cut at each orientation quadrature "
+             "point — piecewise-discontinuous integrand drops "
+             "quadrature convergence from spectral to O(1/n²), so "
+             "pair with --n-theta=8 --n-dphi=16 for v1 accuracy).",
     )
     parser.add_argument(
         "--w-over-v-esc", type=float, default=1.0,
@@ -1387,7 +1441,12 @@ def main() -> int:
     if args.v_esc is not None:
         theta["v_esc"] = float(args.v_esc)
 
-    orientation = args.orientation
+    # ``args.orientation`` is now (kind, κ_or_None) — compose using the
+    # CLI's quadrature overrides (None → spin_orientation module default).
+    kind, kappa = args.orientation
+    orientation = build_orientation(
+        kind, kappa, n_theta=args.n_theta, n_dphi=args.n_dphi,
+    )
     o_tag = orientation_tag(orientation)
 
     here = Path(__file__).parent
@@ -1406,9 +1465,17 @@ def main() -> int:
     print(f"  artifacts → {art_dir.relative_to(here.parent)}/")
     print(f"  resolutions: {args.resolutions}")
     print(f"  ε={args.epsilon}  v_esc={theta['v_esc']}  n_mc={args.n_mc}  seed={args.seed}")
+    # Resolve the effective quadrature size for diagnostic printing.
+    if isinstance(orientation, Aligned):
+        n_theta_eff, n_dphi_eff = 1, 1  # single-point quadrature
+    else:
+        n_theta_eff = orientation.n_theta
+        n_dphi_eff = orientation.n_dphi
     print(
         f"  orientation={o_tag}  retention_kind={args.retention_kind}"
         + (f"  w/v_esc={args.w_over_v_esc}" if args.retention_kind == "sigmoid" else "")
+        + f"  quadrature=({n_theta_eff}, {n_theta_eff}, {n_dphi_eff})"
+        + f" = {n_theta_eff * n_theta_eff * n_dphi_eff} pts"
     )
 
     rows = []
@@ -1423,6 +1490,9 @@ def main() -> int:
         engine_smooth_sigma_bins=args.engine_smooth_sigma,
         mc_kde_scheme="knn_balloon_uniform_kernel_with_void_gate",
         orientation=o_tag,
+        orientation_n_theta=int(n_theta_eff),
+        orientation_n_dphi=int(n_dphi_eff),
+        orientation_n_quad=int(n_theta_eff * n_theta_eff * n_dphi_eff),
         retention_kind=args.retention_kind,
         w_over_v_esc=args.w_over_v_esc,
         resolutions=[list(r) for r in args.resolutions],
