@@ -17,8 +17,9 @@ Factory function
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
+import equinox as eqx
 import jax.numpy as jnp
 from gwkokab.models.constraints import mass_sandwich
 from gwkokab.models.utils import ScaledMixture
@@ -158,6 +159,21 @@ def coagulation_model(
     n_m: int = 96,
     n_chi: int = 16,
     n_ve: int = 16,
+    # Solver dispatch — Session M2 of
+    # ``demo/PLAN_mc_first_reprioritization.md``.  ``"implicit"``
+    # remains the production default for AD-on-natal/kernel; ``"mc"``
+    # routes through ``response.mc.MCResponse`` (numpy stash + k-NN
+    # density estimator); ``"basis"`` routes through the v3 basis
+    # Picard.  ``[[feedback-perturbative-unreliable-implicit-production]]``
+    # — perturbative is legacy, not a supported value here.
+    solver: Literal["implicit", "basis", "mc"] = "implicit",
+    # MC-path keyword args, ignored unless ``solver="mc"``.
+    mc_v_esc: Optional[Array] = None,
+    mc_n_seed: int = 5000,
+    mc_depletion_fraction: float = 0.5,
+    mc_rng_seed: Optional[int] = None,
+    mc_orientation_key_seed: int = 0,
+    mc_k: Optional[int] = None,
     validate_args: Optional[bool] = None,
 ) -> ScaledMixture:
     """Build a ``ScaledMixture`` over the coagulation population.
@@ -168,6 +184,15 @@ def coagulation_model(
     The signature splits parameters into (1) physics (natal, kernel,
     response, formation) and (2) static grid configuration (compile-time).
     All physics parameters are differentiable.
+
+    Session M2 — ``solver="mc"`` adds the particle-MC inference path.
+    ``mc_v_esc`` bakes ``v_esc`` into the MC driver at construction
+    time (the formation-side ``env["v_esc"]`` is ignored under the MC
+    path; see ``response/mc.py`` "Hard gotcha").  ``mc_n_seed`` /
+    ``mc_depletion_fraction`` / ``mc_k`` control particle count,
+    evolution amount, and k-NN density-estimator bandwidth
+    respectively — production defaults sized to the
+    ``[[project-evaluation-step3-done]]`` 10 % rel-L1 budget.
     """
     grid = BinaryGrid.default(m_min=float(m_min), m_max=float(m_max), n_m=n_m, n_chi=n_chi)
     env_grid = EnvGrid.default(n_ve=n_ve)
@@ -188,7 +213,31 @@ def coagulation_model(
         log_R_env=log_R_env,
         k_max=k_max,
         grid=grid,
+        solver=solver,
     )
+
+    # Under ``solver="mc"`` run the MC driver eagerly and attach the
+    # stash.  ``build_default_coagulation`` doesn't yet take the M2
+    # MC kwargs (build_default uses pl_peak natal which the MC driver
+    # doesn't sample yet), so the attach is done here at the
+    # ``coagulation_model`` factory layer.
+    if solver == "mc":
+        if mc_v_esc is None:
+            raise ValueError(
+                "coagulation_model(solver='mc') requires mc_v_esc "
+                "(the MC driver bakes v_esc at construction time)."
+            )
+        from .response.mc import build_mc_response
+        mc_resp = build_mc_response(
+            response,
+            v_esc=mc_v_esc,
+            n_seed=mc_n_seed,
+            depletion_fraction=mc_depletion_fraction,
+            rng_seed=mc_rng_seed,
+            orientation_key_seed=mc_orientation_key_seed,
+            k=mc_k,
+        )
+        response = eqx.tree_at(lambda r: r.mc_response, response, mc_resp)
 
     redshift = MadauDickinsonRedshift(
         z_max=z_max, kappa=kappa, gamma=gamma, z_peak=z_peak, validate_args=validate_args
@@ -248,11 +297,27 @@ def coagulation_model_delta_formation(
     k_max: int = 4,
     n_m: int = 96,
     n_chi: int = 16,
+    # Solver dispatch — see ``coagulation_model`` for details.
+    solver: Literal["implicit", "basis", "mc"] = "implicit",
+    # MC-path keyword args, ignored unless ``solver="mc"``.  The
+    # delta-formation path naturally has a fiducial ``v_esc`` (the
+    # ``v_esc_fiducial`` arg above); ``mc_v_esc`` defaults to that
+    # value when ``None`` so the obvious call works.
+    mc_n_seed: int = 5000,
+    mc_depletion_fraction: float = 0.5,
+    mc_rng_seed: Optional[int] = None,
+    mc_orientation_key_seed: int = 0,
+    mc_k: Optional[int] = None,
     validate_args: Optional[bool] = None,
 ) -> ScaledMixture:
     """Same as :func:`coagulation_model` but with a :class:`DeltaFormation` —
     a single-environment hypothesis at fixed ``v_esc``. Useful for fitting
     the cosmic rate of a single channel without env-distribution freedom.
+
+    Session M2 — ``solver="mc"`` is wired here; the MC driver bakes the
+    delta formation's ``v_esc_fiducial`` automatically (no separate
+    ``mc_v_esc`` kwarg needed — the single-environment fixed-``v_esc``
+    semantics already match the MC driver's per-build ``v_esc``).
     """
     grid = BinaryGrid.default(m_min=float(m_min), m_max=float(m_max), n_m=n_m, n_chi=n_chi)
     env_grid = EnvGrid.default(n_ve=4)  # ignored on the delta-path
@@ -273,7 +338,21 @@ def coagulation_model_delta_formation(
         log_R_env=log_R_env,
         k_max=k_max,
         grid=grid,
+        solver=solver,
     )
+
+    if solver == "mc":
+        from .response.mc import build_mc_response
+        mc_resp = build_mc_response(
+            response,
+            v_esc=v_esc_fiducial,
+            n_seed=mc_n_seed,
+            depletion_fraction=mc_depletion_fraction,
+            rng_seed=mc_rng_seed,
+            orientation_key_seed=mc_orientation_key_seed,
+            k=mc_k,
+        )
+        response = eqx.tree_at(lambda r: r.mc_response, response, mc_resp)
 
     redshift = MadauDickinsonRedshift(
         z_max=z_max, kappa=kappa, gamma=gamma, z_peak=z_peak, validate_args=validate_args

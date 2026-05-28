@@ -185,7 +185,7 @@ def _step_one_generation_marginalised(
     v_esc: ArrayLike,
     symmetry_factor: float,
     orientation,
-    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
 ) -> Array:
     """Orientation-marginalised bilinear scatter via ``jax.lax.scan``.
@@ -206,12 +206,17 @@ def _step_one_generation_marginalised(
     magnitude ``|χ_rem|``) and
     :func:`remnants.kick_vector.v_kick_vec` (scalar km/s).
 
-    ``retention_kind="heaviside"`` reproduces the v1 hard-cut at each
-    orientation point — same retention surface as the aligned path on
-    a per-orientation basis but smoothed by the orientation
-    averaging.  ``retention_kind="sigmoid"`` makes the per-orientation
-    retention smooth, recovering ``∂/∂v_esc`` gradients through JAX
-    (see ``remnants/kick.py`` module docstring).
+    ``retention_kind="sigmoid"`` (the default after 2026-05-27) keeps
+    the per-orientation retention smooth, which (a) lets the
+    ``spin_orientation`` module's ``(4, 8) = 128``-point default
+    quadrature converge spectrally on the smooth integrand, and (b)
+    recovers ``∂/∂v_esc`` gradients through JAX (see ``remnants/kick.py``
+    module docstring).  ``retention_kind="heaviside"`` is the v1
+    bit-equality opt-in — reproduces the hard cut at each
+    orientation point but is piecewise-discontinuous in orientation,
+    so quadrature convergence drops; pair with
+    ``Isotropic(n_theta=8, n_dphi=16)`` for the v1 1024-point
+    accuracy.
     """
     m = grid.m
     chi = grid.chi
@@ -293,7 +298,7 @@ def _step_one_generation(
     v_esc: ArrayLike,
     symmetry_factor: float,  # 1/2 if j==l else 1
     orientation=None,
-    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
 ) -> Array:
     """Compute the contribution of one ``(j, l)`` progenitor pair to ``n_k(m, χ)``.
@@ -388,8 +393,22 @@ class CoagulationResponse(eqx.Module):
     # path).  ``"heaviside"`` preserves the v1 hard-cut at each
     # orientation point; ``"sigmoid"`` smooths each cut, recovering
     # ``∂/∂v_esc`` gradients through JAX.
-    retention_kind: str = eqx.field(static=True, default="heaviside")
+    # 2026-05-27: default flipped from "heaviside" to "sigmoid" to make
+    # the (4, 8) = 128-point orientation quadrature default converge
+    # spectrally on the smooth integrand (see
+    # ``spin_orientation`` module Convergence Notes).  Aligned dispatch
+    # is unaffected (Aligned shortcut bypasses retention_kind entirely).
+    retention_kind: str = eqx.field(static=True, default="sigmoid")
     w_over_v_esc: float = eqx.field(static=True, default=1.0)
+    # Particle-MC stash for ``solver="mc"`` (Session M2 of
+    # ``demo/PLAN_mc_first_reprioritization.md``).  ``None`` under the
+    # default implicit / basis / perturbative paths — they ignore it.
+    # When ``solver="mc"`` the response factory eagerly runs the MC
+    # driver at construction time and parks the resulting stash here;
+    # :meth:`log_rate_density` then dispatches to
+    # :meth:`response.mc.MCResponse.log_rate_density` instead of the
+    # grid-based path below.  See ``[[project-engine-m2-done]]``.
+    mc_response: object = eqx.field(default=None)
 
     def _natal_log_density(self) -> Array:
         spin_dist = build_natal_spin(**self.natal_spin_params)
@@ -516,7 +535,40 @@ class CoagulationResponse(eqx.Module):
             \\frac{dN_R}{dt\\, dm_1 dm_2 d\\chi_1 d\\chi_2}
             = \\tfrac12 \\, R_{\\rm env} \\, K(m_1, m_2)
               \\, N(m_1, \\chi_1) \\, N(m_2, \\chi_2) .
+
+        Dispatches on :attr:`solver`:
+
+        * ``"mc"`` — delegates to
+          :meth:`response.mc.MCResponse.log_rate_density` on the
+          stashed :attr:`mc_response`.  The MC driver was run eagerly
+          at construction time by
+          :func:`response.mc.build_mc_response`; ``env["v_esc"]`` is
+          ignored on this path (the MC driver baked ``v_esc`` at
+          construction time — see PLAN § "Hard gotcha").
+        * Any other ``solver`` value (``"implicit"``, ``"basis"``,
+          ``"perturbative"``) — falls through to the existing grid-
+          based path below, which calls :meth:`_log_total_density` and
+          looks up at the query points via :func:`log_density_at`.
+
+        Under ``solver="mc"`` we require :attr:`mc_response` to be
+        non-``None``; the factory contract is that
+        ``coagulation_model(solver="mc")`` always populates it.  A
+        ``ValueError`` here is a misuse signal, not a runtime
+        condition.
         """
+        if self.solver == "mc":
+            if self.mc_response is None:
+                raise ValueError(
+                    "CoagulationResponse(solver='mc') requires "
+                    "mc_response to be populated; build via "
+                    "coagulation_model(..., solver='mc') or attach "
+                    "an MCResponse explicitly via response.mc."
+                    "build_mc_response(...)."
+                )
+            return self.mc_response.log_rate_density(
+                m1, m2, chi1, chi2, env
+            )
+
         v_esc = env["v_esc"]
         log_N = self._log_total_density(v_esc)
         from ..kernels import log_pairing_kernel
@@ -555,8 +607,15 @@ def build_gaussian_coagulation(
     solver: str = "perturbative",
     epsilon: ArrayLike = 1.0,
     orientation: object = None,
-    retention_kind: Literal["heaviside", "sigmoid"] = "heaviside",
+    retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
+    # Session M2 MC-path kwargs.  Ignored unless ``solver="mc"``.
+    mc_v_esc: Optional[ArrayLike] = None,
+    mc_n_seed: int = 5000,
+    mc_depletion_fraction: float = 0.5,
+    mc_rng_seed: Optional[int] = None,
+    mc_orientation_key_seed: int = 0,
+    mc_k: Optional[int] = None,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -611,7 +670,36 @@ def build_gaussian_coagulation(
     )
     if orientation is not None:
         kwargs["orientation"] = orientation
-    return CoagulationResponse(**kwargs)
+    response = CoagulationResponse(**kwargs)
+
+    # Session M2: under ``solver="mc"`` we eagerly run the particle MC
+    # driver and stash the result on the response via the new
+    # ``mc_response`` field.  ``mc_v_esc`` is the MC's escape-velocity
+    # bake-in — passed separately from the formation-side ``env["v_esc"]``
+    # which the MC path ignores (PLAN § "Hard gotcha").
+    if solver == "mc":
+        if mc_v_esc is None:
+            raise ValueError(
+                "build_gaussian_coagulation(solver='mc') requires "
+                "mc_v_esc to be set (the MC driver bakes v_esc at "
+                "construction time)."
+            )
+        from .mc import build_mc_response
+        mc_response = build_mc_response(
+            response,
+            v_esc=mc_v_esc,
+            n_seed=mc_n_seed,
+            depletion_fraction=mc_depletion_fraction,
+            rng_seed=mc_rng_seed,
+            orientation_key_seed=mc_orientation_key_seed,
+            k=mc_k,
+        )
+        # Attach via eqx.tree_at (CoagulationResponse is frozen).
+        import equinox as _eqx
+        response = _eqx.tree_at(
+            lambda r: r.mc_response, response, mc_response,
+        )
+    return response
 
 
 def build_default_coagulation(
