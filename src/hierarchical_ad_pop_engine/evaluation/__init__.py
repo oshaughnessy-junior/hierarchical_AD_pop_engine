@@ -28,10 +28,12 @@ from .protocol import RateDensityEvaluator
 from .implicit import ImplicitEvaluator
 from .basis import BasisEvaluator
 from .mc import MCEvaluator
+from .mc_jax import MCEvaluatorJax
 
 __all__ = [
     "RateDensityEvaluator",
     "ImplicitEvaluator",
     "BasisEvaluator",
     "MCEvaluator",
+    "MCEvaluatorJax",
 ]
