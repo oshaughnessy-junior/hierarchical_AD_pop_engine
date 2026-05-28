@@ -607,23 +607,34 @@ def sample_natals_jax(
             )
         weights = weights * wa
 
-    # Validation under JAX is eager-only; under jit the caller will
-    # need to validate at trace time or via an outer wrapper.  Same
-    # convention as the numpy path.
-    if not bool(jnp.all(jnp.isfinite(weights))):
-        raise ValueError(
-            "non-finite weight from sample_natals_jax — check proposal "
-            "support and natal-pdf domain"
-        )
-    if bool(jnp.any(weights < 0.0)):
-        raise ValueError(
-            "negative weight from sample_natals_jax — proposal must "
-            "yield log_q ≤ log_p_natal (importance weights are "
-            "non-negative by construction)"
-        )
-
     if filter_zero_weights:
-        # Eager-only — dynamic shape.
+        # Eager-only — dynamic shape.  Validation + zero-weight filter
+        # both live behind this flag because ``bool(jnp.all(...))`` is
+        # a TracerBoolConversionError under jax.jit / jax.grad / SVI
+        # tracing; callers that need jit-compatibility (J2's
+        # ``particle_mc_jax``, J4's ``build_mc_jax_response``, M4 SVI)
+        # set ``filter_zero_weights=False`` and the validation is
+        # skipped along with the dynamic-shape filter.
+        #
+        # The default truncnorm + uniform-ones path produces trivially
+        # valid weights (finite + positive by construction); the
+        # proposal / stratify paths produce positive weights via
+        # ``exp(log_w)`` which is always non-negative.  The only mode
+        # where validation actually catches anything is a caller-
+        # supplied buggy proposal — and that caller is eager by API
+        # contract anyway (proposals return concrete arrays, not
+        # tracers).
+        if not bool(jnp.all(jnp.isfinite(weights))):
+            raise ValueError(
+                "non-finite weight from sample_natals_jax — check proposal "
+                "support and natal-pdf domain"
+            )
+        if bool(jnp.any(weights < 0.0)):
+            raise ValueError(
+                "negative weight from sample_natals_jax — proposal must "
+                "yield log_q ≤ log_p_natal (importance weights are "
+                "non-negative by construction)"
+            )
         keep = np.asarray(weights > 0.0)
         if not bool(keep.all()):
             keep_idx = jnp.asarray(np.flatnonzero(keep))
