@@ -52,7 +52,7 @@ import argparse
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -156,6 +156,35 @@ class MCConfig:
     # numpy ``rng`` driving everything that touches the active pool).
     orientation_key_seed: int = 0
 
+    # ------------------------------------------------------------------
+    # Session M3b — importance-sampled / stratified natal draws.
+    # All three fields default to ``None``; in that case
+    # :func:`sample_natals` falls through to the v1 truncnorm path and
+    # returns ``weights = np.ones(n_seed)``, so every existing caller
+    # is bit-for-bit unaffected.
+    # ------------------------------------------------------------------
+    # ``proposal``: caller-supplied importance proposal.  Signature
+    # ``q(rng) -> (m, chi, log_q_per_sample)``.  When set, samples are
+    # drawn from this and per-particle weights become
+    # ``w = exp(log p_natal(m, chi) - log q(m, chi))``.  Overrides
+    # ``stratify`` if both are set.
+    proposal: Optional[Callable[[np.random.Generator],
+                                Tuple[np.ndarray, np.ndarray, np.ndarray]]] = None
+    # ``stratify``: if set to ``(n_m_cells, n_chi_cells)``, divides the
+    # ``(log m, χ)`` rectangle into that many cells and draws roughly
+    # ``n_seed / (n_m_cells × n_chi_cells)`` particles uniformly per
+    # cell; weights follow ``w = p_natal / q_stratified`` automatically.
+    # Useful for resolving narrow natal features (the
+    # :file:`demo/PLAN_m3_stratified_natal.md` § M3b headline use case).
+    stratify: Optional[Tuple[int, int]] = None
+    # ``weight_array``: explicit caller-supplied per-particle weights
+    # at sample time.  When set, multiplies *into* whatever weights the
+    # ``proposal`` / ``stratify`` paths produced (or replaces the
+    # uniform-ones for the default v1 path).  Shape ``(n_seed,)``.  Use
+    # case: caller has its own importance proposal handled externally
+    # and just wants to inject the resulting weights.
+    weight_array: Optional[np.ndarray] = None
+
 
 def _orientation_is_aligned(orientation: object) -> bool:
     """``True`` if ``orientation`` should route to the v1 scalar path.
@@ -220,20 +249,203 @@ def _per_event_remnant_misaligned(
 # ---------------------------------------------------------------------------
 # Particle MC.
 # ---------------------------------------------------------------------------
-def sample_natals(cfg: MCConfig, rng: np.random.Generator):
+def _natal_log_pdf(m: np.ndarray, chi: np.ndarray, cfg: MCConfig) -> np.ndarray:
+    r"""Joint log p_natal(m, χ) for the IS-weight numerator.
+
+    Product of independent truncnorm distributions in ``m`` (on
+    ``[m_min, m_max]``) and ``χ`` (on ``[0, 1]``) — mirrors the v1
+    sampling distribution used by :func:`sample_natals` when no
+    proposal is supplied.  Returned in log space so the
+    ``log p − log q`` subtraction in :func:`sample_natals` is
+    numerically clean across ~30 orders of magnitude in the tails.
+    """
     a_m = (cfg.m_min - cfg.mu_natal) / cfg.sigma_natal
     b_m = (cfg.m_max - cfg.mu_natal) / cfg.sigma_natal
-    m = truncnorm.rvs(
-        a_m, b_m, loc=cfg.mu_natal, scale=cfg.sigma_natal,
-        size=cfg.n_seed, random_state=rng,
-    ).astype(np.float64)
+    log_p_m = truncnorm.logpdf(
+        m, a_m, b_m, loc=cfg.mu_natal, scale=cfg.sigma_natal,
+    )
     a_c = (0.0 - cfg.natal_spin_loc) / cfg.natal_spin_scale
     b_c = (1.0 - cfg.natal_spin_loc) / cfg.natal_spin_scale
-    chi = truncnorm.rvs(
-        a_c, b_c, loc=cfg.natal_spin_loc, scale=cfg.natal_spin_scale,
-        size=cfg.n_seed, random_state=rng,
-    ).astype(np.float64)
-    return m, chi
+    log_p_chi = truncnorm.logpdf(
+        chi, a_c, b_c, loc=cfg.natal_spin_loc, scale=cfg.natal_spin_scale,
+    )
+    return log_p_m + log_p_chi
+
+
+def _stratified_natal(
+    cfg: MCConfig, rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Stratified-uniform sampler on ``(log m, χ)`` cells, with IS weights.
+
+    Per ``demo/PLAN_m3_stratified_natal.md`` § "M3b — driver-side
+    weighting + workstation gate" / Stratified proposal at the
+    engine grid edges:
+
+    * Divide ``[log m_min, log m_max] × [0, 1]`` into
+      ``n_m_cells × n_chi_cells`` equal-area cells.
+    * Draw ``round(n_seed / (n_m_cells · n_chi_cells))`` samples
+      uniformly per cell in ``(log m, χ)``.
+    * Per-particle weight ``w_i = p_natal(m_i, χ_i) / q_strat(m_i, χ_i)``
+      with ``q_strat`` the joint density of the stratified-uniform
+      proposal in the ``(m, χ)`` measure (Jacobian from
+      ``d(log m) = dm / m`` already folded in).
+
+    The proposal density in ``(m, χ)``-coordinates is
+    ``q_strat(m, χ) = 1 / (m · Δlog m · Δχ)`` with ``Δlog m =
+    log(m_max) - log(m_min)`` and ``Δχ = 1``; uniform across cells
+    because we draw equally per cell.
+
+    Returns ``(m, chi, weights)`` with ``weights > 0`` everywhere
+    inside the support (truncnorm density is positive on
+    ``[m_min, m_max] × [0, 1]``).
+    """
+    n_m_cells, n_chi_cells = cfg.stratify  # type: ignore[misc]
+    n_total_cells = int(n_m_cells * n_chi_cells)
+    if n_total_cells <= 0:
+        raise ValueError(
+            f"stratify={cfg.stratify!r} must have positive entries"
+        )
+    n_per_cell = max(1, cfg.n_seed // n_total_cells)
+    log_m_edges = np.linspace(
+        np.log(cfg.m_min), np.log(cfg.m_max), n_m_cells + 1,
+    )
+    chi_edges = np.linspace(0.0, 1.0, n_chi_cells + 1)
+    m_list = []
+    chi_list = []
+    for i in range(n_m_cells):
+        for j in range(n_chi_cells):
+            log_m_cell = rng.uniform(
+                log_m_edges[i], log_m_edges[i + 1], n_per_cell,
+            )
+            chi_cell = rng.uniform(
+                chi_edges[j], chi_edges[j + 1], n_per_cell,
+            )
+            m_list.append(np.exp(log_m_cell))
+            chi_list.append(chi_cell)
+    m = np.concatenate(m_list)
+    chi = np.concatenate(chi_list)
+    log_m_range = float(np.log(cfg.m_max) - np.log(cfg.m_min))
+    # log q_strat(m, χ) = -log m - log(Δlog m) - log(Δχ) with Δχ=1.
+    log_q = -np.log(m) - np.log(log_m_range)
+    log_w = _natal_log_pdf(m, chi, cfg) - log_q
+    weights = np.exp(log_w)
+    return m, chi, weights
+
+
+def sample_natals(
+    cfg: MCConfig, rng: np.random.Generator,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""Draw natal ``(m, χ)`` samples + per-particle importance weights.
+
+    Returns ``(m, chi, weights)``.
+
+    Three sampling modes, resolved in priority order:
+
+    1. ``cfg.proposal`` (caller-supplied importance proposal):
+       ``q(rng) -> (m, chi, log_q_per_sample)``.  Weights
+       ``w = exp(log p_natal - log q)``.
+    2. ``cfg.stratify = (n_m_cells, n_chi_cells)``: stratified-
+       uniform draw on ``(log m, χ)`` cells via
+       :func:`_stratified_natal`.
+    3. Default: original v1 truncnorm draw in both axes; uniform
+       weights ``np.ones(n_seed)``.  PRNG draw sequence is
+       bit-for-bit identical to the pre-M3b implementation so the
+       downstream K-rejection loop stays in lockstep with the
+       Aligned-baseline cascade dynamics.
+
+    ``cfg.weight_array``, if set, is multiplied *into* whichever
+    base weights mode (1)/(2)/(3) produced — useful for an external
+    caller who computed weights upstream.
+    """
+    if cfg.proposal is not None:
+        m, chi, log_q = cfg.proposal(rng)
+        m = np.asarray(m, dtype=np.float64).ravel()
+        chi = np.asarray(chi, dtype=np.float64).ravel()
+        log_q = np.asarray(log_q, dtype=np.float64).ravel()
+        if not (m.shape == chi.shape == log_q.shape):
+            raise ValueError(
+                f"proposal returned mismatched shapes m={m.shape} "
+                f"chi={chi.shape} log_q={log_q.shape}"
+            )
+        log_w = _natal_log_pdf(m, chi, cfg) - log_q
+        weights = np.exp(log_w)
+    elif cfg.stratify is not None:
+        m, chi, weights = _stratified_natal(cfg, rng)
+    else:
+        # ---------- v1 bit-for-bit path. ----------
+        a_m = (cfg.m_min - cfg.mu_natal) / cfg.sigma_natal
+        b_m = (cfg.m_max - cfg.mu_natal) / cfg.sigma_natal
+        m = truncnorm.rvs(
+            a_m, b_m, loc=cfg.mu_natal, scale=cfg.sigma_natal,
+            size=cfg.n_seed, random_state=rng,
+        ).astype(np.float64)
+        a_c = (0.0 - cfg.natal_spin_loc) / cfg.natal_spin_scale
+        b_c = (1.0 - cfg.natal_spin_loc) / cfg.natal_spin_scale
+        chi = truncnorm.rvs(
+            a_c, b_c, loc=cfg.natal_spin_loc, scale=cfg.natal_spin_scale,
+            size=cfg.n_seed, random_state=rng,
+        ).astype(np.float64)
+        weights = np.ones(cfg.n_seed, dtype=np.float64)
+
+    if cfg.weight_array is not None:
+        wa = np.asarray(cfg.weight_array, dtype=np.float64).ravel()
+        if wa.shape != m.shape:
+            raise ValueError(
+                f"cfg.weight_array shape {wa.shape} != natal-sample "
+                f"shape {m.shape}"
+            )
+        weights = weights * wa
+
+    if not np.all(np.isfinite(weights)):
+        raise ValueError(
+            "non-finite weight from sample_natals — check proposal "
+            "support and natal-pdf domain"
+        )
+    if np.any(weights < 0.0):
+        raise ValueError(
+            "negative weight from sample_natals — proposal must yield "
+            "log_q ≤ log_p_natal (importance weights are non-negative "
+            "by construction)"
+        )
+    # Filter zero-weight samples.  These are particles drawn by the
+    # stratified / proposal sampler in regions where ``p_natal``
+    # underflows to zero (e.g. ``m`` very far from ``mu_natal`` —
+    # truncnorm logpdf can hit −2500 at the support's tail and exp
+    # rounds to 0.0 in float64).  Such samples contribute nothing to
+    # any weighted estimator AND would inflate the M3a MCEvaluator's
+    # k-NN bandwidth without contributing to its kernel sum, so we
+    # drop them at the sampler boundary to keep the downstream API
+    # contract (``weights > 0``) intact.  Under the v1 path
+    # (uniform weights = 1) no particles are filtered, so bit-for-bit
+    # behaviour is preserved.
+    keep = weights > 0.0
+    if not np.all(keep):
+        m = m[keep]
+        chi = chi[keep]
+        weights = weights[keep]
+    if m.size == 0:
+        raise ValueError(
+            "sample_natals filtered to zero particles — proposal "
+            "has no overlap with the natal support"
+        )
+    return m, chi, weights
+
+
+def _kish_n_eff(weights: np.ndarray) -> float:
+    """Kish (1965) effective sample size ``(Σ w)² / Σ w²``.
+
+    Coincides with ``len(weights)`` for uniform weights.  Pinned at
+    `0.0` for an empty array.  Used in :func:`particle_mc`'s stats
+    return so callers can monitor whether stratification or IS has
+    actually bought sampling efficiency — same convention as the
+    M3a ``MCEvaluator.n_eff`` field.
+    """
+    if weights.size == 0:
+        return 0.0
+    w = np.asarray(weights, dtype=np.float64)
+    s = float(w.sum())
+    ss = float(np.sum(w * w))
+    return s * s / ss if ss > 0 else 0.0
 
 
 def _kernel_upper_bound(m_active: np.ndarray, a: float, b: float) -> float:
@@ -268,7 +480,24 @@ def particle_mc(
             scalar :func:`v_kick_aligned`; under any other orientation
             the per-event sample.  Added in Session C — older readers
             that only consume ``mergers`` are unaffected.
-        ``stats`` : dict with n_attempts, n_accepted, n_retained, n_active_final.
+        ``w_active`` : 1-D array shape ``(N_active_final,)`` — Session
+            M3b per-surviving-particle importance weight.  Uniform
+            ``1.0`` under the default v1 path (no proposal / stratify /
+            weight_array); non-trivial when an IS proposal or
+            stratified natal sampler is in use.  Pair with
+            ``MCEvaluator(weights=...)`` for weighted density
+            estimation.  Older readers that consume only
+            ``m_active`` / ``chi_active`` are unaffected.
+        ``w_mergers`` : 1-D array shape ``(N_accept,)`` — Session M3b
+            per-accepted-merger descendant weight (``w_desc = 0.5 ·
+            (w_i + w_j)`` from the merger of parents ``i, j``).
+            Same uniform-1.0 invariant under v1 path.  Pair with
+            rows of ``mergers`` when computing weighted observable-
+            marginals.
+        ``stats`` : dict with n_attempts, n_accepted, n_retained,
+            n_active_final, plus Session M3b additions
+            ``n_eff_active`` / ``n_eff_mergers`` (Kish 1965 effective
+            sample size; equals the count for uniform weights).
 
     Notes
     -----
@@ -288,10 +517,20 @@ def particle_mc(
     """
     aligned_path = _orientation_is_aligned(cfg.orientation)
     orient_key_state = jax.random.PRNGKey(int(cfg.orientation_key_seed))
-    m_arr, chi_arr = sample_natals(cfg, rng)
+    m_arr, chi_arr, w_arr = sample_natals(cfg, rng)
     n_init = m_arr.size
     gen_arr = np.ones(n_init, dtype=np.int32) if track_generations else None
     active = np.ones(n_init, dtype=bool)
+    # Session M3b — per-particle importance weight, propagated through
+    # the cascade by the arithmetic-mean rule on accepted mergers
+    # (``w_desc = 0.5·(w_i + w_j)``).  Uniform initial weights (the v1
+    # path) give ``w_arr == 1`` for ever, so the rejection-loop
+    # dynamics are bit-for-bit unchanged — only the new ``w_active`` /
+    # ``w_mergers`` return-dict entries appear post-M3b.  See
+    # ``demo/PLAN_m3_stratified_natal.md`` § "Weight propagation rule".
+    # Per-merger weight record (one float per accepted merger,
+    # indexed in lockstep with ``mergers_records``).
+    w_mergers_records: list[float] = []
 
     # Resolve stopping criterion. If the user passed an explicit
     # n_max_mergers we use that; otherwise compute one from
@@ -407,16 +646,30 @@ def particle_mc(
                     )
                 )
 
+            # Session M3b — descendant weight = arithmetic mean of
+            # parents.  Under uniform initial weights (v1 path), wa =
+            # wb = 1 ⇒ w_new = 1 ⇒ this is a no-op that keeps the
+            # active-pool weights uniform forever.  Under stratified /
+            # importance-proposal initial weights, the average is what
+            # carries the natal IS information through the cascade
+            # while preserving per-particle scale (each particle
+            # continues to represent ~one bin's worth of probability
+            # mass).  See ``demo/PLAN_m3_stratified_natal.md`` §
+            # "Weight propagation rule (LOCKED)".
+            wa = float(w_arr[i_a]); wb = float(w_arr[i_b])
+            w_new = 0.5 * (wa + wb)
             if retain:
                 # Replace heavier-slot with the remnant; deactivate the
                 # other. Heavier slot first so the bookkeeping conserves
                 # m1 ≥ m2 cosmetically.
                 if ma >= mb:
                     m_arr[i_a] = m_new; chi_arr[i_a] = chi_new
+                    w_arr[i_a] = w_new
                     if gen_arr is not None: gen_arr[i_a] = max(ga, gb) + 1
                     active[i_b] = False
                 else:
                     m_arr[i_b] = m_new; chi_arr[i_b] = chi_new
+                    w_arr[i_b] = w_new
                     if gen_arr is not None: gen_arr[i_b] = max(ga, gb) + 1
                     active[i_a] = False
                 n_retained += 1
@@ -432,6 +685,11 @@ def particle_mc(
                 rec = (mb, ma, cb, ca, gb, ga, float(retain), event_rem)
             mergers_records.append(rec)
             v_kicks_records.append(v_kick_evt)
+            # Per-merger weight is the descendant weight (which is also
+            # what the engine-side comparison should use when binning
+            # mergers — the merger event "weighs" w_new in the
+            # rate-density sense after the arithmetic-mean propagation).
+            w_mergers_records.append(w_new)
 
             if n_accepted >= n_max_mergers:
                 break
@@ -449,6 +707,20 @@ def particle_mc(
             np.asarray(v_kicks_records, dtype=np.float64)
             if v_kicks_records else np.empty((0,), dtype=np.float64)
         ),
+        # Session M3b additions — per-particle / per-event importance
+        # weights.  Under the v1 (uniform-weight) path these are
+        # uniformly 1.0 and existing readers can safely ignore them.
+        # ``w_active`` is the per-surviving-particle weight (pair with
+        # ``m_active`` / ``chi_active``; pass straight into
+        # ``MCEvaluator(weights=...)`` for density estimation).
+        # ``w_mergers`` is the per-accepted-merger descendant weight
+        # (pair with rows of ``mergers``; multiply per-event histogram
+        # bins by these when computing weighted observable-marginals).
+        w_active=w_arr[out_idx].copy(),
+        w_mergers=(
+            np.asarray(w_mergers_records, dtype=np.float64)
+            if w_mergers_records else np.empty((0,), dtype=np.float64)
+        ),
         stats=dict(
             n_attempts=n_attempts,
             n_accepted=n_accepted,
@@ -458,6 +730,15 @@ def particle_mc(
             stop_reason=stop_reason,
             depletion=1.0 - (int(active.sum()) / max(n_init, 1)),
             orientation=type(cfg.orientation).__name__ if cfg.orientation is not None else "Aligned",
+            # M3b — Kish effective sample sizes (1965 design-effect).
+            # For uniform weights, both equal ``n_active_final`` /
+            # ``n_accepted`` exactly.  Useful for the workstation
+            # gate's stratification-vs-uniform comparison.
+            n_eff_active=_kish_n_eff(w_arr[out_idx]),
+            n_eff_mergers=(
+                _kish_n_eff(np.asarray(w_mergers_records, dtype=np.float64))
+                if w_mergers_records else 0.0
+            ),
         ),
     )
 

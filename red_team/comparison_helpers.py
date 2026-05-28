@@ -172,6 +172,9 @@ def run_mc(
     track_generations: bool = False,
     orientation: object | None = None,
     orientation_key_seed: int = 0,
+    proposal=None,
+    stratify=None,
+    weight_array=None,
 ) -> dict:
     r"""Run the particle MC at the given theta with a fixed-seed RNG.
 
@@ -184,7 +187,14 @@ def run_mc(
     ``orientation`` / ``orientation_key_seed`` forward to
     :class:`MCConfig` (Session C wired these in via a76fa8f).  Default
     ``orientation=None`` routes to the v1 Aligned scalar path
-    bit-for-bit so existing callers are unaffected.  See
+    bit-for-bit so existing callers are unaffected.
+
+    Session M3b additions — ``proposal`` / ``stratify`` /
+    ``weight_array`` forward to :class:`MCConfig` (all default
+    ``None``, preserving v1 bit-for-bit).  The return dict gains
+    ``w_active`` / ``w_mergers`` keys under any non-None M3b
+    setting; older readers that consume only ``m_active`` /
+    ``chi_active`` / ``mergers`` are unaffected either way.  See
     ``[[feedback-dispatch-callgraph-audit]]``.
     """
     cfg = B1.MCConfig(
@@ -192,6 +202,9 @@ def run_mc(
         depletion_fraction=depletion_fraction,
         orientation=orientation,
         orientation_key_seed=int(orientation_key_seed),
+        proposal=proposal,
+        stratify=stratify,
+        weight_array=weight_array,
         **{k: theta[k] for k in (
             "mu_natal", "sigma_natal", "m_min", "m_max",
             "natal_spin_loc", "natal_spin_scale",
