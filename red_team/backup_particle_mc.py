@@ -639,6 +639,310 @@ def sample_natals_jax(
     return m, chi, weights
 
 
+# ===========================================================================
+# Session J2 — JAX-pure particle MC hot loop.
+#
+# K-rejection-as-importance-weighting design (PLAN_jax_mc.md § J2): every
+# candidate pair becomes a merger event with weight increment
+# ``w_event = K_ij / K_max`` instead of being accepted with that probability.
+# This makes the inner loop deterministic-once-keys-are-drawn (every step
+# always merges), which is what ``jax.lax.scan`` requires.
+#
+# Validation: sandbox-derived ([[demo/PLAN_jax_mc]] § J2 + this session's
+# j2_sandbox_derivation.py) that:
+#  - per-attempt observable shape matches discrete in expectation
+#    (INV-A / INV-B exact in expectation, INV-C bias → 0 as 1/√n_init).
+#  - At production n_init = 20000 the cascade-fidelity bias is < 0.2 %,
+#    well below MC SE.
+#
+# Aligned-only first pass: non-Aligned vector physics adds per-event
+# orientation sampling + ``jax.random.split`` inside the scan and is a
+# follow-up (J2b).  Calls with ``cfg.orientation`` set to a non-``None`` /
+# non-``Aligned`` model raise ``NotImplementedError``.
+#
+# Numpy ``particle_mc`` stays as the validation backstop per
+# [[feedback-red-team-validation]] and [[demo/PLAN_jax_mc]] § "Hard rule".
+# ===========================================================================
+def _kernel_K_jax(m1, m2, a, b):
+    """JAX mirror of :func:`kernel_K`.  Inputs are scalars or arrays."""
+    m_big = jnp.maximum(m1, m2)
+    m_sml = jnp.minimum(m1, m2)
+    q = m_sml / m_big
+    return (m1 + m2) ** a * q ** b
+
+
+def _kernel_upper_bound_jax(m_min_active, m_max_active, a, b):
+    """JAX mirror of :func:`_kernel_upper_bound`.
+
+    Differs slightly from the numpy version: takes scalar
+    ``m_min_active`` / ``m_max_active`` rather than the active array, so
+    it can be invoked inside ``lax.scan`` without dynamic indexing.
+    Same 1.05 safety margin.
+    """
+    cand_hi = _kernel_K_jax(2 * m_max_active, 2 * m_max_active, a, b)
+    cand_lo = _kernel_K_jax(2 * m_min_active, 2 * m_min_active, a, b)
+    cand_mi = _kernel_K_jax(
+        m_max_active + m_min_active, m_max_active + m_min_active, a, b,
+    )
+    return jnp.maximum(jnp.maximum(cand_hi, cand_lo), cand_mi) * 1.05
+
+
+def particle_mc_jax(
+    cfg: "MCConfig",
+    key: jax.Array,
+    *,
+    n_steps: Optional[int] = None,
+):
+    """JAX-pure particle MC under K-rejection-as-importance-weighting.
+
+    Returns a dict mirroring the numpy :func:`particle_mc` schema fields
+    that downstream consumers actually use:
+
+    ``m_active`` / ``chi_active`` / ``w_active`` / ``gen_active``
+        Per-surviving-particle state; weights propagate the M3a/M3b
+        ``w_desc = 0.5(w_i + w_j)`` natal-density rule.
+    ``mergers``
+        Per-step record ``(m1, m2, chi1, chi2, g1, g2, retained, m_rem)``,
+        heavier first.  Shape ``(n_steps, 8)``.  Inactive (post-pool-
+        exhaustion) steps return NaN rows.
+    ``v_kicks``
+        Per-step aligned kick magnitude.  Shape ``(n_steps,)``.  NaN on
+        inactive steps.
+    ``w_mergers``
+        Per-step K-rejection event weight ``w_event = K_ij / K_max`` ×
+        descendant natal weight propagation.  Shape ``(n_steps,)``.
+        Pass this directly to ``MCEvaluator(weights=...)`` for weighted
+        density estimation; in aggregate Σw matches numpy's
+        ``n_accepted`` in expectation (validation backstop).
+    ``stats``
+        Dict with ``n_init``, ``n_steps``, ``n_active_final``,
+        ``depletion``, ``n_eff_active``, ``n_eff_mergers``,
+        ``sum_w_mergers``.
+
+    Parameters
+    ----------
+    cfg : MCConfig
+        Same dataclass as the numpy path.  ``cfg.orientation`` must be
+        ``None`` or :class:`~hierarchical_ad_pop_engine.spin_orientation.Aligned`
+        for J2 (non-Aligned is a follow-up).
+    key : jax.Array
+        PRNG key; split internally for natal sampling + per-step pair
+        selection.
+    n_steps : int, optional
+        Fixed inner-loop step budget.  If ``None``, computed from
+        ``cfg.depletion_fraction`` as ``int(depletion × n_init / 1.5)``,
+        targeting ≈ ``depletion × n_init`` particles deactivated by
+        cascade end (each step removes ≈ 1-2 particles).
+
+    Notes
+    -----
+    AD support:
+
+    * ``∂Σ m_active / ∂cfg.mu_natal``: cleanly via J1's truncated_normal
+      reparametrisation.  This is the load-bearing M4 gradient.
+    * ``∂Σ w_mergers / ∂cfg.kernel_b``: finite via the smooth
+      ``K_ij / K_max`` weight; gradient strength depends on the
+      kernel sensitivity (sandbox-verified at INV-AD).
+    * ``∂retained / ∂cfg.v_esc``: zero (Heaviside).  Recovers under
+      misalignment + soft-sigmoid retention (follow-up J2b).
+
+    Examples
+    --------
+    >>> import jax
+    >>> cfg = MCConfig(mu_natal=8.0, sigma_natal=1.0, m_min=4.0, m_max=80.0,
+    ...                natal_spin_loc=0.0, natal_spin_scale=0.10,
+    ...                kernel_a=0.0, kernel_b=1.0, v_esc=1000.0,
+    ...                n_seed=200, depletion_fraction=0.10)
+    >>> out = particle_mc_jax(cfg, jax.random.PRNGKey(2026))
+    >>> out["m_active"].shape  # doctest: +SKIP
+    (..., )
+    """
+    if not _orientation_is_aligned(cfg.orientation):
+        raise NotImplementedError(
+            "particle_mc_jax currently supports only Aligned orientation; "
+            "non-Aligned per-event vector physics is the J2b follow-up "
+            "(see demo/PLAN_jax_mc.md § J2)."
+        )
+
+    key_natal, key_loop = jax.random.split(key)
+    # Disable filtering — keeps shape static for the scan carry.  Default
+    # truncnorm path produces no zero-weight samples anyway.
+    m_arr0, chi_arr0, w_arr0 = sample_natals_jax(
+        cfg, key_natal, filter_zero_weights=False,
+    )
+    n_init = int(m_arr0.shape[0])
+
+    if n_steps is None:
+        # Pool depletes ≈ 1.5 particles per merger event on average
+        # (heavily retention-dependent; ~1 at high retention, ~2 at low).
+        # Target depletion × n_init particles deactivated by cascade end.
+        n_steps = max(1, int(cfg.depletion_fraction * n_init / 1.5))
+
+    active0 = jnp.ones(n_init, dtype=bool)
+    gen0 = jnp.ones(n_init, dtype=jnp.int32)
+
+    # Carry pytree for jax.lax.scan.
+    carry0 = (m_arr0, chi_arr0, w_arr0, active0, gen0, key_loop)
+
+    a_k = jnp.asarray(cfg.kernel_a)
+    b_k = jnp.asarray(cfg.kernel_b)
+    v_esc = jnp.asarray(cfg.v_esc)
+
+    def step_fn(carry, _):
+        m_arr, chi_arr, w_arr, active, gen, key = carry
+
+        n_active = jnp.sum(active)
+        step_active_now = n_active >= 2
+
+        # K_max from current active pool (NaN-safe via inf padding).
+        m_active_for_min = jnp.where(active, m_arr, jnp.inf)
+        m_active_for_max = jnp.where(active, m_arr, -jnp.inf)
+        m_min_active = jnp.min(m_active_for_min)
+        m_max_active = jnp.max(m_active_for_max)
+        K_max = _kernel_upper_bound_jax(m_min_active, m_max_active, a_k, b_k)
+        # Sanity guard — at pool exhaustion m_min becomes inf and K_max
+        # is undefined.  Mask via step_active_now.
+        K_max = jnp.where(step_active_now, K_max, 1.0)
+
+        # Sample i, j from active pool with i != j.
+        key, k_i, k_j = jax.random.split(key, 3)
+        p_active = jnp.where(active, 1.0, 0.0)
+        denom = jnp.maximum(p_active.sum(), 1.0)
+        p_i = p_active / denom
+        i = jax.random.choice(k_i, n_init, p=p_i)
+        # Mask out i so j != i.
+        p_j_unnorm = jnp.where(
+            jnp.arange(n_init) == i, 0.0, p_active,
+        )
+        denom_j = jnp.maximum(p_j_unnorm.sum(), 1.0)
+        p_j = p_j_unnorm / denom_j
+        j = jax.random.choice(k_j, n_init, p=p_j)
+
+        m_i = m_arr[i]
+        m_j = m_arr[j]
+        chi_i = chi_arr[i]
+        chi_j = chi_arr[j]
+        w_i = w_arr[i]
+        w_j = w_arr[j]
+        g_i = gen[i]
+        g_j = gen[j]
+
+        # K-rejection-as-weighting: continuous accept with w_event factor.
+        K_ij = _kernel_K_jax(m_i, m_j, a_k, b_k)
+        w_event = K_ij / K_max
+
+        # Aligned remnant physics (no per-event orientation work — those
+        # paths require extra keys inside the scan).
+        m_new = _M_rem_jax(m_i, m_j, chi_i, chi_j)
+        chi_new = _chi_rem_jax(m_i, m_j, chi_i, chi_j)
+        v_kick_evt = _v_kick_aligned_jax(m_i, m_j, chi_i, chi_j)
+        retain = _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
+
+        # Identify heavier / lighter parent (so we keep the heavier slot
+        # and write the remnant there — matches numpy's cosmetic m1 ≥ m2
+        # convention).
+        heavier_is_i = m_i >= m_j
+        idx_heavy = jnp.where(heavier_is_i, i, j)
+        idx_light = jnp.where(heavier_is_i, j, i)
+
+        # Descendant cumulative weight: M3a/M3b natal-density average ×
+        # K-rejection event weight.  Under uniform initial weights
+        # (default v1 path) and absent any kernel structure (K_ij ≈
+        # K_max) this reduces to ≈ 0.5(w_i + w_j).  Under stratified /
+        # IS natal weights AND non-trivial kernel, both factors compose.
+        w_desc = 0.5 * (w_i + w_j) * w_event
+
+        # Apply state updates only when step_active_now (else carry through).
+        do_retain = step_active_now & retain
+        do_drop_both = step_active_now & (~retain)
+
+        new_active = active
+        new_active = new_active.at[idx_light].set(
+            jnp.where(step_active_now, False, new_active[idx_light]),
+        )
+        new_active = new_active.at[idx_heavy].set(
+            jnp.where(do_drop_both, False, new_active[idx_heavy]),
+        )
+        # idx_heavy stays True on retention (no-op since it was True).
+
+        new_m_arr = m_arr.at[idx_heavy].set(
+            jnp.where(do_retain, m_new, m_arr[idx_heavy]),
+        )
+        new_chi_arr = chi_arr.at[idx_heavy].set(
+            jnp.where(do_retain, chi_new, chi_arr[idx_heavy]),
+        )
+        new_w_arr = w_arr.at[idx_heavy].set(
+            jnp.where(do_retain, w_desc, w_arr[idx_heavy]),
+        )
+        new_gen = gen.at[idx_heavy].set(
+            jnp.where(do_retain, jnp.maximum(g_i, g_j) + 1, gen[idx_heavy]).astype(jnp.int32),
+        )
+
+        # Per-step records (heavier-first, masked NaN on inactive steps).
+        m1_rec = jnp.where(heavier_is_i, m_i, m_j)
+        m2_rec = jnp.where(heavier_is_i, m_j, m_i)
+        chi1_rec = jnp.where(heavier_is_i, chi_i, chi_j)
+        chi2_rec = jnp.where(heavier_is_i, chi_j, chi_i)
+        g1_rec = jnp.where(heavier_is_i, g_i, g_j).astype(m_arr.dtype)
+        g2_rec = jnp.where(heavier_is_i, g_j, g_i).astype(m_arr.dtype)
+        retain_rec = retain.astype(m_arr.dtype)
+        m_rem_rec = jnp.where(retain, m_new, jnp.nan)
+        rec_active = jnp.stack(
+            [m1_rec, m2_rec, chi1_rec, chi2_rec, g1_rec, g2_rec, retain_rec, m_rem_rec],
+        )
+        nan_row = jnp.full_like(rec_active, jnp.nan)
+        rec = jnp.where(step_active_now, rec_active, nan_row)
+
+        v_kick_out = jnp.where(step_active_now, v_kick_evt, jnp.nan)
+        w_out = jnp.where(step_active_now, w_desc, 0.0)
+        step_flag = step_active_now.astype(jnp.int32)
+
+        new_carry = (new_m_arr, new_chi_arr, new_w_arr, new_active, new_gen, key)
+        out = (rec, v_kick_out, w_out, step_flag)
+        return new_carry, out
+
+    final_carry, outputs = jax.lax.scan(step_fn, carry0, jnp.arange(n_steps))
+    (m_arr_f, chi_arr_f, w_arr_f, active_f, gen_f, _key_f) = final_carry
+    (mergers_arr, v_kicks_arr, w_mergers_arr, step_flags) = outputs
+
+    # ``active_f`` is dynamic — eager-mode boolean indexing produces
+    # ragged outputs (used by KS-test / weight-histogram callers).
+    # Under ``jax.grad`` / ``jax.jit`` boolean indexing on a traced mask
+    # is not supported; in that case the caller should index with the
+    # raw full-length arrays + multiply by the active mask.
+    #
+    # Convention: return both forms — ``m_active`` / ``chi_active`` /
+    # ``w_active`` / ``gen_active`` are full-length n_init arrays
+    # alongside the ``active_mask`` boolean.  The caller picks the
+    # form they need (eager indexing via ``out['m_active'][out['active_mask']]``,
+    # or weighted sums via ``jnp.sum(out['m_active'] * out['active_mask'])``).
+    # Plain-eager users keep the original API by indexing in their own
+    # code; the J1 sandbox-test pattern (KS-test driver) handles this
+    # cleanly outside the AD scope.
+    out_dict = dict(
+        m_active=m_arr_f,
+        chi_active=chi_arr_f,
+        w_active=w_arr_f,
+        gen_active=gen_f,
+        active_mask=active_f,
+        mergers=mergers_arr,
+        v_kicks=v_kicks_arr,
+        w_mergers=w_mergers_arr,
+        step_active=step_flags.astype(bool),
+        stats=dict(
+            n_init=n_init,
+            n_steps=int(n_steps),
+            # Differentiable counters — stay as jnp arrays.  Caller
+            # converts to Python scalars eagerly if desired.
+            n_active_final=jnp.sum(active_f),
+            depletion=1.0 - jnp.sum(active_f) / max(n_init, 1),
+            sum_w_mergers=jnp.sum(w_mergers_arr),
+            orientation="Aligned",
+        ),
+    )
+    return out_dict
+
+
 def _kish_n_eff(weights: np.ndarray) -> float:
     """Kish (1965) effective sample size ``(Σ w)² / Σ w²``.
 
