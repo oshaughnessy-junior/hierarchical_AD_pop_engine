@@ -49,7 +49,7 @@ density on the same measure scale as ``N_natal`` and :func:`loss_density`.
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import equinox as eqx
 import jax
@@ -57,7 +57,12 @@ import jax.numpy as jnp
 from jax import Array
 
 from ..kernels import log_pairing_kernel, log_pairing_kernel_grid
+from ..orientation_precompute import (
+    OrientationCache,
+    build_orientation_cache,
+)
 from ..retention import P_retain
+from ..spin_orientation import Aligned
 from .coagulation import _step_one_generation
 
 if TYPE_CHECKING:
@@ -100,6 +105,7 @@ def loss_density(
     N: Array,
     response: "CoagulationResponse",
     v_esc: Array,
+    cache: Optional[OrientationCache] = None,
 ) -> Array:
     """``N(m, χ) · ⟨K · N · P_retain⟩(m, χ)`` on the response's grid.
 
@@ -108,9 +114,9 @@ def loss_density(
     Under Aligned (default), builds a ``(N_m, N_chi, N_m, N_chi)``
     4-D array — at (96, 32) and float64 ~75 MB, comfortable.
 
-    Under non-Aligned, ``P_retain_marginalised`` now scans over the
-    orientation quadrature internally
-    (``remnants/marginal.py:P_retain_marginalised`` uses
+    Under non-Aligned **without** an :class:`OrientationCache`,
+    ``P_retain_marginalised`` scans over the orientation quadrature
+    internally (``remnants/marginal.py:P_retain_marginalised`` uses
     ``jax.lax.scan`` — mirroring the Decision-3 pattern already in
     ``_step_one_generation_marginalised`` on the gain side), so the
     per-iteration memory is bounded by ~3 × the same
@@ -121,6 +127,16 @@ def loss_density(
     is still in the history but the implementation it documented
     has been superseded by the scan refactor.
 
+    Under non-Aligned **with** an :class:`OrientationCache` (the F1
+    fast path), the per-iteration orientation scan is replaced by a
+    lookup into ``cache.P_retain_marg``.  The cache is built once per
+    solve by :func:`build_orientation_cache` in
+    :func:`_picard_while_loop` and is bit-identical to the
+    per-iteration scan output (same call to
+    :func:`P_retain_marginalised` with the same broadcast progenitor
+    inputs).  Speedup factor on the loss side: ~``n_iter`` per solve
+    (typically ~20× at Picard convergence).
+
     Forwards ``response.orientation`` / ``retention_kind`` /
     ``w_over_v_esc`` to :func:`P_retain` so the misalignment dispatch
     set at construction time fires through the production implicit
@@ -129,6 +145,19 @@ def loss_density(
     Without this forward, the implicit solver silently ignored the
     orientation field — caught by
     ``tests/test_misalignment_invariants.py`` Step 11.
+
+    Parameters
+    ----------
+    cache : OrientationCache, optional
+        F1 fast path.  When non-``None`` and ``response.orientation``
+        is non-Aligned, uses ``cache.P_retain_marg`` in place of the
+        per-iteration :func:`P_retain` scan.  ``None`` falls back to
+        the per-iteration path — used both as the Aligned dispatch
+        target (Aligned shortcut handles its own retention internally)
+        and as a backstop when callers don't have a cache (e.g.
+        external loss-density users that don't go through
+        :func:`solve_implicit_fixed_point`).  See
+        ``demo/PLAN_implicit_footprint_refactor.md`` § Session F1.
     """
     grid = response.grid
     m = grid.m
@@ -140,12 +169,21 @@ def loss_density(
     chi2 = chi[None, None, None, :]
 
     log_K = log_pairing_kernel(m1, m2, **response.kernel_params)  # (N_m, 1, N_m, 1)
-    P = P_retain(
-        m1, m2, chi1, chi2, v_esc,
-        orientation=response.orientation,
-        retention_kind=response.retention_kind,
-        w_over_v_esc=response.w_over_v_esc,
-    )  # (N_m, N_chi, N_m, N_chi)
+    # F1 fast path: if a non-Aligned cache is present, read the
+    # precomputed marginal instead of re-running the per-iteration
+    # P_retain_marginalised scan.  Aligned dispatch (cache is None by
+    # construction in build_orientation_cache) falls through to the
+    # scalar P_retain path, which Aligned shortcuts to
+    # retention_aligned — bit-for-bit v1 semantics preserved.
+    if cache is not None and not isinstance(response.orientation, Aligned):
+        P = cache.P_retain_marg
+    else:
+        P = P_retain(
+            m1, m2, chi1, chi2, v_esc,
+            orientation=response.orientation,
+            retention_kind=response.retention_kind,
+            w_over_v_esc=response.w_over_v_esc,
+        )  # (N_m, N_chi, N_m, N_chi)
     K_P = jnp.exp(log_K) * P  # broadcasts on j
 
     integrand = K_P * N[None, None, :, :]  # multiply by N(m', χ')
@@ -313,6 +351,7 @@ def _F_map(
     response: "CoagulationResponse",
     v_esc_arr: Array,
     epsilon_arr: Array,
+    cache: Optional[OrientationCache] = None,
 ) -> Array:
     """Picard RHS: N_natal(θ) + ε·(gain[N, θ] − loss[N, θ]).
 
@@ -321,12 +360,23 @@ def _F_map(
     used by the IFT backward is evaluated where the clip is inactive
     and the gradient is correct.  Do **not** use this for the forward
     solve; use :func:`_picard_while_loop` instead.
+
+    Parameters
+    ----------
+    cache : OrientationCache, optional
+        F1 fast path.  Forwarded to :func:`loss_density`; non-None
+        bypasses the per-call orientation scan on the loss side.  The
+        forward Picard loop (:func:`_picard_while_loop`) builds the
+        cache once and passes it in; the IFT backward
+        (:func:`_make_picard_solve_fn`) rebuilds the cache inside
+        ``vjp_theta_fn`` so ``∂/∂(orientation.kappa)`` flows naturally.
+        See ``demo/PLAN_implicit_footprint_refactor.md`` § Session F1.
     """
     log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
     log_N_natal = response._natal_log_density()
     N_natal = jnp.exp(log_N_natal)
     gain = gain_density(N, log_K_mm, response, v_esc_arr)
-    loss = loss_density(N, response, v_esc_arr)
+    loss = loss_density(N, response, v_esc_arr, cache=cache)
     return N_natal + epsilon_arr * (gain - loss)
 
 
@@ -357,9 +407,20 @@ def _picard_while_loop(
     tol_arr = jnp.asarray(tol, dtype=N_natal.dtype)
     max_iter_arr = jnp.asarray(max_iter, dtype=jnp.int32)
 
+    # F1: precompute orientation-marginalised tensors once per solve.
+    # Returns None under Aligned — Aligned dispatch keeps the bit-stable
+    # v1 path inside loss_density's fallback branch (see PLAN Session F1
+    # Cross-cutting decisions: cache placement = pytree threaded through
+    # the solve, not eqx static field).
+    cache = build_orientation_cache(
+        grid, response.orientation, v_esc_arr,
+        retention_kind=response.retention_kind,
+        w_over_v_esc=response.w_over_v_esc,
+    )
+
     def F(N):
         g = gain_density(N, log_K_mm, response, v_esc_arr)
-        l = loss_density(N, response, v_esc_arr)
+        l = loss_density(N, response, v_esc_arr, cache=cache)
         return jnp.maximum(N_natal + epsilon_arr * (g - l), 0.0)
 
     init_carry = (
@@ -383,8 +444,9 @@ def _picard_while_loop(
         cond_fun, body_fun, init_carry
     )
 
-    # Post-convergence diagnostics.
-    loss_final = loss_density(N_star, response, v_esc_arr)
+    # Post-convergence diagnostics.  Reuse the cache built above — the
+    # diagnostic loss is the same integrand the Picard body evaluated.
+    loss_final = loss_density(N_star, response, v_esc_arr, cache=cache)
     loss_integral = jnp.einsum("ij,i,j->", loss_final, dm_w, dchi_w)
     natal_integral = jnp.einsum("ij,i,j->", N_natal, dm_w, dchi_w)
     n_star_integral = jnp.einsum("ij,i,j->", N_star, dm_w, dchi_w)
@@ -491,13 +553,27 @@ def _make_picard_solve_fn(max_iter: int, tol: float, damping: float):
         #   diagnostics — they use N / log_N exclusively).  TODO: add when needed.
         g_N_star = g.N + g.log_N / jnp.maximum(N_star, 1e-30)
 
+        # ── F1: cache reused across all GMRES matvecs ──────────────────
+        # ``cache`` is treated as a (response, v_esc)-only function;
+        # ``jac_N_T_v`` differentiates only wrt ``N``, so we build the
+        # cache once and freeze it across every matvec.  This avoids
+        # ~200 redundant orientation scans across the GMRES iteration
+        # count.  Under Aligned the cache is None — loss_density's
+        # fallback branch fires the bit-stable scalar path.
+        cache_fwd = build_orientation_cache(
+            response.grid, response.orientation, v_esc_arr,
+            retention_kind=response.retention_kind,
+            w_over_v_esc=response.w_over_v_esc,
+        )
+
         # ── GMRES: solve (I − J_N)ᵀ v = g_N_star ───────────────────────
         shape = N_star.shape
 
         def jac_N_T_v(v: Array) -> Array:
             """(∂F/∂N)ᵀ v  via VJP of _F_map wrt N at N_star."""
             _, vjp_fn = jax.vjp(
-                lambda N: _F_map(N, response, v_esc_arr, epsilon_arr),
+                lambda N: _F_map(N, response, v_esc_arr, epsilon_arr,
+                                 cache=cache_fwd),
                 N_star,
             )
             return vjp_fn(v)[0]
@@ -517,8 +593,21 @@ def _make_picard_solve_fn(max_iter: int, tol: float, damping: float):
         v = v_flat.reshape(shape)
 
         # ── Propagate: cotangent_θ = vjp_θ(F(N*, ·))(v) ────────────────
+        # Build the cache *inside* the VJP closure so that ∂/∂κ
+        # (Fisher) and ∂/∂v_esc flow through the orientation marginal.
+        # If we passed ``cache_fwd`` in instead, the κ-cotangent flowing
+        # through ``cache_fwd.P_retain_marg`` would be silently dropped
+        # (since ``cache_fwd`` is treated as a constant for AD purposes
+        # outside the jax.vjp scope).  Same v_esc.
         _, vjp_theta_fn = jax.vjp(
-            lambda resp, ve, eps: _F_map(N_star, resp, ve, eps),
+            lambda resp, ve, eps: _F_map(
+                N_star, resp, ve, eps,
+                cache=build_orientation_cache(
+                    resp.grid, resp.orientation, ve,
+                    retention_kind=resp.retention_kind,
+                    w_over_v_esc=resp.w_over_v_esc,
+                ),
+            ),
             response,
             v_esc_arr,
             epsilon_arr,

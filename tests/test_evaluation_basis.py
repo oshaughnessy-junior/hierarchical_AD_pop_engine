@@ -125,15 +125,27 @@ def basis_solver() -> TensorProductBasis:
 
 @pytest.fixture(scope="module")
 def basis_result(small_response, basis_solver) -> BasisSolveResult:
+    # ε=1e-2 chosen for Picard *stability* — not for physics realism.
+    # At this fixture's natal scale (μ=8, σ=1) with kernel_a=0 +
+    # kernel_b=1 + v_esc=1000 + w_over_v_esc=1.0, the soft sigmoid
+    # retention is ~σ(1) ≈ 0.73 even on the heaviest LZ kicks, so loss
+    # dominates gain and damped Picard at ε≥0.1 diverges (coefficients
+    # blow up ~30×/iter, NaN at ~iter 8).  ε=1e-2 leaves a non-trivial
+    # cascade (1G/2G both visible) while staying well inside the
+    # stability basin.  The basis IFT VJP is pinned for AD correctness
+    # by ``test_basis_solver.py`` at ε=1e-4; this file pins the
+    # ``BasisEvaluator`` *API* (grid-point equivalence, out-of-domain
+    # zero, derived-axis raise, protocol conformance) which is
+    # independent of ε's absolute value.
     return solve_basis_fixed_point(
         small_response,
         basis_solver,
         v_esc=jnp.asarray(1000.0),
-        epsilon=1.0,
+        epsilon=1e-2,
         w_over_v_esc=1.0,
-        max_iter=200,
+        max_iter=500,
         tol=1e-8,
-        damping=0.5,
+        damping=0.2,
     )
 
 
@@ -384,11 +396,12 @@ def test_density_grad_runs(small_response, basis_solver):
             k_max=4, solver="implicit", epsilon=1.0,
             grid=BinaryGrid.default(m_min=_M_MIN, m_max=_M_MAX, n_m=20, n_chi=8),
         )
+        # ε=1e-2 for Picard stability — see basis_result fixture docstring.
         result = solve_basis_fixed_point(
             response, basis_solver,
             v_esc=jnp.asarray(1000.0),
-            epsilon=1.0, w_over_v_esc=1.0,
-            max_iter=200, tol=1e-8, damping=0.5,
+            epsilon=1e-2, w_over_v_esc=1.0,
+            max_iter=500, tol=1e-8, damping=0.2,
         )
         ev = result.evaluator(response, basis_solver)
         m_q, chi_q = jnp.meshgrid(
