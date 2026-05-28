@@ -88,8 +88,36 @@ from .grids import BinaryGrid
 from .remnants.marginal import (
     P_retain_marginalised,
     chi_rem_at_orientation,
+    v_kick_at_orientation,
 )
+from .remnants.mass import M_rem
 from .spin_orientation import Aligned
+
+
+# Session F2 — basis-rank sentinel.
+# ``R_CHI_OUT_DEFAULT = None`` means "use the engine χ-grid bilinear-hat
+# basis with R = N_χ".  This basis is **mass-conserving by construction**
+# (bilinear hats partition unity at every point in [chi[0], chi[-1]]),
+# which matches what the original scan path's bilinear χ-scatter does.
+#
+# The PLAN's original Strategy-B intent was to spectrally compress
+# (R ≪ N_χ via shifted Legendre), but the projection-reconstruction
+# loop on a coarse engine χ grid loses mass-conservation for r ≥ 2
+# because ``Σ_j P_r^*(χ[j]) · dχ[j] ≠ L·δ_{r,0}`` at low N_χ
+# (Σ_j P_2^* · dχ ≈ 0.24 vs the exact 0 at N_χ=6).  The fix is
+# either an internal fine χ-grid for orthogonality or an explicit
+# mass-conservation correction — both are deferred to a follow-up.
+#
+# Memory cost at production (N_χ=32 with R=N_χ): same as the
+# scan-path 4-D tensor for the χ-out side; the cache cost stays
+# linear in N_χ, not constant in R.  Acceptable per the PLAN budget.
+#
+# Truthy default ``True`` tells :func:`build_orientation_cache` to
+# build the F2 surrogate; the actual basis rank is fixed at
+# ``N_χ`` (bilinear hats — see :class:`OrientationCache` field
+# docstring).  Set to ``None``/``0`` to skip F2 and fall back to
+# the F1-only path (gain side per-iter scan).
+R_CHI_OUT_DEFAULT = True
 
 
 class OrientationCache(eqx.Module):
@@ -126,6 +154,43 @@ class OrientationCache(eqx.Module):
 
     P_retain_marg: Array  # (N_m, N_chi, N_m, N_chi)
     chi_rem_mean: Array  # (N_m, N_chi, N_m, N_chi)
+    # ── Session F2 fields ────────────────────────────────────────────
+    # Strategy B χ-out spectral surrogate, **bilinear-hat basis** at
+    # R = N_χ (mass-conserving by construction; partition of unity at
+    # every χ_out point).  Populated only when the caller passes
+    # ``R_chi_out`` to :func:`build_orientation_cache`.  ``None`` (the
+    # default sentinel) means "F2 fast path not built; gain side falls
+    # back to per-iter scan in _step_one_generation_marginalised".
+    #
+    # The PLAN originally wanted a smaller-R Legendre spectral
+    # compression (R ≪ N_χ), but the projection-reconstruction loop
+    # loses mass conservation on coarse engine χ grids (the
+    # bilinear-grid weights ``Σ_j P_r^*(χ[j]) · dχ[j]`` aren't
+    # δ_{r,0} L for r ≥ 2 at N_χ ~ 6).  Bilinear hats keep
+    # mass-conservation trivially; spectral compression is deferred.
+    #
+    # ``chi_scatter_marg[j_out, i1, j1, i2, j2]`` — orientation-summed
+    # bilinear-hat coefficient at engine χ-cell ``j_out``::
+    #
+    #     chi_scatter_marg[j_out, ...]
+    #         = Σ_k w_orient_k · P_ret_k
+    #               · hat_at_j_out(chi_rem_k(i1, j1, i2, j2))
+    #
+    # where ``hat_at_j(x) = max(0, 1 − |x − χ[j]| / Δχ[j])``.  Mass-
+    # conservation: ``Σ_{j_out} chi_scatter_marg[j_out, ...] =
+    # P_retain_marg[...]`` by partition-of-unity of the bilinear hats.
+    # Reduces to bit-equivalent of the scan path's bilinear-χ-scatter,
+    # but precomputed once per solve rather than per Picard iter.
+    #
+    # ``M_rem_mean_retained[i1, j1, i2, j2]`` — P_ret-weighted
+    # orientation-mean remnant mass.  Used by the F2 fast gain path
+    # to anchor the bilinear-m scatter onto a single m_out value per
+    # progenitor cell (the Strategy B assumption that M_rem's
+    # orientation variation is dominated by its mean at production
+    # m-resolution — see PLAN § Strategy A limitations and the
+    # M_rem-derivation note in the F2 fast-gain docstring).
+    chi_scatter_marg: Optional[Array] = eqx.field(default=None)
+    M_rem_mean_retained: Optional[Array] = eqx.field(default=None)
 
 
 def build_orientation_cache(
@@ -135,6 +200,7 @@ def build_orientation_cache(
     *,
     retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
+    R_chi_out: Optional[int] = None,
 ) -> Optional[OrientationCache]:
     """Build the per-solve orientation-marginalised tensor cache.
 
@@ -213,9 +279,33 @@ def build_orientation_cache(
     # at production resolution.
     chi_rem_mean = _chi_rem_mean_4d(m1, m2, chi1, chi2, orientation)
 
+    # ── Session F2 ──────────────────────────────────────────────────
+    # When the caller asks to build the F2 surrogate (truthy
+    # ``R_chi_out``), build the bilinear-hat χ-scatter marginal +
+    # P_ret-weighted M_rem mean in one combined scan over the
+    # orientation quadrature.  ``R_chi_out`` value beyond truthiness
+    # is currently ignored — the basis rank is fixed at ``N_χ`` by
+    # the partition-of-unity mass-conservation requirement (see the
+    # ``OrientationCache`` docstring section on the basis choice).
+    # Skipping F2 keeps the F1 cache cost unchanged for callers that
+    # haven't migrated.
+    chi_scatter_marg = None
+    M_rem_mean_retained = None
+    if R_chi_out:
+        chi_scatter_marg, M_rem_mean_retained = _f2_combined_scan(
+            m1, m2, chi1, chi2, grid,
+            v_esc=v_esc,
+            orientation=orientation,
+            retention_kind=retention_kind,
+            w_over_v_esc=w_over_v_esc,
+            P_retain_marg=P_retain_marg,
+        )
+
     return OrientationCache(
         P_retain_marg=P_retain_marg,
         chi_rem_mean=chi_rem_mean,
+        chi_scatter_marg=chi_scatter_marg,
+        M_rem_mean_retained=M_rem_mean_retained,
     )
 
 
@@ -264,7 +354,170 @@ def _chi_rem_mean_4d(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Session F2 — bilinear-hat χ-out surrogate (Strategy B, mass-conserving).
+#
+# Replaces the per-Picard-iter orientation scan in
+# ``response/coagulation.py:_step_one_generation_marginalised`` (the
+# gain side, in F1's complement to the loss side).  The orientation
+# marginal of the χ-out distribution is **bilinear-hat-scattered onto
+# the engine χ grid** at cache build time, then contracted per Picard
+# iter against ``K · N · N · cell`` without re-scanning orientation.
+#
+# Mass-conservation: bilinear hats are a partition of unity at every
+# χ_out, so ``Σ_{j_out} hat_at_j_out(x) = 1`` for any ``x ∈
+# [grid.chi[0], grid.chi[-1]]``.  The orientation-summed coefficient
+# tensor therefore obeys ``Σ_{j_out} chi_scatter_marg[j_out, …] =
+# P_retain_marg[…]`` — bit-equivalent to the scan path on the χ side.
+#
+# This trades the PLAN's original Legendre-spectral compression for
+# correctness: a low-R shifted-Legendre projection on the coarse
+# engine χ grid does **not** discretely integrate to ``L · δ_{r,0}``
+# for r ≥ 2 (e.g. ``Σ_j P_2^*(χ[j]) · dχ[j] ≈ 0.24`` at N_χ = 6 vs
+# the exact 0), so the reconstruct-at-grid loop spills mass into the
+# r=0 mode and the forward solve diverges by ~16 % rel L1 at Stage 1.
+# Spectral compression with proper internal-grid orthogonality is a
+# follow-up; for F2 we ship correct-and-simple.
+# ---------------------------------------------------------------------------
+def _bilinear_chi_hats(x: Array, chi_grid: Array) -> Array:
+    r"""Bilinear-hat basis values at ``x`` for each engine χ-grid node.
+
+    Returns ``hats[j, *x.shape]`` where ``hats[j, …]`` is the value
+    of the bilinear hat centred at ``chi_grid[j]`` evaluated at
+    ``x``.  Mass-conservation invariant::
+
+        Σ_j hats[j, …] = 1   (for x inside [chi_grid[0], chi_grid[-1]])
+                       = 0   (outside)
+
+    Implementation: compute fractional grid index ``i_frac`` via
+    ``jnp.interp``, then form ``(1 − di)`` at index ``i_lo`` and
+    ``di`` at ``i_lo + 1``, scatter to length-``N_χ`` per node.
+    """
+    N = chi_grid.size
+    x_arr = jnp.asarray(x)
+    i_frac = jnp.interp(
+        x_arr, chi_grid, jnp.arange(N, dtype=x_arr.dtype),
+    )
+    inside = (x_arr >= chi_grid[0]) & (x_arr <= chi_grid[-1])
+    i_lo = jnp.clip(jnp.floor(i_frac).astype(jnp.int32), 0, N - 2)
+    di = i_frac - i_lo
+
+    # Build the (N, *x.shape) one-hot-like tensor by scattering
+    # (1 - di) and di onto the appropriate j index.  We use
+    # ``jnp.where`` over a comparison broadcast rather than ``.at``
+    # because the latter doesn't vmap cleanly over the j-axis here
+    # and the comparison broadcast is constant-time per j per query.
+    j_axis = jnp.arange(N).reshape((N,) + (1,) * x_arr.ndim)
+    lo_mask = (j_axis == i_lo)
+    hi_mask = (j_axis == (i_lo + 1))
+    hats = jnp.where(lo_mask, 1.0 - di, 0.0) + jnp.where(hi_mask, di, 0.0)
+    # Zero out everything outside the χ grid.
+    return jnp.where(inside, hats, 0.0)
+
+
+def _f2_combined_scan(
+    m1: Array,
+    m2: Array,
+    chi1: Array,
+    chi2: Array,
+    grid: BinaryGrid,
+    *,
+    v_esc: Array,
+    orientation,
+    retention_kind: Literal["heaviside", "sigmoid"],
+    w_over_v_esc: float,
+    P_retain_marg: Optional[Array],
+) -> tuple[Array, Optional[Array]]:
+    r"""Combined orientation scan: bilinear-hat χ scatter + P_ret-weighted M_rem.
+
+    One pass over the orientation quadrature accumulates **two**
+    tensors over the 4-D progenitor mesh:
+
+    * ``chi_scatter_marg[j_out, i1, j1, i2, j2]`` —
+      ``Σ_k w_k · P_ret_k · hat_at_j_out(chi_rem_k)`` (shape
+      ``(N_χ, N_m, N_χ, N_m, N_χ)``).  Mass-conservation: summed
+      over ``j_out`` this equals ``P_retain_marg`` by partition-of-
+      unity of the hats.
+    * ``M_rem_weighted_accum[i1, j1, i2, j2]`` —
+      ``Σ_k w_k · P_ret_k · M_rem_k``.  Divided by ``P_retain_marg``
+      at the caller to give the P_ret-weighted orientation-mean
+      remnant mass.  ``None`` if ``P_retain_marg is None`` (the
+      caller is in the standalone helper-function path).
+
+    Both products share the same per-orientation ``P_ret`` and the
+    same ``chi_rem`` evaluation, so combining them is half the cost
+    of two separate scans.
+
+    Returns
+    -------
+    (chi_scatter_marg, M_rem_mean_retained) : tuple
+    """
+    bcast_shape = jnp.broadcast_shapes(
+        jnp.shape(m1), jnp.shape(m2),
+        jnp.shape(chi1), jnp.shape(chi2),
+    )
+    quad = orientation.quadrature_3d()  # (n_quad, 4)
+    v_esc_arr = jnp.asarray(v_esc)
+    chi_grid = grid.chi
+    N_chi = chi_grid.size
+
+    if retention_kind not in ("heaviside", "sigmoid"):
+        raise ValueError(
+            f"Unknown retention_kind {retention_kind!r}; expected "
+            "'heaviside' or 'sigmoid'."
+        )
+
+    def scan_body(carry, orient_pt):
+        chi_acc, m_rem_acc = carry
+        cos_t1 = orient_pt[0]
+        cos_t2 = orient_pt[1]
+        dphi = orient_pt[2]
+        w_orient = orient_pt[3]
+
+        v_k = v_kick_at_orientation(
+            m1, m2, chi1, chi2, cos_t1, cos_t2, dphi,
+        )
+        if retention_kind == "heaviside":
+            P_ret = jnp.where(v_k < v_esc_arr, 1.0, 0.0)
+        else:
+            w_v = w_over_v_esc * v_esc_arr
+            P_ret = jax.nn.sigmoid((v_esc_arr - v_k) / w_v)
+
+        chi_rem_k = chi_rem_at_orientation(
+            m1, m2, chi1, chi2, cos_t1, cos_t2, dphi,
+        )
+        # M_rem under per-orientation χ_z projection — same convention
+        # as ``_step_one_generation_marginalised``.
+        chi1_z = chi1 * cos_t1
+        chi2_z = chi2 * cos_t2
+        M_rem_k = M_rem(m1, m2, chi1_z, chi2_z)
+
+        w_eff = w_orient * P_ret  # 4-D
+        hats = _bilinear_chi_hats(chi_rem_k, chi_grid)  # (N_χ, *bcast)
+        chi_inc = hats * w_eff[None, ...]  # (N_χ, *bcast)
+        m_rem_inc = w_eff * M_rem_k        # bcast
+
+        return (chi_acc + chi_inc, m_rem_acc + m_rem_inc), None
+
+    init_chi = jnp.zeros((N_chi,) + bcast_shape)
+    init_m_rem = jnp.zeros(bcast_shape)
+    (chi_scatter_marg, m_rem_accum), _ = jax.lax.scan(
+        scan_body, (init_chi, init_m_rem), quad,
+    )
+
+    if P_retain_marg is not None:
+        # Floor the divisor: progenitor cells with zero retention
+        # contribute zero weight to the gain anyway; we keep
+        # M_rem_mean finite for index-lookup well-definedness.
+        m_rem_mean_retained = m_rem_accum / jnp.maximum(P_retain_marg, 1e-30)
+    else:
+        m_rem_mean_retained = None
+
+    return chi_scatter_marg, m_rem_mean_retained
+
+
 __all__ = [
     "OrientationCache",
     "build_orientation_cache",
+    "R_CHI_OUT_DEFAULT",
 ]

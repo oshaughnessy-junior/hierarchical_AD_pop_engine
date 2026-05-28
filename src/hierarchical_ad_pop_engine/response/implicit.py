@@ -59,6 +59,7 @@ from jax import Array
 from ..kernels import log_pairing_kernel, log_pairing_kernel_grid
 from ..orientation_precompute import (
     OrientationCache,
+    R_CHI_OUT_DEFAULT,
     build_orientation_cache,
 )
 from ..retention import P_retain
@@ -211,6 +212,7 @@ def gain_density(
     log_K_mm: Array,
     response: "CoagulationResponse",
     v_esc: Array,
+    cache: Optional[OrientationCache] = None,
 ) -> Array:
     """Density-form gain term ``(1/2) ∫∫ K · N · N · P_retain`` on the grid.
 
@@ -221,6 +223,17 @@ def gain_density(
     forward, the bilinear gain accumulator ignored the orientation
     field while the per-generation perturbative ``_solve`` honoured
     it, producing a silent divergence between the two solver paths.
+
+    Session F2 fast path
+    --------------------
+    If ``cache`` carries the F2 surrogate fields
+    (``chi_out_basis_coeffs``, ``chi_out_basis_funcs_at_grid``,
+    ``M_rem_mean_retained`` — populated by
+    :func:`orientation_precompute.build_orientation_cache` with
+    ``R_chi_out > 0``), the orientation scan inside
+    ``_step_one_generation_marginalised`` is replaced by a one-shot
+    tensor contraction.  Aligned dispatch returns from
+    ``_step_one_generation`` upstream and never touches the cache.
     """
     log_N_safe = jnp.log(jnp.maximum(N, 1e-30))
     raw_weight_per_cell = _step_one_generation(
@@ -233,6 +246,7 @@ def gain_density(
         orientation=response.orientation,
         retention_kind=response.retention_kind,
         w_over_v_esc=response.w_over_v_esc,
+        cache=cache,
     )
     grid = response.grid
     dm_out = _dm_log_weights(grid.m, grid.log_m)
@@ -375,7 +389,7 @@ def _F_map(
     log_K_mm = log_pairing_kernel_grid(response.grid.m, **response.kernel_params)
     log_N_natal = response._natal_log_density()
     N_natal = jnp.exp(log_N_natal)
-    gain = gain_density(N, log_K_mm, response, v_esc_arr)
+    gain = gain_density(N, log_K_mm, response, v_esc_arr, cache=cache)
     loss = loss_density(N, response, v_esc_arr, cache=cache)
     return N_natal + epsilon_arr * (gain - loss)
 
@@ -407,19 +421,27 @@ def _picard_while_loop(
     tol_arr = jnp.asarray(tol, dtype=N_natal.dtype)
     max_iter_arr = jnp.asarray(max_iter, dtype=jnp.int32)
 
-    # F1: precompute orientation-marginalised tensors once per solve.
+    # F1 + F2: precompute orientation-marginalised tensors once per solve.
     # Returns None under Aligned — Aligned dispatch keeps the bit-stable
     # v1 path inside loss_density's fallback branch (see PLAN Session F1
     # Cross-cutting decisions: cache placement = pytree threaded through
     # the solve, not eqx static field).
+    #
+    # Under non-Aligned the cache also carries the F2 χ-out spectral
+    # surrogate (chi_out_basis_coeffs + chi_out_basis_funcs_at_grid +
+    # M_rem_mean_retained) which gain_density routes through to skip
+    # the per-Picard-iter orientation scan on the gain side.  Pinned
+    # rank R_CHI_OUT_DEFAULT is the smallest value meeting the < 0.5%
+    # rel-L1 convergence gate at Stage 1 θ\* (see project-engine-f2-done).
     cache = build_orientation_cache(
         grid, response.orientation, v_esc_arr,
         retention_kind=response.retention_kind,
         w_over_v_esc=response.w_over_v_esc,
+        R_chi_out=R_CHI_OUT_DEFAULT,
     )
 
     def F(N):
-        g = gain_density(N, log_K_mm, response, v_esc_arr)
+        g = gain_density(N, log_K_mm, response, v_esc_arr, cache=cache)
         l = loss_density(N, response, v_esc_arr, cache=cache)
         return jnp.maximum(N_natal + epsilon_arr * (g - l), 0.0)
 
@@ -553,17 +575,19 @@ def _make_picard_solve_fn(max_iter: int, tol: float, damping: float):
         #   diagnostics — they use N / log_N exclusively).  TODO: add when needed.
         g_N_star = g.N + g.log_N / jnp.maximum(N_star, 1e-30)
 
-        # ── F1: cache reused across all GMRES matvecs ──────────────────
+        # ── F1 + F2: cache reused across all GMRES matvecs ─────────────
         # ``cache`` is treated as a (response, v_esc)-only function;
         # ``jac_N_T_v`` differentiates only wrt ``N``, so we build the
         # cache once and freeze it across every matvec.  This avoids
         # ~200 redundant orientation scans across the GMRES iteration
         # count.  Under Aligned the cache is None — loss_density's
-        # fallback branch fires the bit-stable scalar path.
+        # fallback branch fires the bit-stable scalar path.  F2 fields
+        # populated with R_CHI_OUT_DEFAULT to match the forward solve.
         cache_fwd = build_orientation_cache(
             response.grid, response.orientation, v_esc_arr,
             retention_kind=response.retention_kind,
             w_over_v_esc=response.w_over_v_esc,
+            R_chi_out=R_CHI_OUT_DEFAULT,
         )
 
         # ── GMRES: solve (I − J_N)ᵀ v = g_N_star ───────────────────────
@@ -606,6 +630,7 @@ def _make_picard_solve_fn(max_iter: int, tol: float, damping: float):
                     resp.grid, resp.orientation, ve,
                     retention_kind=resp.retention_kind,
                     w_over_v_esc=resp.w_over_v_esc,
+                    R_chi_out=R_CHI_OUT_DEFAULT,
                 ),
             ),
             response,

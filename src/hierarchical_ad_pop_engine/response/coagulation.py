@@ -187,6 +187,7 @@ def _step_one_generation_marginalised(
     orientation,
     retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
+    cache: Optional[object] = None,
 ) -> Array:
     """Orientation-marginalised bilinear scatter via ``jax.lax.scan``.
 
@@ -217,7 +218,35 @@ def _step_one_generation_marginalised(
     so quadrature convergence drops; pair with
     ``Isotropic(n_theta=8, n_dphi=16)`` for the v1 1024-point
     accuracy.
+
+    Session F2 fast path
+    --------------------
+    If ``cache`` carries a non-``None``
+    ``chi_out_basis_coeffs`` field (built by
+    :func:`orientation_precompute.build_orientation_cache` with
+    ``R_chi_out > 0``), the per-iter orientation scan over both
+    ``M_rem`` and ``chi_rem`` is replaced by a one-shot tensor
+    contraction against the precomputed spectral coefficients and
+    a precomputed P_ret-weighted ``M_rem`` mean.  See
+    :func:`_step_one_generation_basis_fast` for the contraction
+    geometry.
+
+    Speedup: ~``n_quad / 1`` per Picard iter on the gain side; the
+    orientation cost reappears once at cache construction (one scan
+    per solve).  Aligned dispatch bypasses this branch by routing
+    to ``_step_one_generation_aligned`` at the upstream
+    ``_step_one_generation`` site — Aligned never reaches here.
     """
+    # F2 fast path — if a basis cache is present, contract against
+    # the precomputed surrogate instead of scanning orientation.
+    if (
+        cache is not None
+        and getattr(cache, "chi_scatter_marg", None) is not None
+    ):
+        return _step_one_generation_basis_fast(
+            log_n_j, log_n_l, log_K_mm, grid, symmetry_factor, cache,
+        )
+
     m = grid.m
     chi = grid.chi
     N_m = m.size
@@ -290,6 +319,116 @@ def _step_one_generation_marginalised(
     return out
 
 
+def _step_one_generation_basis_fast(
+    log_n_j: Array,
+    log_n_l: Array,
+    log_K_mm: Array,
+    grid: BinaryGrid,
+    symmetry_factor: float,
+    cache,
+) -> Array:
+    """F2 fast-path gain — basis-surrogate contraction in place of the scan.
+
+    Replaces ``_step_one_generation_marginalised``'s per-Picard-iter
+    orientation scan with a one-shot tensor contraction against the
+    F2 surrogate fields on ``cache``.  Same output convention
+    (count-per-output-cell) so the upstream
+    ``response/implicit.py:gain_density`` cell-area divisor
+    continues to produce a density on ``(m_out, χ_out)`` consistent
+    with ``log_n[0]`` from :meth:`CoagulationResponse._natal_log_density`.
+
+    Geometry
+    --------
+    The orientation-averaged gain at progenitor cell
+    ``(i_1, j_1, i_2, j_2)`` produces a 2-D distribution on
+    ``(m_out, χ_out)``.  F2 (bilinear-hat surrogate; PLAN § Strategy
+    B, simplified for mass-conservation at coarse engine grids)
+    factorises:
+
+    * ``χ_out`` direction: the orientation-summed bilinear-hat
+      scattered coefficients ``cache.chi_scatter_marg[j_out, …]`` —
+      a partition-of-unity decomposition that conserves mass by
+      construction.
+    * ``m_out`` direction: the P_ret-weighted orientation-mean
+      ``M_rem_mean_retained[…]`` — collapsed to a single mean per
+      progenitor cell.  Strategy A's limitation: the M_rem
+      orientation spread is dropped.  At production m-resolution
+      (N_m ≥ 32) the spread is well-resolved by adjacent grid bins
+      and the bias is small; at sandbox-tier resolution (N_m = 8)
+      the bias surfaces as ~few % rel-L1 vs the scan path.
+
+    Mathematically::
+
+        contribution[i_out, j_out]
+            = Σ_{i1,j1,i2,j2}
+                  K_pair · N_j(i1,j1) · N_l(i2,j2) · cell · sym
+                  · cache.chi_scatter_marg[j_out, i1, j1, i2, j2]
+                  · bilinear-m-hat(i_out, M_rem_mean_retained[i1, …])
+
+    Mass conservation::
+
+        Σ_{j_out} cache.chi_scatter_marg[j_out, …]
+            = P_retain_marg[…]   (partition of unity for hats)
+
+    so the total mass on (i_out, j_out) equals the scan-path total
+    up to the m-side approximation.
+
+    Aligned bit-stability
+    ---------------------
+    Aligned never reaches this branch; the
+    :func:`_step_one_generation` dispatcher routes Aligned to
+    :func:`_step_one_generation_aligned` upstream.  The cache itself
+    is also ``None`` under Aligned (see
+    :func:`orientation_precompute.build_orientation_cache`).
+    """
+    m = grid.m
+    chi = grid.chi
+    log_m = grid.log_m
+    N_m = m.size
+    N_chi = chi.size
+
+    dm1, dchi1 = _trapezoidal_cell_widths(grid)
+    cell = (
+        dm1[:, None, None, None]
+        * dchi1[None, :, None, None]
+        * dm1[None, None, :, None]
+        * dchi1[None, None, None, :]
+    )
+
+    log_K_4d = log_K_mm[:, None, :, None]
+    log_pair = log_K_4d + log_n_j[:, :, None, None] + log_n_l[None, None, :, :]
+    base_weight = jnp.exp(log_pair) * cell * symmetry_factor  # (N_m, N_chi, N_m, N_chi)
+
+    # ── Per-(j_out) weighted progenitor tensor ───────────────────
+    # cache.chi_scatter_marg has shape (N_χ, N_m, N_χ, N_m, N_χ).
+    # weighted[j_out, i1, j1, i2, j2] = base_weight · chi_scatter_marg[j_out, …]
+    weighted = base_weight[None, ...] * cache.chi_scatter_marg
+
+    # Flatten progenitor mesh into a single axis so the m-side
+    # bilinear scatter is a 1-D operation per j_out.
+    weighted_flat = weighted.reshape(N_chi, -1)              # (N_χ, N_p)
+    M_rem_flat = cache.M_rem_mean_retained.reshape(-1)        # (N_p,)
+
+    # ── m-side bilinear scatter onto i_out ──────────────────────
+    log_M = jnp.log(jnp.maximum(M_rem_flat, 1e-30))
+    i_frac = jnp.interp(
+        log_M, log_m, jnp.arange(N_m, dtype=jnp.float64),
+    )
+    inside_m = (log_M >= log_m[0]) & (log_M <= log_m[-1])
+    i_lo = jnp.clip(jnp.floor(i_frac).astype(jnp.int32), 0, N_m - 2)
+    di = i_frac - i_lo
+
+    w_lo = jnp.where(inside_m, weighted_flat * (1.0 - di), 0.0)  # (N_χ, N_p)
+    w_hi = jnp.where(inside_m, weighted_flat * di, 0.0)
+
+    # Scatter on the m_out axis.  Shape (N_χ, N_m), transposed at
+    # the end to match the (N_m, N_χ) caller convention.
+    out_jm = jnp.zeros((N_chi, N_m))
+    out_jm = out_jm.at[:, i_lo].add(w_lo)
+    out_jm = out_jm.at[:, i_lo + 1].add(w_hi)
+    return out_jm.T  # (N_m, N_χ)
+
+
 def _step_one_generation(
     log_n_j: Array,  # (N_m, N_chi) progenitor j density
     log_n_l: Array,  # (N_m, N_chi) progenitor l density
@@ -300,6 +439,7 @@ def _step_one_generation(
     orientation=None,
     retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
     w_over_v_esc: float = 1.0,
+    cache: Optional[object] = None,
 ) -> Array:
     """Compute the contribution of one ``(j, l)`` progenitor pair to ``n_k(m, χ)``.
 
@@ -327,6 +467,7 @@ def _step_one_generation(
         orientation,
         retention_kind=retention_kind,
         w_over_v_esc=w_over_v_esc,
+        cache=cache,
     )
 
 
