@@ -431,6 +431,214 @@ def sample_natals(
     return m, chi, weights
 
 
+# ===========================================================================
+# Session J1 — JAX-pure natal sampler.
+#
+# Lives alongside the numpy ``sample_natals`` / ``_natal_log_pdf`` /
+# ``_stratified_natal`` (kept untouched as the validation backstop per
+# ``demo/PLAN_jax_mc.md`` § "Hard rule").  All J1 surfaces have a ``_jax``
+# suffix and accept a ``jax.Array`` key instead of a ``np.random.Generator``;
+# returns are ``jax.Array`` triples ``(m, chi, weights)``.
+#
+# Reparametrised in ``mu_natal`` / ``sigma_natal`` / ``natal_spin_loc`` /
+# ``natal_spin_scale`` so gradients flow through the natal hyperparameters
+# (this is what unblocks the eventual M4 SVI integration test under
+# ``solver="mc_jax"``).
+# ===========================================================================
+def _natal_log_pdf_jax(m, chi, cfg: MCConfig):
+    r"""JAX mirror of :func:`_natal_log_pdf` — joint log p_natal(m, χ).
+
+    Uses ``jax.scipy.stats.truncnorm.logpdf``; output dtype follows JAX
+    default precision (float32 unless ``jax_enable_x64``).  Differentiable
+    in ``cfg.mu_natal`` / ``sigma_natal`` / ``natal_spin_loc`` /
+    ``natal_spin_scale`` via standard truncnorm autodiff.
+    """
+    from jax.scipy.stats import truncnorm as _jt
+    mu = jnp.asarray(cfg.mu_natal)
+    sig = jnp.asarray(cfg.sigma_natal)
+    loc_c = jnp.asarray(cfg.natal_spin_loc)
+    sc_c = jnp.asarray(cfg.natal_spin_scale)
+    a_m = (jnp.asarray(cfg.m_min) - mu) / sig
+    b_m = (jnp.asarray(cfg.m_max) - mu) / sig
+    log_p_m = _jt.logpdf(m, a_m, b_m, loc=mu, scale=sig)
+    a_c = (0.0 - loc_c) / sc_c
+    b_c = (1.0 - loc_c) / sc_c
+    log_p_chi = _jt.logpdf(chi, a_c, b_c, loc=loc_c, scale=sc_c)
+    return log_p_m + log_p_chi
+
+
+def _stratified_natal_jax(cfg: MCConfig, key: jax.Array):
+    r"""JAX mirror of :func:`_stratified_natal`.
+
+    Stratified-uniform sampler on the ``(log m, χ)`` rectangle with
+    auto-computed Jacobian-correct weights ``w = p_natal / q_strat``.
+    Returns ``(m, chi, weights)`` as JAX arrays of length
+    ``n_m_cells × n_chi_cells × n_per_cell`` (≤ ``cfg.n_seed``).
+
+    Vectorised by construction — no Python loop over cells, so this
+    is jit-compatible (under static ``stratify`` shape).
+    """
+    n_m_cells, n_chi_cells = cfg.stratify  # type: ignore[misc]
+    n_total_cells = int(n_m_cells * n_chi_cells)
+    if n_total_cells <= 0:
+        raise ValueError(
+            f"stratify={cfg.stratify!r} must have positive entries"
+        )
+    n_per_cell = max(1, cfg.n_seed // n_total_cells)
+    log_m_edges = jnp.linspace(
+        jnp.log(jnp.asarray(cfg.m_min)),
+        jnp.log(jnp.asarray(cfg.m_max)),
+        n_m_cells + 1,
+    )
+    chi_edges = jnp.linspace(0.0, 1.0, n_chi_cells + 1)
+    key_m, key_chi = jax.random.split(key)
+    u_m = jax.random.uniform(
+        key_m, shape=(n_m_cells, n_chi_cells, n_per_cell),
+    )
+    u_chi = jax.random.uniform(
+        key_chi, shape=(n_m_cells, n_chi_cells, n_per_cell),
+    )
+    log_m_lo = log_m_edges[:n_m_cells, None, None]
+    log_m_hi = log_m_edges[1:, None, None]
+    chi_lo = chi_edges[None, :n_chi_cells, None]
+    chi_hi = chi_edges[None, 1:, None]
+    log_m = log_m_lo + (log_m_hi - log_m_lo) * u_m
+    chi_cells = chi_lo + (chi_hi - chi_lo) * u_chi
+    m = jnp.exp(log_m).ravel()
+    chi = chi_cells.ravel()
+    log_m_range = jnp.log(jnp.asarray(cfg.m_max)) - jnp.log(jnp.asarray(cfg.m_min))
+    # log q_strat(m, χ) = -log m - log(Δlog m) - log(Δχ) with Δχ=1.
+    log_q = -jnp.log(m) - jnp.log(log_m_range)
+    log_w = _natal_log_pdf_jax(m, chi, cfg) - log_q
+    weights = jnp.exp(log_w)
+    return m, chi, weights
+
+
+def sample_natals_jax(
+    cfg: MCConfig, key: jax.Array, *, filter_zero_weights: bool = True,
+):
+    r"""JAX-pure version of :func:`sample_natals`.
+
+    Returns ``(m, chi, weights)`` as JAX arrays.  Same three sampling
+    modes as the numpy version:
+
+    1. ``cfg.proposal`` if set: caller-supplied ``q(key)`` →
+       ``(m, chi, log_q)``.  Returns JAX arrays of any length.
+    2. ``cfg.stratify`` if set: stratified-uniform on ``(log m, χ)``
+       cells via :func:`_stratified_natal_jax`.
+    3. Default: ``jax.random.truncated_normal`` in both axes;
+       reparametrised so gradients in ``mu_natal`` / ``sigma_natal``
+       / ``natal_spin_loc`` / ``natal_spin_scale`` flow through the
+       affine ``loc + scale·z`` transform.
+
+    ``cfg.weight_array`` multiplies into whichever base-mode weights.
+
+    Parameters
+    ----------
+    cfg : MCConfig
+        Same dataclass as the numpy path.  Float fields are
+        ``jnp.asarray``-converted inside so AD on natal hyperparameters
+        works without the caller having to JAX-ify the dataclass.
+    key : jax.Array
+        PRNG key (replaces the numpy ``rng``).
+    filter_zero_weights : bool, default True
+        If True, samples with zero weight (proposal landing in regions
+        where ``p_natal`` underflows to 0) are filtered out before
+        return — same convention as the numpy ``sample_natals``.
+        Note: this turns the output shape into a dynamic Python-time
+        quantity, so under ``jax.jit`` the caller must set
+        ``filter_zero_weights=False`` and handle the masking
+        explicitly (J2's particle_mc loop will follow that pattern).
+
+    Notes
+    -----
+    Reparametrisation: ``jax.random.truncated_normal(key, a, b,
+    shape)`` returns standard-truncated samples; we shift+scale by
+    ``mu`` / ``sigma`` (and ``loc_chi`` / ``scale_chi``).  The affine
+    transform is the reparametrisation trick — gradients in mu/sigma
+    flow through it cleanly.  Note that ``a`` and ``b`` themselves
+    depend on ``mu`` / ``sigma`` via the truncation bounds; JAX
+    handles that derivative through the underlying truncnorm sampler.
+    """
+    if cfg.proposal is not None:
+        m, chi, log_q = cfg.proposal(key)
+        m = jnp.asarray(m).ravel()
+        chi = jnp.asarray(chi).ravel()
+        log_q = jnp.asarray(log_q).ravel()
+        if not (m.shape == chi.shape == log_q.shape):
+            raise ValueError(
+                f"proposal returned mismatched shapes m={m.shape} "
+                f"chi={chi.shape} log_q={log_q.shape}"
+            )
+        log_w = _natal_log_pdf_jax(m, chi, cfg) - log_q
+        weights = jnp.exp(log_w)
+    elif cfg.stratify is not None:
+        m, chi, weights = _stratified_natal_jax(cfg, key)
+    else:
+        # ---------- Reparametrised truncnorm path. ----------
+        mu = jnp.asarray(cfg.mu_natal)
+        sig = jnp.asarray(cfg.sigma_natal)
+        loc_c = jnp.asarray(cfg.natal_spin_loc)
+        sc_c = jnp.asarray(cfg.natal_spin_scale)
+        a_m = (jnp.asarray(cfg.m_min) - mu) / sig
+        b_m = (jnp.asarray(cfg.m_max) - mu) / sig
+        a_c = (0.0 - loc_c) / sc_c
+        b_c = (1.0 - loc_c) / sc_c
+        key_m, key_chi = jax.random.split(key)
+        # ``jax.random.truncated_normal`` takes (lower, upper) in
+        # standard-normal coordinates; shift+scale gives the
+        # reparametrisation.
+        z_m = jax.random.truncated_normal(
+            key_m, a_m, b_m, shape=(cfg.n_seed,),
+        )
+        m = mu + sig * z_m
+        z_chi = jax.random.truncated_normal(
+            key_chi, a_c, b_c, shape=(cfg.n_seed,),
+        )
+        chi = loc_c + sc_c * z_chi
+        weights = jnp.ones(cfg.n_seed, dtype=m.dtype)
+
+    if cfg.weight_array is not None:
+        wa = jnp.asarray(cfg.weight_array).ravel()
+        if wa.shape != m.shape:
+            raise ValueError(
+                f"cfg.weight_array shape {wa.shape} != natal-sample "
+                f"shape {m.shape}"
+            )
+        weights = weights * wa
+
+    # Validation under JAX is eager-only; under jit the caller will
+    # need to validate at trace time or via an outer wrapper.  Same
+    # convention as the numpy path.
+    if not bool(jnp.all(jnp.isfinite(weights))):
+        raise ValueError(
+            "non-finite weight from sample_natals_jax — check proposal "
+            "support and natal-pdf domain"
+        )
+    if bool(jnp.any(weights < 0.0)):
+        raise ValueError(
+            "negative weight from sample_natals_jax — proposal must "
+            "yield log_q ≤ log_p_natal (importance weights are "
+            "non-negative by construction)"
+        )
+
+    if filter_zero_weights:
+        # Eager-only — dynamic shape.
+        keep = np.asarray(weights > 0.0)
+        if not bool(keep.all()):
+            keep_idx = jnp.asarray(np.flatnonzero(keep))
+            m = m[keep_idx]
+            chi = chi[keep_idx]
+            weights = weights[keep_idx]
+        if m.size == 0:
+            raise ValueError(
+                "sample_natals_jax filtered to zero particles — "
+                "proposal has no overlap with the natal support"
+            )
+
+    return m, chi, weights
+
+
 def _kish_n_eff(weights: np.ndarray) -> float:
     """Kish (1965) effective sample size ``(Σ w)² / Σ w²``.
 
