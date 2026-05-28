@@ -550,6 +550,14 @@ class CoagulationResponse(eqx.Module):
     # :meth:`response.mc.MCResponse.log_rate_density` instead of the
     # grid-based path below.  See ``[[project-engine-m2-done]]``.
     mc_response: object = eqx.field(default=None)
+    # JAX-pure MC response for ``solver="mc_jax"`` (Session J4 of
+    # ``demo/PLAN_jax_mc.md``).  Sibling of ``mc_response``: the J4
+    # factory builds this via the JAX-traceable ``particle_mc_jax`` +
+    # ``MCEvaluatorJax`` pipeline so AD flows from log_rate_density
+    # back to θ_pop — what unblocks the M4 SVI integration test.
+    # Carrier is :class:`response.mc_jax.MCResponseJax`.  See
+    # ``[[project-jax-mc-j4-done]]``.
+    mc_jax_response: object = eqx.field(default=None)
 
     def _natal_log_density(self) -> Array:
         spin_dist = build_natal_spin(**self.natal_spin_params)
@@ -710,6 +718,19 @@ class CoagulationResponse(eqx.Module):
                 m1, m2, chi1, chi2, env
             )
 
+        if self.solver == "mc_jax":
+            if self.mc_jax_response is None:
+                raise ValueError(
+                    "CoagulationResponse(solver='mc_jax') requires "
+                    "mc_jax_response to be populated; build via "
+                    "build_gaussian_coagulation(..., solver='mc_jax') "
+                    "or attach an MCResponseJax explicitly via "
+                    "response.mc_jax.build_mc_jax_response(...)."
+                )
+            return self.mc_jax_response.log_rate_density(
+                m1, m2, chi1, chi2, env
+            )
+
         v_esc = env["v_esc"]
         log_N = self._log_total_density(v_esc)
         from ..kernels import log_pairing_kernel
@@ -757,6 +778,13 @@ def build_gaussian_coagulation(
     mc_rng_seed: Optional[int] = None,
     mc_orientation_key_seed: int = 0,
     mc_k: Optional[int] = None,
+    # Session J4 MC-JAX-path kwargs.  Ignored unless ``solver="mc_jax"``.
+    # ``mc_jax_key`` defaults to ``jax.random.PRNGKey(0)`` so the SVI
+    # objective is deterministic — change it via the test fixture if
+    # multi-key averaging is desired (typically not, for SVI; the
+    # variance estimator is already a stochastic outer loop).
+    mc_jax_key: Optional[jax.Array] = None,
+    mc_jax_n_steps: Optional[int] = None,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -839,6 +867,33 @@ def build_gaussian_coagulation(
         import equinox as _eqx
         response = _eqx.tree_at(
             lambda r: r.mc_response, response, mc_response,
+        )
+
+    if solver == "mc_jax":
+        if mc_v_esc is None:
+            raise ValueError(
+                "build_gaussian_coagulation(solver='mc_jax') requires "
+                "mc_v_esc to be set (the MC driver bakes v_esc at "
+                "construction time)."
+            )
+        from .mc_jax import build_mc_jax_response
+        # Default key is deterministic so the SVI objective is
+        # deterministic in θ.  Multi-key averaging is the caller's
+        # decision (typically not used for SVI).
+        if mc_jax_key is None:
+            mc_jax_key = jax.random.PRNGKey(0)
+        mc_jax_response = build_mc_jax_response(
+            response,
+            v_esc=mc_v_esc,
+            key=mc_jax_key,
+            n_seed=mc_n_seed,
+            depletion_fraction=mc_depletion_fraction,
+            n_steps=mc_jax_n_steps,
+        )
+        import equinox as _eqx
+        response = _eqx.tree_at(
+            lambda r: r.mc_jax_response, response, mc_jax_response,
+            is_leaf=lambda x: x is None,
         )
     return response
 
