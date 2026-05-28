@@ -125,9 +125,11 @@ def _log_pairing_kernel_numpy(
 # ---------------------------------------------------------------------------
 def _knn_balloon_2d(
     tree: cKDTree,
-    n_samples: int,
+    n_samples: float,
     query_pts: np.ndarray,
     k: int,
+    *,
+    sample_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     r"""k-NN-bandwidth biweight balloon density estimator in 2-D.
 
@@ -138,16 +140,20 @@ def _knn_balloon_2d(
     .. math::
 
         \hat{f}(x)
-        \;=\; \frac{1}{n \, h(x)^2}\, \sum_{i \,:\, d_i \le h(x)}
-              K_b\!\Big(\frac{d_i}{h(x)}\Big),
+        \;=\; \frac{1}{W \, h(x)^2}\, \sum_{i \,:\, d_i \le h(x)}
+              w_i \, K_b\!\Big(\frac{d_i}{h(x)}\Big),
         \qquad
         K_b(u) = \frac{3}{\pi}\,\big(1 - u^2\big)^2,\; |u| \le 1,
 
-    where ``d_i = ‖x − x_i‖`` and the sum runs over the ``k``
+    where ``d_i = ‖x − x_i‖``, the sum runs over the ``k``
     nearest samples (by construction the only ones with
-    ``d_i ≤ h(x)``).  Normalisation check:
+    ``d_i ≤ h(x)``), and ``W = Σ w_i`` is the total weight (the
+    *effective sample count* — equals the raw sample count for
+    uniform weights, the Kish effective sample size otherwise).
+    Normalisation check at uniform weights ``w_i = 1``:
     ``∫₀¹ (3/π)(1−r²)² · 2πr dr = 6 · [-(1−r²)³/6]₀¹ = 1``, so
-    ``∫ K_b dA = 1`` over the unit disc.
+    ``∫ K_b dA = 1`` over the unit disc, ``Σ w_i = n``, and the
+    formula collapses to the standard LQ unweighted form.
 
     Compared to the Epanechnikov kernel ``(2/π)(1 − u²)`` (one less
     factor of ``(1 − u²)``), the biweight has a smooth zero
@@ -163,33 +169,69 @@ def _knn_balloon_2d(
     ----------
     tree : scipy.spatial.cKDTree
         Pre-built tree over the (possibly reflected) sample set.
-    n_samples : int
-        Effective sample count for the LQ normalisation.  Equals
-        ``m_active.size`` (the original sample count) regardless of
-        whether the tree includes reflections — reflections widen
-        the *kernel domain*, not the *probability mass*.
+    n_samples : float
+        Total weight ``W = Σ w_i`` for the LQ-formula denominator.
+        For uniform weights this equals ``m_active.size`` (the
+        original sample count, regardless of whether the tree
+        includes reflections — reflections widen the *kernel
+        domain*, not the *probability mass*).  Under non-uniform
+        weights this is the sum of the original-sample weights
+        (NOT the reflection-augmented sum — reflections are
+        virtual).
     query_pts : (Q, 2) ndarray
         Evaluation points in ``(log m, χ)`` coordinates.
     k : int
         Neighbour count.  Larger ``k`` → smoother estimate, more
-        bias.  Default elsewhere ``k = max(4, round(√n))``.
+        bias.  Default elsewhere ``k = max(4, round(√n_eff))``.
+    sample_weights : (n_tree,) ndarray | None, default None
+        Per-sample weight array indexed in the *tree's* sample
+        order (i.e. shape matches the augmented-with-reflections
+        sample count, NOT the original sample count).  ``None`` ⇒
+        uniform weights ⇒ bit-for-bit identical to the pre-Session
+        M3a code path (``[[project-evaluation-step3-done]]``).
+        When provided, weights are looked up by the per-query k-NN
+        indices and used in the kernel sum
+        ``Σ w_i (1 − u_i²)²``.
+
+    Notes
+    -----
+    The ``n_samples`` parameter name (rather than ``W``) is kept
+    for backward-compatibility with the M2 / Step-3 call surface;
+    semantically it is the total weight ``W`` of the original
+    sample set, which equals ``n_active`` exactly when
+    ``sample_weights`` is ``None`` (or all-ones).  The dtype is
+    ``float`` to accommodate non-integer weight sums.
     """
-    dists, _ = tree.query(query_pts, k=k)
-    # cKDTree.query returns shape (Q,) when k=1 (irregular).  Promote
-    # to (Q, k) so the kernel sum below is shape-uniform.
+    if sample_weights is None:
+        # Bit-for-bit Step-3 path: no idx capture, no weighted sum.
+        dists, _ = tree.query(query_pts, k=k)
+        if dists.ndim == 1:
+            dists = dists[:, None]
+        r_k = dists[:, -1:]
+        r_k = np.maximum(r_k, 1e-30)
+        u_sq = (dists / r_k) ** 2
+        one_minus_u_sq = np.maximum(1.0 - u_sq, 0.0)
+        kernel_sum = np.sum(one_minus_u_sq * one_minus_u_sq, axis=1)
+        return (3.0 / np.pi) * kernel_sum / (n_samples * r_k[:, 0] ** 2)
+
+    # Weighted path: capture neighbour indices so we can look up per-
+    # sample weights and form Σ w_i (1−u²)² rather than Σ (1−u²)².
+    dists, idxs = tree.query(query_pts, k=k)
     if dists.ndim == 1:
         dists = dists[:, None]
-    r_k = dists[:, -1:]  # (Q, 1) per-query bandwidth
+        idxs = idxs[:, None]
+    r_k = dists[:, -1:]
     r_k = np.maximum(r_k, 1e-30)
-    u_sq = (dists / r_k) ** 2  # (Q, k)
-    # Biweight: K_b(u) = (3/π)(1 − u²)² on |u| ≤ 1.  Because we
-    # picked the k nearest neighbours, every term has u² ≤ 1
-    # (modulo float-roundoff at the k-th sample itself).  Clip to
-    # avoid a tiny negative tail on the k-th neighbour from
-    # rounding.
+    u_sq = (dists / r_k) ** 2
     one_minus_u_sq = np.maximum(1.0 - u_sq, 0.0)
-    kernel_sum = np.sum(one_minus_u_sq * one_minus_u_sq, axis=1)  # (Q,)
-    return (3.0 / np.pi) * kernel_sum / (n_samples * r_k[:, 0] ** 2)
+    # Per-neighbour weights via tree-index lookup.  ``sample_weights``
+    # is laid out in the tree's data order (including reflections),
+    # so a direct fancy-index does the right thing.
+    w_neigh = sample_weights[idxs]  # (Q, k)
+    weighted_kernel_sum = np.sum(
+        w_neigh * one_minus_u_sq * one_minus_u_sq, axis=1
+    )  # (Q,)
+    return (3.0 / np.pi) * weighted_kernel_sum / (n_samples * r_k[:, 0] ** 2)
 
 
 # ---------------------------------------------------------------------------
@@ -223,15 +265,40 @@ class MCEvaluator:
         matching :attr:`CoagulationResponse.kernel_params`.
     k : int, optional
         Number of nearest neighbours for the balloon estimator.
-        Default ``max(4, round(√n_active))`` — Silverman's
+        Default ``max(4, round(√n_eff))`` — Silverman's
         rule-of-thumb for k-NN density estimation, gives reasonable
-        bias-variance tradeoff across n_active = 10² to 10⁵.
+        bias-variance tradeoff across n_active = 10² to 10⁵.  Under
+        uniform weights ``n_eff = n_active``; under non-uniform
+        weights ``n_eff = (Σ w)² / (Σ w²)`` (Kish 1965 effective
+        sample size; coincides with ``n`` when all weights equal).
     reflect_chi : bool, default True
         Augment the sample set with reflections at ``χ = 0`` and
         ``χ = 1``.  Without reflection the k-NN bandwidth diverges
         near the hard boundaries (only one-sided neighbours) and the
         density estimator underestimates ``N`` there.  Off by
         request for inspection / debugging.
+    weights : (n_active,) array-like | None, default None
+        **Session M3a addition** — importance / stratification
+        weights per active particle.  When provided, the k-NN
+        balloon estimator uses the weighted Loftsgaarden-Quesenberry
+        variant: ``f̂(x) = (Σ w_i K_b(d_i/h)) / (W · h(x)^2)`` with
+        ``W = Σ w_i`` (Kish-effective sample size).  ``None`` ⇒
+        uniform weights ⇒ Step-3 / M2 behaviour bit-for-bit.  All
+        weights must be positive and finite; ``ValueError``
+        otherwise.
+
+        Engine-units convention extends to weighted form:
+        ``∫∫ N(m, χ) dm dχ ≈ W`` (= n_active for uniform weights,
+        sum-of-weights otherwise).  This is the appropriate scaling
+        when each particle represents ``w_i`` fractional binaries
+        in the population (e.g. under stratified natal sampling,
+        Session M3b in ``demo/PLAN_m3_stratified_natal.md``).
+
+        Per ``[[feedback-dispatch-callgraph-audit]]``: this is a
+        leaf-level surface extension; the only downstream callers
+        as of M3a are ``density``, ``rate_density_4d``, ``total_rate``,
+        and the marginal helpers, all of which flow through
+        ``self.density`` so the weight propagation is implicit there.
 
     Notes
     -----
@@ -255,6 +322,7 @@ class MCEvaluator:
         kernel_params: Mapping[str, float],
         k: int | None = None,
         reflect_chi: bool = True,
+        weights: Any = None,
     ) -> None:
         m_a = np.asarray(m_active, dtype=np.float64).ravel()
         chi_a = np.asarray(chi_active, dtype=np.float64).ravel()
@@ -279,11 +347,51 @@ class MCEvaluator:
             "b": float(kernel_params["b"]),
         }
         self.n_active = m_a.size
+
+        # Weight validation + Kish effective-sample-size for default k.
+        # `None` ⇒ uniform → Step-3 bit-for-bit (self.weights stays None;
+        # _build_density_tree + density() then skip the weighted code
+        # paths entirely so the call graph collapses to the original
+        # _knn_balloon_2d signature).
+        if weights is not None:
+            w = np.asarray(weights, dtype=np.float64).ravel()
+            if w.shape != (self.n_active,):
+                raise ValueError(
+                    f"weights must have shape (n_active,) = "
+                    f"({self.n_active},); got {w.shape}"
+                )
+            if not np.all(np.isfinite(w)):
+                raise ValueError(
+                    "weights must all be finite; got "
+                    f"min={np.min(w)!r} max={np.max(w)!r}"
+                )
+            if not np.all(w > 0.0):
+                raise ValueError(
+                    "weights must all be strictly positive (importance "
+                    "weights are positive by construction); got "
+                    f"min={float(np.min(w))!r}"
+                )
+            self.weights: np.ndarray | None = w
+            self.W_total = float(w.sum())
+            # Kish (1965) effective sample size — coincides with
+            # n_active when weights are uniform.  See module docstring
+            # / `[[demo/PLAN_m3_stratified_natal.md]]` § Effective-
+            # sample-count for the default-k heuristic.
+            sum_w_sq = float(np.sum(w * w))
+            n_eff = (self.W_total * self.W_total) / sum_w_sq if sum_w_sq > 0 else 0.0
+        else:
+            self.weights = None
+            self.W_total = float(self.n_active)
+            n_eff = float(self.n_active)
+        self.n_eff = n_eff
+
         if k is None:
-            # Silverman √n rule-of-thumb floor at 4.  At n_active < 16
+            # Silverman √n rule-of-thumb floor at 4.  At n_eff < 16
             # the floor binds; results are noisy but the call doesn't
-            # error out (useful for tiny smoke-test runs).
-            k = max(4, int(round(np.sqrt(self.n_active))))
+            # error out (useful for tiny smoke-test runs).  Uniform-
+            # weight bit-for-bit: n_eff == n_active so the formula
+            # matches the pre-M3a code path exactly.
+            k = max(4, int(round(np.sqrt(n_eff))))
         if k >= self.n_active:
             raise ValueError(
                 f"k = {k} must be < n_active = {self.n_active}"
@@ -302,21 +410,40 @@ class MCEvaluator:
         near a boundary correctly sees neighbours on both sides;
         otherwise the bandwidth would blow up due to one-sided
         statistics and ``N`` would underestimate at the boundary
-        cells.  The LQ-formula denominator uses the *original*
-        sample count ``n_active`` — reflections are virtual.
+        cells.  The LQ-formula denominator uses the *original-sample*
+        total weight ``W = Σ w_i`` — reflections are virtual (they
+        widen the kernel domain, not the probability mass).
 
         ``log m`` is *not* reflected.  See module docstring.
+
+        Session M3a: when ``self.weights`` is set, build a parallel
+        ``self._density_weights_augmented`` array indexed in the
+        same tree-data order as ``self._density_samples`` (each
+        reflected copy inherits its parent's weight bit-for-bit).
+        When ``self.weights is None`` the augmented-weight array is
+        left as ``None`` so downstream calls short-circuit to the
+        Step-3 unweighted code path.
         """
         log_m = np.log(self.m_active)
         chi = self.chi_active
         if self.reflect_chi:
             log_m_all = np.concatenate([log_m, log_m, log_m])
             chi_all = np.concatenate([chi, -chi, 2.0 - chi])
+            if self.weights is not None:
+                # Tree order: [original | reflected at χ=0 | reflected at χ=1].
+                # Each reflection inherits the original's weight.
+                weights_aug = np.concatenate(
+                    [self.weights, self.weights, self.weights]
+                )
+            else:
+                weights_aug = None
         else:
             log_m_all = log_m
             chi_all = chi
+            weights_aug = self.weights  # may be None; ok
         samples = np.column_stack([log_m_all, chi_all])
         self._density_samples = samples
+        self._density_weights_augmented = weights_aug
         self._density_tree = cKDTree(samples)
 
     # ---- 1. Single-BH density ---------------------------------------------
@@ -324,9 +451,10 @@ class MCEvaluator:
         r"""``N(m, χ)`` by 2-D k-NN balloon estimator in ``(log m, χ)``.
 
         Returns the engine-units density: ``∫∫ N(m, χ) dm dχ ≈
-        n_active`` (matches the convention used by
-        :class:`ImplicitEvaluator.density` and
-        :class:`BasisEvaluator.density`).
+        W_total`` (= ``n_active`` for uniform weights — matches the
+        convention used by :class:`ImplicitEvaluator.density` and
+        :class:`BasisEvaluator.density`; = ``Σ w_i`` under
+        non-uniform weights, see ``weights`` parameter docstring).
 
         Out-of-domain queries (``χ ∉ [0, 1]`` or ``m ≤ 0``) return 0.
         """
@@ -339,13 +467,22 @@ class MCEvaluator:
         log_m = np.log(np.maximum(m_b, 1e-30))
         query_pts = np.column_stack([log_m, chi_b])
         # f_hat is the empirical density in (log m, χ) space, ∫f_hat = 1.
+        # Pass W_total (= n_active under uniform weights ⇒ bit-for-bit
+        # Step-3) and the augmented per-sample weight array (None under
+        # uniform weights ⇒ _knn_balloon_2d takes the unweighted code
+        # path with no per-neighbour index lookup).
         f_hat = _knn_balloon_2d(
-            self._density_tree, self.n_active, query_pts, self.k
+            self._density_tree,
+            self.W_total,
+            query_pts,
+            self.k,
+            sample_weights=self._density_weights_augmented,
         )
         # Change of variables to (m, χ): divide by m.  Multiply by
-        # n_active so the result has engine-units (∫N dm dχ = n_active,
-        # not 1).
-        N = self.n_active * f_hat / np.maximum(m_b, 1e-30)
+        # W_total so the result has engine-units (∫N dm dχ = W_total,
+        # which equals n_active under uniform weights — matches the
+        # pre-M3a convention bit-for-bit).
+        N = self.W_total * f_hat / np.maximum(m_b, 1e-30)
         N = np.where(valid, N, 0.0)
         return N.reshape(shape_out)
 
