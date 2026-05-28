@@ -17,14 +17,21 @@ The new API is for cheap one-off plot / export queries and for
 swapping evaluators inside gwkokab without call-site changes.
 
 Sequence step 1 shipped the protocol and the implicit-solver
-evaluator.  Step 2 (this commit) adds the basis-solver evaluator.
-The MC evaluator follows in step 3 of ``PLAN_arbitrary_point_evaluation.md``,
-living in ``red_team/`` because the particle MC itself is a red-team
-backstop.
+evaluator.  Step 2 added the basis-solver evaluator.  Step 3 shipped
+the MC evaluator in ``red_team/`` because the particle MC was a
+red-team backstop; Session M2 of
+``demo/PLAN_mc_first_reprioritization.md`` promotes it here as the
+``log_prob`` backbone behind ``response.mc.MCResponse``.
 """
 
 from .protocol import RateDensityEvaluator
 from .implicit import ImplicitEvaluator
 from .basis import BasisEvaluator
+from .mc import MCEvaluator
 
-__all__ = ["RateDensityEvaluator", "ImplicitEvaluator", "BasisEvaluator"]
+__all__ = [
+    "RateDensityEvaluator",
+    "ImplicitEvaluator",
+    "BasisEvaluator",
+    "MCEvaluator",
+]
