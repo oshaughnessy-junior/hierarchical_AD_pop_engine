@@ -785,6 +785,11 @@ def build_gaussian_coagulation(
     # variance estimator is already a stochastic outer loop).
     mc_jax_key: Optional[jax.Array] = None,
     mc_jax_n_steps: Optional[int] = None,
+    # Round-3 (B.1 Bernoulli K-gate): K_max/⟨K⟩ estimate sized so
+    # n_steps yields expected K-accepts = depletion × n_seed (numpy
+    # parity).  See
+    # ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` § 5.
+    mc_jax_k_ratio: float = 1.5,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -889,6 +894,7 @@ def build_gaussian_coagulation(
             n_seed=mc_n_seed,
             depletion_fraction=mc_depletion_fraction,
             n_steps=mc_jax_n_steps,
+            k_ratio=float(mc_jax_k_ratio),
         )
         import equinox as _eqx
         response = _eqx.tree_at(

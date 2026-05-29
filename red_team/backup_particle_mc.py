@@ -703,8 +703,23 @@ def particle_mc_jax(
     key: jax.Array,
     *,
     n_steps: Optional[int] = None,
+    k_ratio: float = 1.5,
 ):
-    """JAX-pure particle MC under K-rejection-as-importance-weighting.
+    """JAX-pure particle MC under Bernoulli K-rejection.
+
+    **Round-3 update (2026-05-29):** switched from rejection-as-weighting
+    (J2 original) to **Bernoulli K-rejection with a straight-through
+    estimator** for AD.  Numpy and JAX now share the same cascade
+    dynamics in expectation — pool depletion, retention, and remnant
+    injection are all K-gated by a per-step Bernoulli draw, exactly
+    mirroring numpy ``particle_mc``.  The previous design conflated
+    pool depletion (which numpy guards by K-rejection) with rate-
+    equivalent event recording (which numpy treats as a discrete
+    accept/reject), producing a systematic deficit on both
+    ``Σw_mergers`` and the K-weighted rate integral ``∫∫K·N·N``.  See
+    ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` for the root
+    cause and ``[[project-jax-mc-workstation-round3]]`` for the
+    headline numbers.
 
     Returns a dict mirroring the numpy :func:`particle_mc` schema fields
     that downstream consumers actually use:
@@ -714,21 +729,30 @@ def particle_mc_jax(
         ``w_desc = 0.5(w_i + w_j)`` natal-density rule.
     ``mergers``
         Per-step record ``(m1, m2, chi1, chi2, g1, g2, retained, m_rem)``,
-        heavier first.  Shape ``(n_steps, 8)``.  Inactive (post-pool-
-        exhaustion) steps return NaN rows.
+        heavier first.  Shape ``(n_steps, 8)``.  Inactive or
+        K-rejected steps return NaN rows.
     ``v_kicks``
         Per-step aligned kick magnitude.  Shape ``(n_steps,)``.  NaN on
-        inactive steps.
+        inactive or K-rejected steps.
     ``w_mergers``
-        Per-step K-rejection event weight ``w_event = K_ij / K_max`` ×
-        descendant natal weight propagation.  Shape ``(n_steps,)``.
-        Pass this directly to ``MCEvaluator(weights=...)`` for weighted
-        density estimation; in aggregate Σw matches numpy's
-        ``n_accepted`` in expectation (validation backstop).
+        Per-step descendant weight ``w_desc = 0.5(w_i + w_j)`` on
+        K-accepted active steps; ``0`` on K-rejected or inactive steps.
+        Under uniform initial weights every accepted step contributes
+        unit weight (matches numpy ``n_accepted`` count exactly per
+        run, not just in expectation).  Pass this directly to
+        ``MCEvaluator(weights=...)`` for weighted density estimation.
+        **AD note:** the K-gate uses a straight-through estimator so
+        ``∂w_mergers / ∂kernel_{a,b}`` flows through ``w_event =
+        K_ij / K_max`` even though the forward pass is binary.
+    ``step_active``
+        Bool array, shape ``(n_steps,)``.  ``True`` if the step was
+        both pool-active (``n_active >= 2``) and K-accepted —
+        i.e. it produced a real merger event.  ``False`` for rejected
+        or post-exhaustion steps.
     ``stats``
         Dict with ``n_init``, ``n_steps``, ``n_active_final``,
         ``depletion``, ``n_eff_active``, ``n_eff_mergers``,
-        ``sum_w_mergers``.
+        ``sum_w_mergers``, ``n_accepted`` (Σ step_active).
 
     Parameters
     ----------
@@ -738,12 +762,29 @@ def particle_mc_jax(
         for J2 (non-Aligned is a follow-up).
     key : jax.Array
         PRNG key; split internally for natal sampling + per-step pair
-        selection.
+        selection + K-gate Bernoulli draw.
     n_steps : int, optional
         Fixed inner-loop step budget.  If ``None``, computed from
-        ``cfg.depletion_fraction`` as ``int(depletion × n_init / 1.5)``,
-        targeting ≈ ``depletion × n_init`` particles deactivated by
-        cascade end (each step removes ≈ 1-2 particles).
+        ``cfg.depletion_fraction`` and ``k_ratio`` as
+        ``int(depletion × n_init × k_ratio)``, targeting
+        ``depletion × n_init`` accepted events in expectation (matches
+        numpy's ``n_max_mergers`` stopping criterion).
+    k_ratio : float, default 1.5
+        Estimate of ``K_max / ⟨K⟩`` over the natal pool.  Used to size
+        ``n_steps`` so the expected number of K-accepts matches
+        numpy's ``n_max_mergers = depletion × n_init``.  The default
+        1.5 is a mild overshoot of typical Gaussian-natal × power-law-
+        kernel regimes (workstation-round-3 demo measured 1.24 at
+        depletion=1.0; production fits should set this from a brief
+        natal-time MC estimate, e.g. via
+        :func:`estimate_k_ratio`).
+
+        **Why static, not derived from natal moments inside the
+        trace:** under SVI, the natal mu/sigma are JAX tracers, so we
+        can't cast them to a Python int for ``jax.lax.scan``'s static
+        ``length`` argument without forcing a retrace per gradient
+        step.  Pass ``k_ratio`` explicitly (from a one-time estimate
+        at SVI init) to avoid the retrace.
 
     Notes
     -----
@@ -751,9 +792,12 @@ def particle_mc_jax(
 
     * ``∂Σ m_active / ∂cfg.mu_natal``: cleanly via J1's truncated_normal
       reparametrisation.  This is the load-bearing M4 gradient.
-    * ``∂Σ w_mergers / ∂cfg.kernel_b``: finite via the smooth
-      ``K_ij / K_max`` weight; gradient strength depends on the
-      kernel sensitivity (sandbox-verified at INV-AD).
+    * ``∂Σ w_mergers / ∂cfg.kernel_b``: finite via the **straight-
+      through estimator** on the K-gate.  Forward uses the hard
+      Bernoulli accept (0/1); backward propagates the gradient as
+      ``∂(K_ij/K_max)/∂kernel_b``.  Has zero bias on the K-weighted
+      shape and a small (controllable) bias at the
+      ``K_ij ≈ K_max`` boundary.
     * ``∂retained / ∂cfg.v_esc``: zero (Heaviside).  Recovers under
       misalignment + soft-sigmoid retention (follow-up J2b).
 
@@ -784,10 +828,18 @@ def particle_mc_jax(
     n_init = int(m_arr0.shape[0])
 
     if n_steps is None:
-        # Pool depletes ≈ 1.5 particles per merger event on average
-        # (heavily retention-dependent; ~1 at high retention, ~2 at low).
-        # Target depletion × n_init particles deactivated by cascade end.
-        n_steps = max(1, int(cfg.depletion_fraction * n_init / 1.5))
+        # Round-3 default: under Bernoulli K-rejection, each scan step
+        # accepts with probability ⟨K⟩/K_max ≈ 1/k_ratio.  To match
+        # numpy's ``n_max_mergers = depletion × n_init`` accepted-event
+        # cap in expectation, run k_ratio × that many steps.
+        #
+        # The 1.5 "drops-per-accept" factor in the pre-round-3 formula
+        # was wrong twice over: (1) it assumed every step was an
+        # accepted event (it isn't under Bernoulli gating), (2) it
+        # baked numpy's depletion-driven stop into JAX's count-driven
+        # stop.  See
+        # ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` § 5.
+        n_steps = max(1, int(cfg.depletion_fraction * n_init * float(k_ratio)))
 
     active0 = jnp.ones(n_init, dtype=bool)
     gen0 = jnp.ones(n_init, dtype=jnp.int32)
@@ -816,7 +868,8 @@ def particle_mc_jax(
         K_max = jnp.where(step_active_now, K_max, 1.0)
 
         # Sample i, j from active pool with i != j.
-        key, k_i, k_j = jax.random.split(key, 3)
+        # Round-3: also split a key for the Bernoulli K-gate.
+        key, k_i, k_j, k_u = jax.random.split(key, 4)
         p_active = jnp.where(active, 1.0, 0.0)
         denom = jnp.maximum(p_active.sum(), 1.0)
         p_i = p_active / denom
@@ -838,9 +891,25 @@ def particle_mc_jax(
         g_i = gen[i]
         g_j = gen[j]
 
-        # K-rejection-as-weighting: continuous accept with w_event factor.
+        # Round-3: Bernoulli K-rejection (mirrors numpy ``particle_mc``).
+        # w_event ∈ [0, 1] is the per-attempt acceptance probability.
+        # Forward: ``hard_accept`` is a 0/1 Bernoulli draw, so the cascade
+        # dynamics (pool depletion, retention, remnant injection) only
+        # advance on K-accepted attempts — bit-identical semantics to
+        # numpy's discrete-rejection loop.
+        # Backward (AD): the straight-through estimator ``st_accept``
+        # carries the gradient of ``w_event`` to whatever the discrete
+        # accept gate multiplies in the forward pass.  This is the
+        # zero-bias-on-shape, small-bias-at-boundary path documented in
+        # the diagnosis memo § 5.B.1.
         K_ij = _kernel_K_jax(m_i, m_j, a_k, b_k)
         w_event = K_ij / K_max
+        u = jax.random.uniform(k_u)
+        hard_accept = u < w_event
+        # Straight-through: forward = hard (0.0 or 1.0), backward = w_event.
+        st_accept = w_event + jax.lax.stop_gradient(
+            hard_accept.astype(w_event.dtype) - w_event
+        )
 
         # Aligned remnant physics (no per-event orientation work — those
         # paths require extra keys inside the scan).
@@ -856,20 +925,27 @@ def particle_mc_jax(
         idx_heavy = jnp.where(heavier_is_i, i, j)
         idx_light = jnp.where(heavier_is_i, j, i)
 
-        # Descendant cumulative weight: M3a/M3b natal-density average ×
-        # K-rejection event weight.  Under uniform initial weights
-        # (default v1 path) and absent any kernel structure (K_ij ≈
-        # K_max) this reduces to ≈ 0.5(w_i + w_j).  Under stratified /
-        # IS natal weights AND non-trivial kernel, both factors compose.
-        w_desc = 0.5 * (w_i + w_j) * w_event
+        # Descendant cumulative weight: M3a/M3b natal-density average.
+        # **Round-3:** the ``w_event`` multiplicative factor is REMOVED
+        # here — accepted events under Bernoulli K-rejection have unit
+        # effective weight, matching numpy's v1 ``w_desc = 0.5(w_i + w_j)``
+        # bit-for-bit.  The K-gate carries gradient flow via the
+        # straight-through ``st_accept`` factor applied below to
+        # ``w_out`` (not to ``w_desc`` itself, so the heavy-slot weight
+        # evolves on the same trajectory as numpy).
+        w_desc = 0.5 * (w_i + w_j)
 
-        # Apply state updates only when step_active_now (else carry through).
-        do_retain = step_active_now & retain
-        do_drop_both = step_active_now & (~retain)
+        # Round-3: gate state mutations on Bernoulli K-accept AND
+        # pool-active.  Both light-slot deactivation and heavy-slot
+        # mass/spin updates only happen on accepted attempts (numpy
+        # parity).
+        accept_mask = step_active_now & hard_accept
+        do_retain = accept_mask & retain
+        do_drop_both = accept_mask & (~retain)
 
         new_active = active
         new_active = new_active.at[idx_light].set(
-            jnp.where(step_active_now, False, new_active[idx_light]),
+            jnp.where(accept_mask, False, new_active[idx_light]),
         )
         new_active = new_active.at[idx_heavy].set(
             jnp.where(do_drop_both, False, new_active[idx_heavy]),
@@ -889,7 +965,9 @@ def particle_mc_jax(
             jnp.where(do_retain, jnp.maximum(g_i, g_j) + 1, gen[idx_heavy]).astype(jnp.int32),
         )
 
-        # Per-step records (heavier-first, masked NaN on inactive steps).
+        # Per-step records (heavier-first, masked NaN on rejected /
+        # inactive steps — only K-accepted active steps produce real
+        # merger events).
         m1_rec = jnp.where(heavier_is_i, m_i, m_j)
         m2_rec = jnp.where(heavier_is_i, m_j, m_i)
         chi1_rec = jnp.where(heavier_is_i, chi_i, chi_j)
@@ -902,11 +980,16 @@ def particle_mc_jax(
             [m1_rec, m2_rec, chi1_rec, chi2_rec, g1_rec, g2_rec, retain_rec, m_rem_rec],
         )
         nan_row = jnp.full_like(rec_active, jnp.nan)
-        rec = jnp.where(step_active_now, rec_active, nan_row)
+        rec = jnp.where(accept_mask, rec_active, nan_row)
 
-        v_kick_out = jnp.where(step_active_now, v_kick_evt, jnp.nan)
-        w_out = jnp.where(step_active_now, w_desc, 0.0)
-        step_flag = step_active_now.astype(jnp.int32)
+        v_kick_out = jnp.where(accept_mask, v_kick_evt, jnp.nan)
+        # Round-3: w_out carries the straight-through K-gate so that
+        # ``∂Σw_mergers/∂kernel_b`` (the J2 AD invariant) keeps flowing
+        # smoothly even though the cascade dynamics are now hard-gated.
+        # Forward: w_desc on K-accepted active steps, 0 otherwise.
+        # Backward: gradient w.r.t. K params propagates via st_accept.
+        w_out = st_accept * jnp.where(step_active_now, w_desc, 0.0)
+        step_flag = accept_mask.astype(jnp.int32)
 
         new_carry = (new_m_arr, new_chi_arr, new_w_arr, new_active, new_gen, key)
         out = (rec, v_kick_out, w_out, step_flag)
@@ -948,6 +1031,10 @@ def particle_mc_jax(
             n_active_final=jnp.sum(active_f),
             depletion=1.0 - jnp.sum(active_f) / max(n_init, 1),
             sum_w_mergers=jnp.sum(w_mergers_arr),
+            # Round-3: under Bernoulli K-gating, n_accepted is the
+            # discrete count of K-accepted active steps — mirrors
+            # numpy ``particle_mc``'s ``stats['n_accepted']`` exactly.
+            n_accepted=jnp.sum(step_flags),
             orientation="Aligned",
         ),
     )

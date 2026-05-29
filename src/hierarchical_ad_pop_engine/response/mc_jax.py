@@ -207,6 +207,7 @@ def build_mc_jax_response(
     n_seed: int = 5000,
     depletion_fraction: float = 0.5,
     n_steps: Optional[int] = None,
+    k_ratio: float = 1.5,
 ) -> MCResponseJax:
     r"""Build an :class:`MCResponseJax` by running ``particle_mc_jax`` traced.
 
@@ -243,7 +244,20 @@ def build_mc_jax_response(
         engine's f_natal_depleted in the M4 integration test.
     n_steps : int, optional
         Override for the J2 inner-loop step budget.  If ``None``,
-        defaults to ``int(depletion_fraction * n_seed / 1.5)``.
+        defaults to ``int(depletion_fraction * n_seed * k_ratio)``
+        — see ``k_ratio`` below.
+    k_ratio : float, default 1.5
+        Estimate of ``K_max / ⟨K⟩`` over the natal pool.  Round-3
+        Bernoulli K-gate (see
+        ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md``) sizes
+        ``n_steps`` so the expected number of K-accepts matches
+        numpy's ``n_max_mergers = depletion × n_init``.  The default
+        ``1.5`` is a mild overshoot of typical Gaussian-natal ×
+        power-law-kernel regimes (workstation-round-3 demo measured
+        ``1.24`` at depletion=1.0); for production SVI estimate this
+        at init time and pass explicitly to avoid retracing every
+        gradient step (a JAX-traced ``mu_natal`` can't be cast to a
+        Python int for ``jax.lax.scan``).
 
     Returns
     -------
@@ -295,7 +309,7 @@ def build_mc_jax_response(
         orientation=orientation,
     )
 
-    out = particle_mc_jax(cfg, key, n_steps=n_steps)
+    out = particle_mc_jax(cfg, key, n_steps=n_steps, k_ratio=float(k_ratio))
 
     # Build the J3 evaluator over the surviving pool + cascade weights.
     # Surviving-pool selection here must stay JAX-traceable; under AD
