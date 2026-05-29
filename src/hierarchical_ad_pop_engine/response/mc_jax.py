@@ -176,6 +176,25 @@ class MCResponseJax(eqx.Module):
             + log_N2
         )
 
+    def total_rate(self, *, n_quad: int = 64) -> Array:
+        r"""Scalar ``∫∫∫∫ ½ R_env K(m₁,m₂) N(m₁,χ₁) N(m₂,χ₂) dω``.
+
+        Uses the J3 evaluator's ``total_rate`` (grid quadrature on the
+        anisotropic Gaussian KDE) divided by ``n_init²`` so the density
+        convention matches :meth:`log_rate_density` bit-stably.  Without
+        this rescaling :meth:`log_rate_density` and :meth:`total_rate`
+        would be inconsistent by a factor of ``n_init²`` ≈ 10⁶ at
+        production resolution — exactly the M4 SVI failure mode caught
+        2026-05-28 workstation round 1.
+
+        Mirrors the implicit / basis solvers' total_rate convention:
+        ``E[N_obs] = total_rate`` at the calibrated ``log_R_env``.
+
+        AD-traceable end-to-end (the evaluator's total_rate is pure
+        jnp).
+        """
+        return self.evaluator.total_rate(n_quad=n_quad) / float(self.n_init) ** 2
+
 
 # ---------------------------------------------------------------------------
 # Factory — JAX-traceable MC driver + J3 evaluator build.

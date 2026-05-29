@@ -242,28 +242,75 @@ def _plot_2d_compare(jax_run, np_run, out_dir: Path, m_min, m_max):
     print(f"  wrote {out}")
 
 
+def _weighted_resample(values: np.ndarray, weights: np.ndarray,
+                       n: int, rng: np.random.Generator) -> np.ndarray:
+    """Multinomial resample of ``values`` with probabilities ∝ weights.
+
+    Equivalent in distribution to ``values`` drawn iid from the
+    weighted empirical distribution.  Used to map J2's K-rejection-as-
+    weighting events to an apples-to-apples sample that matches
+    numpy's discrete K-rejection acceptance.
+    """
+    p = weights / weights.sum()
+    idx = rng.choice(values.size, size=n, p=p, replace=True)
+    return values[idx]
+
+
 def _ks_summary(jax_run, np_run):
     from scipy.stats import ks_2samp
+    rng = np.random.default_rng(2026)
     print()
     print("Distributional parity (KS test on surviving pool):")
-    for col, vals_j, vals_n in [
+    # m_active / chi_active comparison.  JAX active particles have
+    # non-uniform w_active from the cascade weight propagation; numpy
+    # active particles have uniform w_active=1.  Resample JAX with
+    # weights so the two distributions are apples-to-apples.
+    for col, vals_j, vals_n, w_j in [
         ("m_active",
-         jax_run["m_active"], np_run["m_active"]),
+         jax_run["m_active"], np_run["m_active"], jax_run["w_active"]),
         ("chi_active",
-         jax_run["chi_active"], np_run["chi_active"]),
+         jax_run["chi_active"], np_run["chi_active"], jax_run["w_active"]),
     ]:
-        ks = ks_2samp(vals_j, vals_n)
-        print(f"  {col}: KS p = {ks.pvalue:.3g}   (>0.01 ⇒ "
-              f"indistinguishable at 1 % level)")
-    # Merger m_rem
-    mj = jax_run["mergers"][:, 7]
-    mn = np_run["mergers"][:, 7]
-    mj = mj[np.isfinite(mj) & (mj > 0)]
-    mn = mn[np.isfinite(mn) & (mn > 0)]
+        ks_raw = ks_2samp(vals_j, vals_n)
+        n = min(vals_j.size, vals_n.size, 5000)
+        if vals_j.size > 0 and w_j.sum() > 0:
+            vals_j_resamp = _weighted_resample(vals_j, w_j, n, rng)
+            ks_w = ks_2samp(vals_j_resamp, vals_n[:n])
+            print(f"  {col}: KS p raw = {ks_raw.pvalue:.3g}, "
+                  f"KS p weighted-resample = {ks_w.pvalue:.3g}   "
+                  f"(>0.01 ⇒ indistinguishable at 1 % level)")
+        else:
+            print(f"  {col}: KS p = {ks_raw.pvalue:.3g}")
+    # Merger m_rem — weighted by w_mergers (the K-rejection-as-weighting
+    # event weight) is the apples-to-apples comparison to numpy's
+    # discrete K-rejection accepted events.  Raw JAX events over-
+    # represent low-K pairs (every attempt logged) whereas numpy
+    # filters them via Bernoulli rejection — RAW comparison is
+    # biased AGAINST high-gen peaks in JAX (which depend on high-K
+    # pair formation).  Weighted resampling absorbs this.
+    mj_all = jax_run["mergers"][:, 7]
+    mn_all = np_run["mergers"][:, 7]
+    keep_j = np.isfinite(mj_all) & (mj_all > 0)
+    keep_n = np.isfinite(mn_all) & (mn_all > 0)
+    mj = mj_all[keep_j]
+    mn = mn_all[keep_n]
+    w_mj = jax_run["w_mergers"][keep_j]
     if mj.size and mn.size:
-        ks = ks_2samp(mj, mn)
-        print(f"  m_rem (retained): KS p = {ks.pvalue:.3g}, "
-              f"n_jax={mj.size}, n_np={mn.size}")
+        ks_raw = ks_2samp(mj, mn)
+        if w_mj.sum() > 0:
+            n_resamp = min(mj.size, mn.size, 5000)
+            mj_resamp = _weighted_resample(mj, w_mj, n_resamp, rng)
+            ks_w = ks_2samp(mj_resamp, mn[:n_resamp])
+            print(f"  m_rem (retained): "
+                  f"KS p raw = {ks_raw.pvalue:.3g}  "
+                  f"(biased — JAX over-represents low-K pairs), "
+                  f"KS p weighted-resample = {ks_w.pvalue:.3g}  "
+                  f"(apples-to-apples)")
+        else:
+            print(f"  m_rem (retained): KS p = {ks_raw.pvalue:.3g}")
+        print(f"    n_jax = {mj.size}, Σw_mergers = {w_mj.sum():.0f}  "
+              f"(≈ numpy n_accepted = {mn.size} in expectation per "
+              f"[[project-jax-mc-j2-done]])")
 
 
 def main(argv=None):

@@ -223,6 +223,38 @@ def test_grad_through_log_R_env_is_one():
 # ---------------------------------------------------------------------------
 # INV-5: env is ignored — v_esc was baked at factory time
 # ---------------------------------------------------------------------------
+def test_total_rate_matches_log_rate_density_convention():
+    r"""``MCResponseJax.total_rate`` and ``log_rate_density`` use the
+    same density convention (both N/n_init).
+
+    Probe: at θ* the per-event log_rate_density - log_R_env tracks the
+    log of the kernel × N1 × N2 in PDF units; the total_rate (which is
+    ∫∫∫∫ rate density) must be in the same units, i.e. it should NOT
+    scale as n_init² compared to the implicit convention.
+
+    Direct check: ``total_rate × n_init²`` should equal the raw
+    evaluator.total_rate (the unscaled W_total convention).
+    Caught the 2026-05-28 workstation-round-1 M4 failure mode
+    (off by 10⁶) before re-shipping.
+    """
+    cfg = MCConfig(n_seed=N_SEED, depletion_fraction=0.10, **THETA)
+    r = _build_response(cfg, jax.random.PRNGKey(2026), log_R_env=0.0)
+    tr_response = float(r.total_rate(n_quad=32))
+    tr_evaluator = float(r.evaluator.total_rate(n_quad=32))
+    expected = tr_evaluator / (N_SEED ** 2)
+    rel = abs(tr_response - expected) / max(abs(expected), 1e-12)
+    print(f"\n[INV-total_rate] response.total_rate = {tr_response:.4e}, "
+          f"evaluator.total_rate / n_init² = {expected:.4e}, rel = {rel:.3e}")
+    assert rel < 1e-5, f"total_rate rescaling mismatch: rel = {rel:.3e}"
+    # Sanity scale: at uniform-weights default with log_R_env=0, R_env=1,
+    # and per-event N1 N2 ~ O(W_total² / n_init²) ~ O(n_active²/n_init²) ~ O(1),
+    # the total rate is O(1).  Much larger / smaller is a leak.
+    assert 1e-3 < tr_response < 1e3, (
+        f"total_rate magnitude looks wrong: {tr_response:.4e} "
+        f"(expect O(1) at log_R_env=0)"
+    )
+
+
 def test_env_ignored():
     cfg = MCConfig(n_seed=N_SEED, depletion_fraction=0.10, **THETA)
     r = _build_response(cfg, jax.random.PRNGKey(2026), log_R_env=0.0)

@@ -118,14 +118,17 @@ def build_response_mc_jax(
 def expected_event_count_mc_jax(response, v_esc):
     """Total rate for the MC-JAX response.
 
-    For ``solver="mc_jax"`` the rate density is backed by
-    MCEvaluatorJax.total_rate; the engine grid quadrature
-    (``demo.expected_event_count``) doesn't apply since there is no
-    engine ``_log_total_density``.  We call the evaluator's total_rate
-    directly.
+    For ``solver="mc_jax"`` we call ``MCResponseJax.total_rate`` which
+    applies the same ``1/n_init²`` density-convention rescaling as
+    :meth:`MCResponseJax.log_rate_density`, keeping per-event and
+    integrated rates apples-to-apples.
+
+    Without the rescaling, the evaluator's raw total_rate is off by
+    factor ``n_init²`` ≈ 10⁶ at production resolution (caught
+    2026-05-28 workstation round 1).
     """
     del v_esc  # ignored on the MC path
-    return response.mc_jax_response.evaluator.total_rate(n_quad=64)
+    return response.mc_jax_response.total_rate(n_quad=64)
 
 
 _DEMO_SEED_ROOT = 20260517
