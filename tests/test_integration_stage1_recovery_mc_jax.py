@@ -91,9 +91,16 @@ _MC_KEY_SEED = 20260528
 def build_response_mc_jax(
     *, mu_natal, sigma_natal, natal_spin_loc, natal_spin_scale,
     kernel_b, log_rate, k_max=demo.K_MAX_FIT, grid=None,
+    gate="bernoulli",
 ):
     """Build a CoagulationResponse for the Stage 1 6-param model under
     ``solver="mc_jax"`` — JAX-traceable so SVI gradients flow.
+
+    ``gate`` selects the cascade K-gate implementation branch:
+    ``"bernoulli"`` (B.1 round-3, default) or ``"soft"`` (B.2
+    deterministic occupancy flow).  The test fixture parametrises over
+    both so the M4 SVI recovery is a head-to-head between the two
+    branches (``project-jax-mc-b2-soft-gate-followup``).
     """
     return build_gaussian_coagulation(
         mu=mu_natal,
@@ -112,6 +119,7 @@ def build_response_mc_jax(
         mc_n_seed=_MC_N_SEED,
         mc_depletion_fraction=_MC_DEPLETION,
         mc_jax_key=jax.random.PRNGKey(_MC_KEY_SEED),
+        mc_jax_gate=gate,
     )
 
 
@@ -148,9 +156,19 @@ def monkeypatch_module():
     mp.undo()
 
 
-@pytest.fixture(scope="module")
-def stage1_mc_jax_svi_result(monkeypatch_module):
-    r"""Run the full mc_jax-dispatched pipeline once for the module."""
+@pytest.fixture(scope="module", params=["bernoulli", "soft"],
+                ids=["gate=bernoulli(B.1)", "gate=soft(B.2)"])
+def stage1_mc_jax_svi_result(request, monkeypatch_module):
+    r"""Run the full mc_jax-dispatched pipeline once per gate branch.
+
+    Parametrised over ``gate ∈ {"bernoulli", "soft"}`` so every M4
+    assertion runs on BOTH the B.1 (Bernoulli K-gate) and B.2
+    (deterministic soft occupancy-flow) cascade implementations — the
+    head-to-head requested 2026-05-29.  Either branch passing the SVI
+    recovery + ELBO + finite-posterior gates is a deliverable; both
+    passing gives cross-implementation reviewability.
+    """
+    gate = request.param
     # Boundary-corrected truth (matches implicit test rationale).
     monkeypatch_module.setitem(demo.THETA_STAR, "natal_spin_loc", 0.05)
 
@@ -173,6 +191,7 @@ def stage1_mc_jax_svi_result(monkeypatch_module):
         kernel_b=demo.THETA_STAR["kernel_b"],
         log_rate=log_rate_star,
         grid=fit_grid,
+        gate=gate,
     )
 
     # Sanity: expected-count diagnostic.
@@ -190,7 +209,7 @@ def stage1_mc_jax_svi_result(monkeypatch_module):
     events = jnp.asarray(events_np)
 
     # 2. Inference model — overridden to use mc_jax response.
-    model = _make_inference_model_mc_jax(events, fit_grid)
+    model = _make_inference_model_mc_jax(events, fit_grid, gate=gate)
     svi_result, guide = demo.run_svi(
         model, key_svi, n_steps=demo.SVI_STEPS, lr=demo.SVI_LR,
     )
@@ -207,10 +226,11 @@ def stage1_mc_jax_svi_result(monkeypatch_module):
         svi_result=svi_result,
         posterior=posterior,
         n_exp_at_truth=n_exp_at_truth,
+        gate=gate,
     )
 
 
-def _make_inference_model_mc_jax(events, grid):
+def _make_inference_model_mc_jax(events, grid, *, gate="bernoulli"):
     """numpyro model that dispatches to ``solver="mc_jax"``.
 
     Identical scaffolding to ``demo.make_inference_model`` but builds
@@ -237,7 +257,7 @@ def _make_inference_model_mc_jax(events, grid):
         response = build_response_mc_jax(
             mu_natal=mu, sigma_natal=sigma,
             natal_spin_loc=spin_loc, natal_spin_scale=spin_scale,
-            kernel_b=kb, log_rate=log_rate, grid=grid,
+            kernel_b=kb, log_rate=log_rate, grid=grid, gate=gate,
         )
 
         per_event = response.log_rate_density(m1, m2, chi1, chi2, env)
@@ -255,10 +275,17 @@ def _make_inference_model_mc_jax(events, grid):
 # ---------------------------------------------------------------------------
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason=(
         "Known finite-sample bias in MCResponseJax.total_rate at the "
-        "M4 working point (n_seed=2000, depletion=0.10).  At this "
+        "M4 working point (n_seed=2000, depletion=0.10).  GATE-"
+        "INDEPENDENT: the bias is in MCEvaluatorJax.total_rate (J3 "
+        "Gaussian-KDE oversmoothing + quadrature-span clipping), which "
+        "both the bernoulli (B.1) and soft (B.2) cascade branches feed "
+        "identically — so it is expected to fail under BOTH gates.  "
+        "strict=False (was True) now that the test is parametrised over "
+        "two gate branches: a surprise xpass on either branch should "
+        "surface as an xpass (informative), not break CI.  At this "
         "regime the J3 Gaussian-KDE Silverman bandwidth oversmooths "
         "the natal-mass peak (the "
         "[[feedback-gaussian-kde-over-smooths-cascade-peaks]] failure "
