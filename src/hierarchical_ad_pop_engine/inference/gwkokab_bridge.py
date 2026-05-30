@@ -1,0 +1,284 @@
+r"""gwkokab bridge — expose the coagulation engine as a gwkokab population model.
+
+gwkokab's analytical-Poisson likelihood
+(:func:`gwkokab.inference.numpyro_analytical_poisson_likelihood`) consumes a
+population model as **two** pieces:
+
+1. a ``numpyro`` :class:`~numpyro.distributions.Distribution` whose
+   ``log_prob(x)`` returns the **log rate-density (intensity)** at a binary
+   parameter point ``x = (m1, m2, χ1, χ2)`` — NOT a normalised pdf.  This is
+   exactly the gwkokab ``ScaledMixture`` convention
+   (``log_prob = logsumexp(log_scales + component_log_probs)`` = log of the
+   rate-scaled intensity) and exactly what the engine's
+   :meth:`CoagulationResponse.log_rate_density` already returns
+   (``log[½ R_env K(m1,m2) N(m1,χ1) N(m2,χ2)]``).
+2. a ``poisson_mean_estimator(model, **pmean_kwargs) -> (μ, var)`` giving the
+   expected detected count ``μ = ∫ VT(x)·intensity(x) dx`` (and its variance).
+
+The analytical likelihood then forms (see
+``gwkokab.inference.poissonlikelihood_utils.analytical_poisson_likelihood_fn``)
+
+    log L = Σ_n logsumexp_k[ log_prob(ω_{n,k}) + ln_offset_{n,k} ]
+            + n_events·log(T_obs) − μ
+
+— i.e. the inhomogeneous-Poisson population likelihood, where the inner sum
+over ``k`` is the Monte-Carlo marginalisation over each event's posterior
+samples reweighted by the reference prior (``ln_offsets``).
+
+This bridge supplies both pieces around a :class:`CoagulationResponse` built
+with ``solver="mc_jax"`` (AD-traceable end-to-end, gate ∈ {bernoulli, soft}).
+With a single posterior sample per event and ``ln_offsets = 0``, ``T_obs = 1``
+it reduces to the hand-rolled Stage-1 likelihood the M4 integration test uses
+(``Σ log_rate_density(event) − total_rate``) — so this is a faithful,
+framework-standard generalisation, not a new estimator.
+
+**Selection.**  This first increment uses **flat selection** (``VT ≡ 1`` —
+the detected-rate convention of ``demo/PLAN_gwkokab_fit.md`` Stage 1, with the
+detection efficiency folded into ``log_R_env``).  A ``pdet(x)``-weighted
+``poisson_mean_estimator`` (Stage-2 SNR surrogate) is a follow-up — pass a
+custom estimator to :func:`numpyro_analytical_poisson_likelihood`.
+
+Hard rules honoured:
+* ``[[feedback-no-fake-physics-stand-ins]]`` — no new physics; this only
+  re-routes the engine's existing intensity + rate through gwkokab's API.
+* ``[[feedback-perturbative-unreliable-implicit-production]]`` — additive; a
+  new ``inference/`` subpackage, nothing in ``response/`` changes.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+from jax import Array
+from numpyro.distributions import Distribution, constraints
+
+# NOTE: ``build_gaussian_coagulation`` is imported LAZILY inside
+# :func:`make_coagulation_dist_fn` rather than at module load.  The engine's
+# ``response`` package transitively imports ``gwkokab`` (via
+# ``natal.mass``), which pulls gwkokab's full dependency tree (flowMC, RIFT,
+# …).  Keeping the import lazy lets this module — and the pure-numpyro
+# :class:`CoagulationPopulation` / :func:`coagulation_poisson_mean_estimator`
+# — be imported and unit-tested with only jax + numpyro present (the
+# in-sandbox fast-loop), deferring the heavy engine+gwkokab import to the
+# moment a response is actually built.
+
+
+__all__ = [
+    "CoagulationPopulation",
+    "coagulation_poisson_mean_estimator",
+    "make_coagulation_dist_fn",
+]
+
+
+class CoagulationPopulation(Distribution):
+    r"""numpyro ``Distribution`` adapter over a built :class:`CoagulationResponse`.
+
+    ``event_shape = (4,)`` with the event ordered ``(m1, m2, χ1, χ2)``.
+    ``log_prob`` returns the **log rate-density / intensity** (gwkokab
+    ``ScaledMixture`` convention), delegating to
+    :meth:`CoagulationResponse.log_rate_density`.
+
+    Built fresh inside the numpyro model body each likelihood call (via
+    :func:`make_coagulation_dist_fn`), so it is consumed within the same
+    trace and does not need bespoke pytree registration — the AD path runs
+    through the closed-over ``response``'s dynamic fields.
+
+    Parameters
+    ----------
+    response : CoagulationResponse
+        A response built with a solver whose ``log_rate_density`` is
+        AD-traceable (``"mc_jax"`` for SVI/NUTS).
+    env : dict
+        Passed straight to ``log_rate_density`` (``{"v_esc": ...}``; the
+        mc / mc_jax paths baked ``v_esc`` at construction time and ignore it).
+    total_rate_fn : callable
+        ``total_rate_fn(**pmean_kwargs) -> Array`` giving the (unselected)
+        expected count ``∫ intensity dx``.  Supplied by the factory because
+        the accessor differs per solver (``response.mc_jax_response.total_rate``
+        for ``mc_jax``).
+    m_min, m_max : float
+        Box-support bounds.  Masses are allowed up to ``m_max_factor·m_max``
+        (remnants exceed the natal cap); χ ∈ [0, 1].
+    m_max_factor : float, default 2.5
+        Head-room above ``m_max`` for retained hierarchical remnants.
+    """
+
+    arg_constraints: Dict[str, Any] = {}
+    # Not a sampling distribution; reparametrized=False is irrelevant here.
+
+    def __init__(
+        self,
+        response: Any,
+        env: Dict[str, Any],
+        total_rate_fn: Callable[..., Array],
+        *,
+        m_min: float,
+        m_max: float,
+        m_max_factor: float = 2.5,
+        validate_args: Optional[bool] = None,
+    ):
+        self._response = response
+        self._env = env
+        self._total_rate_fn = total_rate_fn
+        hi_m = float(m_max) * float(m_max_factor)
+        self._support = constraints.independent(
+            constraints.interval(
+                jnp.asarray([float(m_min), float(m_min), 0.0, 0.0]),
+                jnp.asarray([hi_m, hi_m, 1.0, 1.0]),
+            ),
+            reinterpreted_batch_ndims=1,
+        )
+        super().__init__(
+            batch_shape=(),
+            event_shape=(4,),
+            validate_args=validate_args,
+        )
+
+    @constraints.dependent_property(is_discrete=False, event_dim=1)
+    def support(self):  # noqa: D401
+        return self._support
+
+    def log_prob(self, value: Array) -> Array:
+        r"""``log[½ R_env K(m1,m2) N(m1,χ1) N(m2,χ2)]`` at ``value=(...,4)``.
+
+        Broadcasts over any leading axes (gwkokab vmaps this over the event
+        axis; the engine vectorises over the per-event sample axis).
+        """
+        value = jnp.asarray(value)
+        m1 = value[..., 0]
+        m2 = value[..., 1]
+        chi1 = value[..., 2]
+        chi2 = value[..., 3]
+        return self._response.log_rate_density(m1, m2, chi1, chi2, self._env)
+
+    def total_rate(self, **pmean_kwargs: Any) -> Array:
+        r"""Unselected expected count ``∫ intensity dx`` (delegates to factory fn)."""
+        return self._total_rate_fn(**pmean_kwargs)
+
+    def sample(self, key, sample_shape=()):  # pragma: no cover - not needed
+        raise NotImplementedError(
+            "CoagulationPopulation is an intensity model for the analytical "
+            "Poisson likelihood; it does not implement .sample.  Generate mock "
+            "catalogues via the demo's grid inverse-CDF sampler instead."
+        )
+
+
+def coagulation_poisson_mean_estimator(
+    model: CoagulationPopulation,
+    *,
+    T_obs: float = 1.0,
+    n_quad: int = 64,
+    **_ignored: Any,
+) -> Tuple[Array, Array]:
+    r"""``(μ, var)`` for gwkokab's analytical Poisson likelihood.
+
+    ``μ = T_obs · ∫ VT(x) intensity(x) dx`` with **flat selection** ``VT ≡ 1``
+    (detected-rate convention; detection efficiency folded into
+    ``log_R_env``).  Variance is returned as ``0`` — the MC ``total_rate`` has
+    finite-sample noise, but the analytical-likelihood ``variance_cut_threshold``
+    is ``None`` in the flat-selection setup, so the variance term is unused.
+    (Estimating the MC ``total_rate`` variance for a variance taper is a
+    follow-up; see ``[[project-mc-jax-total-rate-bias]]`` — the metric itself
+    reads low at small ``n_seed``, so do NOT enable a variance cut until that
+    is fixed.)
+
+    The signature matches gwkokab's ``poisson_mean_estimator`` contract
+    (``Callable[[ScaledMixture, ...], tuple[Array, Array]]``); ``model`` is
+    duck-typed (any object exposing ``.total_rate(**kw)``).
+    """
+    mu = jnp.asarray(T_obs) * model.total_rate(n_quad=n_quad)
+    var = jnp.zeros_like(mu)
+    return mu, var
+
+
+def make_coagulation_dist_fn(
+    *,
+    v_esc: float,
+    m_min: float,
+    m_max: float,
+    kernel_a: float = 0.0,
+    k_max: int = 4,
+    n_seed: int = 2000,
+    depletion_fraction: float = 0.10,
+    gate: str = "soft",
+    n_steps_mult: float = 3.0,
+    mc_jax_key: Any = None,
+    grid: Any = None,
+    m_max_factor: float = 2.5,
+) -> Callable[..., CoagulationPopulation]:
+    r"""Build the ``dist_fn`` gwkokab calls as ``dist_fn(**params) -> Distribution``.
+
+    Returns a closure taking the **free** population parameters as keyword
+    arguments — ``mu_natal, sigma_natal, natal_spin_loc, natal_spin_scale,
+    kernel_b, log_rate`` (the Stage-1 6-param model) — and producing a
+    :class:`CoagulationPopulation` around a freshly-built ``solver="mc_jax"``
+    response.  Everything else (``v_esc, m_min, m_max, kernel_a, k_max,
+    n_seed, depletion_fraction, gate, key``) is captured here as the
+    ``constant_params`` of the fit.
+
+    Wire into gwkokab::
+
+        dist_fn = make_coagulation_dist_fn(v_esc=..., m_min=..., m_max=...,
+                                           gate="soft", mc_jax_key=key)
+        log_lik_fn = numpyro_analytical_poisson_likelihood(
+            dist_fn=dist_fn,
+            priors=...,                      # JointDistribution over the 6 params
+            variables=...,                   # {name: prior_dist}
+            constant_params={},              # (already captured in dist_fn)
+            variables_index=...,             # {name: i}
+            poisson_mean_estimator=coagulation_poisson_mean_estimator,
+            variance_cut_threshold=None,
+        )
+
+    Default ``gate="soft"`` (B.2) — the cleaner branch; pass
+    ``gate="bernoulli"`` for the B.1 cross-check.
+    """
+    if mc_jax_key is None:
+        mc_jax_key = jax.random.PRNGKey(0)
+
+    # Lazy import — pulls the engine response package (→ gwkokab) only when
+    # a fit actually builds responses, not at bridge-module import time.
+    from ..response.coagulation import build_gaussian_coagulation
+
+    def dist_fn(
+        *,
+        mu_natal,
+        sigma_natal,
+        natal_spin_loc,
+        natal_spin_scale,
+        kernel_b,
+        log_rate,
+        **_extra,
+    ) -> CoagulationPopulation:
+        response = build_gaussian_coagulation(
+            mu=mu_natal,
+            sigma=sigma_natal,
+            m_min=m_min,
+            m_max=m_max,
+            natal_spin_loc=natal_spin_loc,
+            natal_spin_scale=natal_spin_scale,
+            kernel_a=kernel_a,
+            kernel_b=kernel_b,
+            log_R_env=log_rate,
+            k_max=k_max,
+            grid=grid,
+            solver="mc_jax",
+            mc_v_esc=v_esc,
+            mc_n_seed=n_seed,
+            mc_depletion_fraction=depletion_fraction,
+            mc_jax_key=mc_jax_key,
+            mc_jax_gate=gate,
+            mc_jax_n_steps_mult=n_steps_mult,
+        )
+        env = {"v_esc": jnp.asarray(v_esc)}
+        total_rate_fn = (
+            lambda **kw: response.mc_jax_response.total_rate(**kw)
+        )
+        return CoagulationPopulation(
+            response, env, total_rate_fn,
+            m_min=m_min, m_max=m_max, m_max_factor=m_max_factor,
+        )
+
+    return dist_fn
