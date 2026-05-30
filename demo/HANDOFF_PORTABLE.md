@@ -277,6 +277,25 @@ If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
   `evaluator.total_rate` — the §4.3 metric bias stays orthogonal; for a flat
   baseline under selection use `make_flat_grid_poisson_mean_estimator` (same
   method), not the bridge's grid `coagulation_poisson_mean_estimator`.
+* **DONE (2026-05-30): full SVI + NUTS posterior** on the single-pulse toy.
+  `demo/posterior_stage1_gwkokab.py` — routes the self-consistent catalogue
+  through the REAL gwkokab `numpyro_analytical_poisson_likelihood` (via
+  `stage1_wiring`'s priors+variables+variables_index+`log_likelihood_fn`),
+  runs SVI (`AutoNormal` mean-field) and NUTS, reports median + 90% CI +
+  coverage, saves pairs/corner figs.  **SVI 6/6** truths in the 90% CI
+  (n_obs=40,n_seed=300, in-VM under the RIFT stub): `mu_natal` [7.34,8.03],
+  `log_rate` [4.36,4.91], `sigma` [0.97,1.49], `spin_scale` [0.084,0.145],
+  `spin_loc` [0.007,0.078], `kernel_b` [0.03,1.66] (widest = the weak-ID,
+  matching the profiles).  **NUTS cross-check 5/6** at a smaller
+  config (n_obs=30,n_seed=200) — agrees on structure; `mu_natal` sits just
+  outside its tighter CI (the ~0.3 mc_jax/KDE peak bias surfaces as the CI
+  tightens).  **SVI robustness gotcha:** an aggressive/far guide explores into
+  the region where the soft-gate cascade NaNs in the BACKWARD pass (forward is
+  `nan_to_num`-guarded in gwkokab, the gradient is NOT —
+  `[[feedback-where-guards-forward-not-backward]]`); fixed with
+  `AutoNormal(init_scale=0.1)` + `optax.clip_by_global_norm` + lr 0.01.  **NUTS
+  at n_seed=300 OOMs the 3.9 GB VM** → full-resolution NUTS is a workstation
+  task.  Figs `demo/figures/stage1_posterior_{svi,nuts}.png`.
 * **Two-pulse natal IMF** + float `kernel_a` (10 params).
 * Open questions (PLAN_gwkokab_fit.md): `ScaledMixture.sample` vs
   inverse-CDF for mock gen; cleanest `pdet` API (callable vs injection
@@ -470,8 +489,10 @@ sessions before.
   (incl. real-gwkokab W7–W9 / S10 via the RIFT stub), §4.2.  Multi-sample mock
   catalogue + single-pulse identifiability/recovery DONE too (all 6 params
   identified, unique origin; `mock_catalog.py` + `fit_stage1_gwkokab.py`).
-  Remaining: the 2-pulse 10-param model, full SVI/NUTS posterior (the M4
-  coverage xfail), and `kernel_b`/`spin_loc` weak-ID follow-up.
+  Full SVI/NUTS posterior on the single-pulse toy DONE (SVI 6/6 coverage; NUTS
+  5/6 cross-check; `posterior_stage1_gwkokab.py`).  Remaining: the 2-pulse
+  10-param model, full-resolution NUTS (workstation, VM OOMs at n_seed=300),
+  and the `kernel_b`/`spin_loc` weak-ID follow-up.
 * **J2b non-Aligned MC** — NOT STARTED; §4.4.
 * **implicit/Picard revisit** — DEFERRED to after gwkokab ships (user).
 * **aligned-χ cascade under-resolution / dN/dχ_eff engine-MC bias** —
