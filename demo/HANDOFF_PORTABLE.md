@@ -226,9 +226,32 @@ If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
   symbol the wiring never calls) — see §3 "Running real gwkokab in the VM".
   cardassia re-runs them against the genuine RIFT stack (no stub) for the
   final gate.
-* Mock catalogue with **multi-sample-per-event** posteriors + matching
-  `ln_offsets` (reference-prior log-weights) — the bridge already handles
-  the `(n_events, n_samples, 4)` shape via vmap; M4 used 1 sample/event.
+* **DONE (2026-05-30): multi-sample mock catalogue + single-pulse
+  identifiability/recovery.**  `demo/mock_catalog.py` —
+  `scatter_to_posteriors` (engine-free measurement blur: log-normal mass +
+  truncnorm spin, `m₁≥m₂` preserved, support-clipped) + `make_mock_posteriors`
+  (implicit-oracle truth → `(n_events,n_samples,4)` posteriors, `ln_offsets≡0`
+  flat-PE).  `demo/fit_stage1_gwkokab.py` — drives the REAL gwkokab
+  `analytical_poisson_likelihood_fn` via the new wiring/selection: builds a
+  jitted `logL` over the 6-vector, **profiles** it through θ* per param
+  (peak-at-truth ⇒ identified) and runs a gradient **MAP** (AD through the
+  whole cascade).  A self-consistent generator (`sample_from_model`,
+  inverse-CDF on the fit model's OWN pair intensity) removes the
+  implicit-vs-mc_jax mismatch so a peak shift is genuine (non)identifiability,
+  not a forward-model gap; `--gen implicit` keeps the cross-solver option.
+  **Result** (n_obs=40, n_samples=5, n_seed=300, k_max=3, self-consistent):
+  **all six params identified** (peaked logL); profile peaks `mu_natal`
+  8.00→7.92, `log_rate` exact, `sigma` 1.0→1.12, `spin_scale` 0.10→0.10,
+  `spin_loc` 0.05→0.02, `kernel_b` 1.0→0.5; MAP → mu 7.71 / sigma 1.12 /
+  spin_loc 0.011 / spin_scale 0.121 / kernel_b 0.623 / log_rate 4.60.  Natal
+  population + interaction model recovered, **unique origin**; `kernel_b` and
+  `spin_loc` carry the largest residual (known weak-ID; the cascade-χ
+  resolution + boundary).  Tests `tests/test_mock_catalog_scatter.py` MC1–MC4
+  (sandbox).  Fig `demo/figures/stage1_identifiability_profiles.png`
+  (gitignored — regen by running the script).  NB: the full end-to-end fit
+  RAN in the Cowork VM under the RIFT stub (engine builds + jits there); a far
+  MAP start lands in a `−inf` region (intensity underflow where no data sit) —
+  init from a mild perturbation of θ* (`_from_physical`).
 * **DONE (2026-05-30): `pdet(θ)` / VT(θ) selection.**
   `src/hierarchical_ad_pop_engine/inference/selection.py` — the detected-rate
   Poisson mean `μ = T_obs·∫ VT(x)·intensity(x) d⁴x` (Stage-1 was flat `VT≡1`).
@@ -444,9 +467,11 @@ sessions before.
 * **total_rate metric bias** — OPEN; gate-independent KDE+quadrature; §4.3.
 * **gwkokab Stage 2** — IN PROGRESS; priors/variables/variables_index wiring
   (`stage1_wiring.py`) AND `pdet(θ)`/VT selection (`selection.py`) DONE + green
-  (incl. real-gwkokab W7–W9 / S10 via the RIFT stub), §4.2.  Remaining:
-  multi-sample mock catalogue + `ln_offsets`, the 2-pulse 10-param model, and a
-  runnable end-to-end SVI/NUTS fit on cardassia.
+  (incl. real-gwkokab W7–W9 / S10 via the RIFT stub), §4.2.  Multi-sample mock
+  catalogue + single-pulse identifiability/recovery DONE too (all 6 params
+  identified, unique origin; `mock_catalog.py` + `fit_stage1_gwkokab.py`).
+  Remaining: the 2-pulse 10-param model, full SVI/NUTS posterior (the M4
+  coverage xfail), and `kernel_b`/`spin_loc` weak-ID follow-up.
 * **J2b non-Aligned MC** — NOT STARTED; §4.4.
 * **implicit/Picard revisit** — DEFERRED to after gwkokab ships (user).
 * **aligned-χ cascade under-resolution / dN/dχ_eff engine-MC bias** —
