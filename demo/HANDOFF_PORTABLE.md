@@ -201,11 +201,31 @@ python3 -m pytest tests/test_gwkokab_bridge.py -q   # all 7 should run (no skips
 If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
 
 **NEXT sub-steps to a running gwkokab fit:**
-* Build the `priors` (`JointDistribution`), `variables` (`{name: prior}`),
-  and `variables_index` (`{name: i}`) for the 6 Stage-1 params and pass
-  them + `dist_fn` + `coagulation_poisson_mean_estimator` to
-  `numpyro_analytical_poisson_likelihood`.  (constant_params can stay {}
-  since `make_coagulation_dist_fn` already closes over them.)
+* **DONE (2026-05-30): priors/variables/variables_index wiring.**
+  `src/hierarchical_ad_pop_engine/inference/stage1_wiring.py` —
+  `build_stage1_variables()` (the 6 Stage-1 numpyro priors +
+  `variables_index` built the gwkokab way, `{k:i for i,k in
+  enumerate(sorted(variables))}`), `build_stage1_priors()`
+  (`JointDistribution` over `sorted(variables)`, lazy gwkokab import),
+  `build_coagulation_likelihood()` (thin wrap of the REAL
+  `numpyro_analytical_poisson_likelihood`, `constant_params={}`,
+  `variance_cut_threshold=None`), and a one-call `build_stage1_likelihood()`
+  returning `{dist_fn, variables, variables_index, priors,
+  poisson_mean_estimator, log_likelihood_fn}`.  The load-bearing detail is
+  the **sorted-order contract**: the likelihood draws samples in
+  `sorted(variables)` order and `variables_index[name]` must index into THAT
+  list, else every param feeds the wrong `dist_fn` slot silently.  Tests:
+  `tests/test_gwkokab_stage1_wiring.py` — W1–W6 (priors, bounds, the
+  sorted-index contract, an inline `mapped_params` routing replica, and AD
+  through the assembled wiring) PASS in the lightweight sandbox; W7–W9 (REAL
+  gwkokab `JointDistribution` marginal-order check + REAL
+  `numpyro_analytical_poisson_likelihood` run + `jax.grad` via
+  `numpyro.infer.util.log_density`) are `importorskip`-gated like G6/G7.
+  **All nine (incl. W7–W9) were exercised GREEN in this Cowork VM** against
+  real gwkokab by stubbing only `RIFT.lalsimutils` (a single import-time
+  symbol the wiring never calls) — see §3 "Running real gwkokab in the VM".
+  cardassia re-runs them against the genuine RIFT stack (no stub) for the
+  final gate.
 * Mock catalogue with **multi-sample-per-event** posteriors + matching
   `ln_offsets` (reference-prior log-weights) — the bridge already handles
   the `(n_events, n_samples, 4)` shape via vmap; M4 used 1 sample/event.
@@ -263,6 +283,40 @@ path (M4, bridge G6/G7) needs the whole gwkokab+RIFT+lalsuite stack.
   This session could NOT bring the full stack up in the ephemeral sandbox
   (disk ~1.8 GB free, RIFT sdist build stalled) — full-stack runs remain a
   workstation/pixi task.
+
+**Running the REAL gwkokab inference/models layer in the Cowork VM
+(2026-05-30, for the wiring W7–W9 tier).**  The `inference` /
+`models.utils` code (`JointDistribution`,
+`numpyro_analytical_poisson_likelihood`, `analytical_poisson_likelihood_fn`,
+`ScaledMixture`) is pure jax/numpyro and never *calls* RIFT — but
+`import gwkokab` pulls `errors.py → import RIFT.lalsimutils` at module load.
+So you can exercise the real inference layer in the VM without lalsuite by
+**stubbing that one import**:
+```bash
+# 1. JAX + the lightweight gwkokab deps, installed to a PERSISTENT mnt cache
+#    (the VM's own / is ~99% full; /dev/shm resets every bash call, so neither
+#    works as a target).  ~700 MB total.
+SITE=<outputs-mnt>/.pylibs            # e.g. .../mnt/outputs/.pylibs
+pip install --target=$SITE --no-cache-dir \
+    jax jaxlib equinox numpyro jaxtyping scipy pytest \
+    quadax interpax loguru h5py optax matplotlib pandas
+# 2. stub the single RIFT symbol gwkokab.errors imports at load (never called
+#    on the inference path):
+STUB=<outputs-mnt>/.stubs; mkdir -p $STUB/RIFT
+: > $STUB/RIFT/__init__.py
+printf 'MsunInSec = 4.925491025543576e-06\n' > $STUB/RIFT/lalsimutils.py
+# 3. run (ABSOLUTE PYTHONPATH entries — a relative gwkokab/src breaks once
+#    pytest cds into the engine dir):
+export PYTHONPATH=$SITE:$STUB:<repo>/gwkokab/src:<repo>/hierarchical_AD_pop_engine/src:<repo>/hierarchical_AD_pop_engine
+export JAX_PLATFORMS=cpu TMPDIR=/dev/shm/tmp
+python3 -m pytest tests/test_gwkokab_stage1_wiring.py -v   # all 9 incl. W7–W9
+```
+This is a DEV-LOOP convenience only — it is NOT a substitute for the real
+RIFT run on cardassia (where the stub is absent and lalsuite is present).
+The committed tests stay `importorskip`-gated so CI without gwkokab skips
+W7–W9 rather than passing against a stub.  (Same Mc·v_PN code path that needs
+`MsunInSec` is in `errors.error_factory*`, which neither the wiring nor the
+bridge touches.)
 
 ### 4.3 Fix the `total_rate` metric bias (gates a real rate)
 `MCResponseJax.total_rate` reads ~5× low at the M4 working point
@@ -366,7 +420,10 @@ sessions before.
 
 * **B.2 soft gate** — DONE, green both gates, uncommitted.  (this file)
 * **total_rate metric bias** — OPEN; gate-independent KDE+quadrature; §4.3.
-* **gwkokab Stage 2** — NOT STARTED; the headline next step; §4.2.
+* **gwkokab Stage 2** — IN PROGRESS; priors/variables/variables_index wiring
+  DONE + green (incl. real-gwkokab W7–W9 via the RIFT stub), §4.2.  Remaining:
+  multi-sample mock catalogue + `ln_offsets`, `pdet(θ)` selection, the 2-pulse
+  10-param model, and a runnable end-to-end SVI/NUTS fit on cardassia.
 * **J2b non-Aligned MC** — NOT STARTED; §4.4.
 * **implicit/Picard revisit** — DEFERRED to after gwkokab ships (user).
 * **aligned-χ cascade under-resolution / dN/dχ_eff engine-MC bias** —
