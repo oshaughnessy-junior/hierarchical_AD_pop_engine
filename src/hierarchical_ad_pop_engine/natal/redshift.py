@@ -14,6 +14,21 @@ convention for compatibility with ``numpyro_poisson_likelihood``.
 
 from __future__ import annotations
 
-from gwkokab.models.redshift import MadauDickinsonRedshift, PowerlawRedshift
+# gwkokab renamed these on main (2026-05): MadauDickinsonRedshift ->
+# MadauDickinsonRedshiftModel, PowerlawRedshift -> PowerlawRedshiftModel.
+# Import version-tolerantly and re-export under the engine's stable names
+# (the rest of the engine — distributions.py, formation.* — uses the
+# unsuffixed names) so the engine works against BOTH the new gwkokab and
+# the older `gwkokab_orig`.
+try:  # new gwkokab (main)
+    from gwkokab.models.redshift import (
+        MadauDickinsonRedshiftModel as MadauDickinsonRedshift,
+        PowerlawRedshiftModel as PowerlawRedshift,
+    )
+except ImportError:  # older gwkokab (pre-rename)
+    from gwkokab.models.redshift import (  # type: ignore[no-redef]
+        MadauDickinsonRedshift as MadauDickinsonRedshift,
+        PowerlawRedshift as PowerlawRedshift,
+    )
 
 __all__ = ["MadauDickinsonRedshift", "PowerlawRedshift"]
