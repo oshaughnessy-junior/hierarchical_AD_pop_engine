@@ -1,0 +1,68 @@
+# pixi environment for the FULL hierarchical_AD_pop_engine + gwkokab stack.
+#
+# Why this exists (the "rope"): the engine's response package transitively
+# imports gwkokab, and gwkokab imports `RIFT.lalsimutils` → lalsuite.  The
+# lightweight pip sandbox (demo/bootstrap_jax_sandbox.sh) can run the MC-
+# PRIMITIVES path (B.2 tier) but NOT the full response/gwkokab path
+# (M4, gwkokab-bridge G6/G7), because pip-building RIFT's sdist + pulling
+# lalsuite is slow/fragile on a near-full disk.  pixi fixes that: it pulls
+# `lalsuite` as a prebuilt conda-forge package (no sdist build) and layers
+# the JAX + numpyro stack + editable repos on top, reproducibly.
+#
+# Usage (on any machine with pixi; https://pixi.sh):
+#   cd hierarchical_AD_pop_engine
+#   pixi install
+#   pixi run tests-mc        # B.2 + bridge G1-G5 (no gwkokab needed)
+#   pixi run tests-bridge    # gwkokab-bridge incl. G6/G7 (full stack)
+#   pixi run tests-m4        # M4 SVI recovery, both gates (slow)
+#   pixi shell               # drop into the env
+#
+# NOTE: lalsuite has aarch64 + x86_64 conda-forge builds AND PyPI
+# manylinux_2_28 wheels (verified 2026-05-29), so this works on Apple-silicon
+# and Linux.  RIFT comes from PyPI (no conda-forge pkg); it imports lalsuite
+# at runtime, which the conda lalsuite satisfies.  Pin versions if a future
+# gwkokab main needs a specific jax (its `cpu` extra wants jax>=0.7; the
+# engine + B.2 were validated on 0.6.2 — bump here if gwkokab requires it).
+
+[project]
+name = "hierarchical-ad-pop-engine-fullstack"
+version = "0.0.1"
+description = "Full engine + gwkokab + RIFT/lalsuite stack for the coagulation population fit"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[dependencies]
+# Conda-forge: prebuilt lalsuite (the part pip struggles with) + scientific base.
+python = "3.11.*"
+lalsuite = "*"
+numpy = "<3"
+scipy = ">=1.12"
+h5py = ">=3.12"
+pandas = ">=2.2"
+matplotlib = ">=3.9"
+pip = "*"
+
+[pypi-dependencies]
+# JAX inference stack (CPU; use a cuda build of jax on a GPU host).
+jax = "*"
+equinox = ">=0.11.3"
+numpyro = ">=0.19.0"
+jaxtyping = ">=0.2.36"
+pytest = "*"
+# GW population framework + its inference deps not on conda-forge.
+RIFT = ">=0.0.15.11"
+quadax = ">=0.2.5"
+interpax = "*"
+# Editable local repos: gwkokab (sibling) + the engine itself.
+gwkokab = { path = "../gwkokab", editable = true }
+hierarchical_ad_pop_engine = { path = ".", editable = true }
+
+[tasks]
+# MC-primitives tier — runs even without the full gwkokab/RIFT stack.
+tests-mc = "python -m pytest tests/test_mc_particle_mc_jax_soft.py -q"
+# gwkokab bridge — G1-G5 always; G6-G7 need the full stack (this env has it).
+tests-bridge = "python -m pytest tests/test_gwkokab_bridge.py -v"
+# M4 SVI recovery, both gate branches (slow).
+tests-m4 = "python -m pytest -m slow -k integration_stage1_recovery_mc_jax -v"
+# Sanity: confirm the full import chain (engine response → gwkokab → RIFT).
+import-check = "python -c \"from hierarchical_ad_pop_engine.response.coagulation import build_gaussian_coagulation; import gwkokab; print('full stack import OK', gwkokab.__version__)\""

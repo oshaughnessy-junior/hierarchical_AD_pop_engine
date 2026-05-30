@@ -222,16 +222,42 @@ through the whole cascade into gwkokab's likelihood (proven: the inline
 G5 contract replica differentiates the analytical-Poisson logL w.r.t. the
 population params).
 
-**Dependency note (important for the dev loop):** the engine's `response`
-package transitively imports gwkokab (`natal.mass` →
+**gwkokab version drift (2026-05-29).** The user replaced gwkokab with the
+latest `main` (old tree preserved as the sibling `gwkokab_orig/`).  Verified
+by diff that the bridge needs **NO API rewire**:
+`numpyro_analytical_poisson_likelihood`, `poissonlikelihood_utils.
+analytical_poisson_likelihood_fn`, and `models/utils/ScaledMixture` are
+**byte-identical** old↔new, and every gwkokab symbol the engine imports
+(`doubly_truncated_power_law_log_norm_constant`, `log_planck_taper_window`,
+`MadauDickinsonRedshift`/`PowerlawRedshift`, `mass_sandwich`, `ScaledMixture`)
+still resolves at the same path.  The only addition is
+`inference/factory.py::get_likelihood_fn` — an additive selector that
+returns the same `numpyro_analytical_poisson_likelihood`.  So the bridge
+G6/G7 **skips were environmental (RIFT not importable), not code drift.**
+`test_gwkokab_bridge.py` was hardened: G6/G7 now skip ONLY on
+import/OSError (env) and FAIL loudly on any other exception (a real future
+API drift), so a genuine break can never again hide as a silent skip.
+
+**Dependency / local-operation note (important for the dev loop):** the
+engine's `response` package transitively imports gwkokab (`natal.mass` →
 `gwkokab.models.utils`), and `import gwkokab` pulls `errors.py` →
 `RIFT.lalsimutils` → **lalsuite**.  So the full `response/coagulation`
-path (and M4, and bridge G6/G7) needs the whole gwkokab+RIFT+lalsuite
-stack — installable on cardassia, NOT in the lightweight sandbox.  The
-sandbox fast-loop covers the MC PRIMITIVES path (`red_team/
-backup_particle_mc.py` → `remnants.*`, e.g. the B.2 tier) which does NOT
-import `response/__init__` and so needs no gwkokab.  See §3 and the
-in-repo `demo/bootstrap_jax_sandbox.sh`.
+path (M4, bridge G6/G7) needs the whole gwkokab+RIFT+lalsuite stack.
+
+* **Lightweight pip sandbox** (`demo/bootstrap_jax_sandbox.sh`): covers the
+  MC PRIMITIVES path only (`red_team/backup_particle_mc.py` → `remnants.*`,
+  e.g. the B.2 tier + bridge G1–G5), which does NOT import
+  `response/__init__` → no gwkokab needed.
+* **Full stack**: use **`pixi.toml`** (repo root) — pulls `lalsuite` from
+  conda-forge (prebuilt; avoids the slow/fragile RIFT+lalsuite pip-sdist
+  build that does not converge on the near-full ephemeral sandbox) + the
+  JAX/numpyro stack + editable `gwkokab` and engine.  `pixi run
+  tests-bridge` / `tests-m4`.  (FYI: `lalsuite` DOES publish
+  `manylinux_2_28_aarch64` + `osx-arm64` wheels, so a pure-pip env is also
+  possible given enough disk + build time; pixi is just the robust path.)
+  This session could NOT bring the full stack up in the ephemeral sandbox
+  (disk ~1.8 GB free, RIFT sdist build stalled) — full-stack runs remain a
+  workstation/pixi task.
 
 ### 4.3 Fix the `total_rate` metric bias (gates a real rate)
 `MCResponseJax.total_rate` reads ~5× low at the M4 working point

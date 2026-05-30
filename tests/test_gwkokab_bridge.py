@@ -168,6 +168,13 @@ _THETA = dict(
 )
 
 
+# Only an IMPORT/env failure (gwkokab → RIFT/lalsuite not installed, etc.)
+# is a legitimate skip.  A genuine API/build error (signature mismatch from
+# gwkokab drift, a bridge bug) must FAIL loudly, not hide as a skip — that
+# was the lesson when the gwkokab main branch moved underneath us.
+_ENV_IMPORT_ERRORS = (ImportError, ModuleNotFoundError, OSError)
+
+
 def _try_real_dist_fn(gate="soft"):
     try:
         dist_fn = make_coagulation_dist_fn(
@@ -176,8 +183,13 @@ def _try_real_dist_fn(gate="soft"):
             mc_jax_key=jax.random.PRNGKey(7),
         )
         return dist_fn(**_THETA)   # forces the heavy build (→ gwkokab)
-    except Exception as exc:  # ImportError (RIFT/lalsuite) or build error
-        pytest.skip(f"full engine+gwkokab stack unavailable here: {exc!r}")
+    except _ENV_IMPORT_ERRORS as exc:
+        pytest.skip(
+            f"full engine+gwkokab stack not importable here "
+            f"(environment, NOT a bridge bug): {type(exc).__name__}: {exc}"
+        )
+    # NB: any OTHER exception (TypeError/AttributeError/ValueError → gwkokab
+    # API drift or a real bridge bug) propagates and FAILS the test.
 
 
 def test_real_response_log_prob_matches_engine():
@@ -198,8 +210,11 @@ def test_real_end_to_end_gwkokab_analytical():
         from gwkokab.inference.poissonlikelihood_utils import (
             analytical_poisson_likelihood_fn,
         )
-    except Exception as exc:
-        pytest.skip(f"gwkokab not importable here: {exc!r}")
+    except _ENV_IMPORT_ERRORS as exc:
+        pytest.skip(
+            f"gwkokab not importable here (environment): "
+            f"{type(exc).__name__}: {exc}"
+        )
     x = _events(12)[:, None, :]
     ln_offsets = jnp.zeros((12, 1))
     ll = analytical_poisson_likelihood_fn(
