@@ -227,13 +227,18 @@ latest `main` (old tree preserved as the sibling `gwkokab_orig/`).  Verified
 by diff that the bridge needs **NO API rewire**:
 `numpyro_analytical_poisson_likelihood`, `poissonlikelihood_utils.
 analytical_poisson_likelihood_fn`, and `models/utils/ScaledMixture` are
-**byte-identical** old↔new, and every gwkokab symbol the engine imports
-(`doubly_truncated_power_law_log_norm_constant`, `log_planck_taper_window`,
-`MadauDickinsonRedshift`/`PowerlawRedshift`, `mass_sandwich`, `ScaledMixture`)
-still resolves at the same path.  The only addition is
-`inference/factory.py::get_likelihood_fn` — an additive selector that
-returns the same `numpyro_analytical_poisson_likelihood`.  So the bridge
-G6/G7 **skips were environmental (RIFT not importable), not code drift.**
+**byte-identical** old↔new, (only addition: `inference/factory.py::get_likelihood_fn`, an additive
+selector returning the same `numpyro_analytical_poisson_likelihood`).  BUT
+the ENGINE had a real break: gwkokab main renamed
+`MadauDickinsonRedshift`->`MadauDickinsonRedshiftModel` and
+`PowerlawRedshift`->`PowerlawRedshiftModel`; `natal/redshift.py` re-exported
+the old names -> ImportError -> the G6/G7 (and M4) skip.  **Fixed
+(commit 93d2161):** version-tolerant import (try `*Model`, fall back to old
+names), aliased to the engine's stable unsuffixed names; constructors
+unchanged (diff-verified), no call-site edits.  (A prior substring grep gave
+a false "resolves" — exact-name checks confirm all OTHER engine-imported
+gwkokab symbols [`doubly_truncated_power_law_log_norm_constant`,
+`log_planck_taper_window`, `mass_sandwich`, `ScaledMixture`] are unchanged.)
 `test_gwkokab_bridge.py` was hardened: G6/G7 now skip ONLY on
 import/OSError (env) and FAIL loudly on any other exception (a real future
 API drift), so a genuine break can never again hide as a silent skip.
