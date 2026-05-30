@@ -21,8 +21,17 @@ This script answers exactly that.
 
 Run::
 
-    python demo/forward_modeling_mc_vs_mc.py
+    python demo/forward_modeling_mc_vs_mc.py                 # B.1 Bernoulli gate
+    python demo/forward_modeling_mc_vs_mc.py --gate soft     # B.2 soft gate
     # writes demo/figures_<hash>/mc_vs_mc_{dN_dm,dN_dchi,2d}.png
+
+``--gate soft`` drives the JAX side through ``particle_mc_jax_soft`` (the
+B.2 deterministic occupancy-flow gate); the surviving pool is weighted by
+``w_active · occupancy``.  This is the head-to-head that shows whether
+B.2's K-weighted depletion reproduces numpy ``particle_mc``'s surviving
+(m, χ) distribution as well as (or better than) B.1.  Histograms only —
+no KDE, per the deep-cascade-peak smoothing concern
+(``feedback-gaussian-kde-over-smooths-cascade-peaks``).
 """
 from __future__ import annotations
 
@@ -43,6 +52,7 @@ from red_team.backup_particle_mc import (  # noqa: E402
     MCConfig,
     particle_mc,
     particle_mc_jax,
+    particle_mc_jax_soft,
 )
 
 
@@ -59,14 +69,26 @@ THETA_STAR = dict(
 )
 
 
-def _run_jax(n_seed: int, depletion: float, key_seed: int):
+def _run_jax(n_seed: int, depletion: float, key_seed: int,
+             gate: str = "bernoulli"):
     cfg = MCConfig(n_seed=n_seed, depletion_fraction=depletion, **THETA_STAR)
-    out = particle_mc_jax(cfg, jax.random.PRNGKey(key_seed))
-    am = out["active_mask"]
+    if gate == "soft":
+        # B.2 deterministic soft K-gate.  The surviving "amount" of each
+        # slot is its continuous occupancy, so the active-pool weight is
+        # w_active · occupancy (dead occupancy-0 tail slots drop out).
+        out = particle_mc_jax_soft(cfg, jax.random.PRNGKey(key_seed))
+        occ = np.asarray(out["occupancy"])
+        keep = occ > 1e-9
+        m = np.asarray(out["m_active"])[keep]
+        chi = np.asarray(out["chi_active"])[keep]
+        w = np.asarray(out["w_active"])[keep] * occ[keep]
+    else:
+        out = particle_mc_jax(cfg, jax.random.PRNGKey(key_seed))
+        am = out["active_mask"]
+        m = np.asarray(out["m_active"][am])
+        chi = np.asarray(out["chi_active"][am])
+        w = np.asarray(out["w_active"][am])
     sa = out["step_active"]
-    m = np.asarray(out["m_active"][am])
-    chi = np.asarray(out["chi_active"][am])
-    w = np.asarray(out["w_active"][am])
     mergers = np.asarray(out["mergers"][sa])
     w_mergers = np.asarray(out["w_mergers"][sa])
     return dict(
@@ -320,6 +342,12 @@ def main(argv=None):
     parser.add_argument("--depletion-fraction", type=float, default=0.10)
     parser.add_argument("--jax-key-seed", type=int, default=2026)
     parser.add_argument("--np-rng-seed", type=int, default=20260518)
+    parser.add_argument(
+        "--gate", choices=["bernoulli", "soft"], default="bernoulli",
+        help="JAX cascade gate: 'bernoulli' (B.1 round-3) or 'soft' "
+        "(B.2 deterministic occupancy flow).  The numpy reference is "
+        "discrete K-rejection either way.",
+    )
     args = parser.parse_args(argv)
 
     rh = args.run_hash or secrets.token_hex(3)
@@ -327,7 +355,8 @@ def main(argv=None):
     out_dir.mkdir(exist_ok=True)
     print(f"Run hash: {rh}")
     print(f"  figures → demo/figures_{rh}/")
-    print(f"  cfg: n_seed={args.n_seed}, depletion={args.depletion_fraction}")
+    print(f"  cfg: n_seed={args.n_seed}, depletion={args.depletion_fraction}, "
+          f"gate={args.gate}")
     print()
 
     print("Running numpy particle_mc (discrete K-rejection)...")
@@ -336,8 +365,12 @@ def main(argv=None):
           f"n_accepted={np_run['mergers'].shape[0]}")
 
     print()
-    print("Running JAX particle_mc_jax (K-rejection-as-weighting)...")
-    jax_run = _run_jax(args.n_seed, args.depletion_fraction, args.jax_key_seed)
+    _gate_label = ("particle_mc_jax_soft (B.2 soft occupancy gate)"
+                   if args.gate == "soft"
+                   else "particle_mc_jax (B.1 Bernoulli K-gate)")
+    print(f"Running JAX {_gate_label}...")
+    jax_run = _run_jax(args.n_seed, args.depletion_fraction,
+                       args.jax_key_seed, gate=args.gate)
     print(f"  n_init={args.n_seed}, n_active={jax_run['m_active'].size}, "
           f"n_steps={jax_run['mergers'].shape[0]}, "
           f"Σw_mergers={jax_run['w_mergers'].sum():.1f} "
