@@ -208,6 +208,8 @@ def build_mc_jax_response(
     depletion_fraction: float = 0.5,
     n_steps: Optional[int] = None,
     k_ratio: float = 1.5,
+    gate: str = "bernoulli",
+    n_steps_mult: float = 3.0,
 ) -> MCResponseJax:
     r"""Build an :class:`MCResponseJax` by running ``particle_mc_jax`` traced.
 
@@ -257,7 +259,31 @@ def build_mc_jax_response(
         ``1.24`` at depletion=1.0); for production SVI estimate this
         at init time and pass explicitly to avoid retracing every
         gradient step (a JAX-traced ``mu_natal`` can't be cast to a
-        Python int for ``jax.lax.scan``).
+        Python int for ``jax.lax.scan``).  Ignored when
+        ``gate="soft"``.
+    gate : {"bernoulli", "soft"}, default "bernoulli"
+        Cascade K-gate mechanism.
+
+        * ``"bernoulli"`` — round-3 B.1 :func:`particle_mc_jax`:
+          stochastic K-rejection + straight-through estimator, sized by
+          ``k_ratio``.  The current default (bit-for-bit unchanged).
+        * ``"soft"`` — B.2 :func:`particle_mc_jax_soft`: deterministic
+          occupancy-flow gate with a depletion budget (slot pre-
+          allocation).  Removes the ``k_ratio`` precision knob (depletion
+          is pinned by the budget; ``n_steps`` only needs to be a
+          generous upper bound via ``n_steps_mult``) AND the straight-
+          through bias (the forward pass is smooth in the kernel params).
+          See ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` § 5.B.2
+          and ``[[project-jax-mc-b2-soft-gate-followup]]``.  Under
+          ``"soft"`` the evaluator weights are ``w_active · occupancy``
+          (continuous), so the density estimator carries kernel/natal AD
+          tangents through the surviving-pool *fraction*, not just a hard
+          active mask.
+    n_steps_mult : float, default 3.0
+        Only used when ``gate="soft"`` and ``n_steps is None``: sizes
+        ``n_steps = int(depletion_fraction · n_seed · n_steps_mult)`` as
+        a generous upper bound (not a precision knob — the budget clip
+        pins depletion regardless).
 
     Returns
     -------
@@ -265,7 +291,14 @@ def build_mc_jax_response(
         Eqx-Module-wrapped J3 evaluator + n_init.  All dynamic
         fields carry AD tangents from the input ``response``.
     """
-    from red_team.backup_particle_mc import MCConfig, particle_mc_jax
+    from red_team.backup_particle_mc import (
+        MCConfig, particle_mc_jax, particle_mc_jax_soft,
+    )
+
+    if gate not in ("bernoulli", "soft"):
+        raise ValueError(
+            f"gate must be 'bernoulli' (B.1) or 'soft' (B.2); got {gate!r}"
+        )
 
     if response.natal_mass_kind != "gaussian":
         raise NotImplementedError(
@@ -309,7 +342,12 @@ def build_mc_jax_response(
         orientation=orientation,
     )
 
-    out = particle_mc_jax(cfg, key, n_steps=n_steps, k_ratio=float(k_ratio))
+    if gate == "soft":
+        out = particle_mc_jax_soft(
+            cfg, key, n_steps=n_steps, n_steps_mult=float(n_steps_mult),
+        )
+    else:
+        out = particle_mc_jax(cfg, key, n_steps=n_steps, k_ratio=float(k_ratio))
 
     # Build the J3 evaluator over the surviving pool + cascade weights.
     # Surviving-pool selection here must stay JAX-traceable; under AD
@@ -329,10 +367,20 @@ def build_mc_jax_response(
     m_active_full = out["m_active"]
     chi_active_full = out["chi_active"]
     w_active_full = out["w_active"]
-    active_mask_f = out["active_mask"].astype(m_active_full.dtype)
-    # Mask: zero-out inactive samples in weights.  Keeps full-length
-    # arrays so jit shape is static.
-    masked_weights = w_active_full * active_mask_f
+    if gate == "soft":
+        # B.2: weight each slot by w_active · occupancy.  Occupancy is the
+        # CONTINUOUS surviving fraction ∈ [0, 1], so the KDE weights carry
+        # kernel/natal AD tangents through the surviving-pool fraction —
+        # the smooth replacement for B.1's binary active_mask (which has
+        # no gradient).  Σ(w·occupancy) = (1 − f_dep)·n_init, same density
+        # convention as the bernoulli path.  Dead tail slots (occupancy 0)
+        # contribute nothing to the KDE / bandwidth.
+        masked_weights = w_active_full * out["occupancy"]
+    else:
+        active_mask_f = out["active_mask"].astype(m_active_full.dtype)
+        # Mask: zero-out inactive samples in weights.  Keeps full-length
+        # arrays so jit shape is static.
+        masked_weights = w_active_full * active_mask_f
 
     evaluator = MCEvaluatorJax.from_run(
         m_active_full,

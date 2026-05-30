@@ -1041,6 +1041,306 @@ def particle_mc_jax(
     return out_dict
 
 
+# ===========================================================================
+# Session B.2 — deterministic soft K-gate (slot pre-allocation).
+#
+# The principled successor to round-3's B.1 Bernoulli K-gate
+# (``particle_mc_jax`` above).  Motivation + full derivation:
+#   * demo/PLAN_jax_mc_time_decoupling_diagnosis.md § 5.B.2 + § 8
+#   * project-jax-mc-b2-soft-gate-followup
+#   * sandbox derivation outputs/b2_soft_gate_derivation.py (numpy,
+#     verified Q1/Q2/Q3 below)
+#
+# B.1's two costs and how B.2 removes them
+# ----------------------------------------
+#   (1) ``k_ratio`` magic factor.  B.1 sizes n_steps = depletion·n_init·
+#       k_ratio so the EXPECTED number of Bernoulli K-accepts hits
+#       numpy's depletion·n_init cap; k_ratio ≈ K_max/⟨K⟩ has to be
+#       estimated and drifts with the regime.  B.2 carries a cumulative
+#       net-removal BUDGET and clips the last contributing step, pinning
+#       depletion to EXACTLY depletion·n_init.  ``n_steps`` then only has
+#       to be a generous UPPER BOUND — too-large just adds cheap no-op
+#       steps, it can't bias depletion.  (Sandbox Q1: depletion = 0.1000
+#       with std 0.0000 for every n_steps ≥ ~1.5·D·n_init.)
+#   (2) Straight-through bias.  B.1's forward pass is a binary Bernoulli
+#       accept, so AD needs a straight-through estimator (zero-bias on
+#       the K-weighted shape, small bias at the K_ij≈K_max boundary).
+#       B.2's forward pass is the smooth occupancy flow
+#       δ = (K_ij/K_max)·min(o_i,o_j) — differentiable everywhere, no
+#       estimator.  (Sandbox Q3: with the pair sequence held fixed — the
+#       AD-faithful condition — the soft observable is C0-smooth in
+#       kernel_b; the discrete mirror is piecewise-constant with zero
+#       gradient between accept-flips.)
+#
+# Mechanism (occupancy flow + slot pre-allocation)
+# ------------------------------------------------
+# Pre-allocate S = n_init + n_steps slots: [0:n_init] natal parents
+# (occupancy o=1), [n_init:S] remnant tail (o=0, "born" as the cascade
+# runs).  Each scan step k:
+#   * draw a pair (i, j) with probability ∝ occupancy o (the soft analog
+#     of numpy's uniform-over-active draw),
+#   * δ = (K_ij/K_max)·min(o_i, o_j)  (clipped by the depletion budget),
+#   * o_i -= δ; o_j -= δ,
+#   * remnant born into tail slot ``n_init + k`` with occupancy δ (if
+#     retained) — the scan counter IS the write index, so no dynamic
+#     write-pointer is needed.
+# Net occupancy removed per step: δ if retained (2 consumed − 1 born),
+# 2δ if not.  W_total = Σ o·w = (1 − depletion)·n_init bit-stably
+# (sandbox Q2 confirmed exact; KS(m), KS(χ) vs numpy well under the
+# 0.05 critical value).
+#
+# Aligned-only first pass, same as B.1: physics fits are called in
+# pair-selection order (matching numpy ``particle_mc`` / B.1 bit-for-
+# bit); non-Aligned raises.  Retention stays Heaviside under Aligned, so
+# ∂/∂v_esc is still zero here (recovers under misalignment + soft-sigmoid
+# retention, the J2b follow-up) — B.2 fixes the KERNEL-gradient quality
+# and the depletion-control knob, not the v_esc gradient.
+#
+# Additive: numpy ``particle_mc`` and B.1 ``particle_mc_jax`` are both
+# untouched.  ``build_mc_jax_response(gate="soft")`` opts in; the default
+# stays B.1 until B.2 is workstation-confirmed.
+# ===========================================================================
+def particle_mc_jax_soft(
+    cfg: "MCConfig",
+    key: jax.Array,
+    *,
+    n_steps: Optional[int] = None,
+    n_steps_mult: float = 3.0,
+    occ_tol: float = 1e-9,
+):
+    """JAX-pure particle MC under the B.2 deterministic soft K-gate.
+
+    Drop-in companion to :func:`particle_mc_jax` (B.1).  Returns a dict
+    with the same load-bearing keys plus a continuous ``occupancy``
+    field (B.1's ``active_mask`` is the boolean ``occupancy > occ_tol``).
+
+    Returns
+    -------
+    dict with keys
+
+    ``m_active`` / ``chi_active`` / ``w_active`` / ``gen_active``
+        Full-length ``S = n_init + n_steps`` slot arrays.  Parent slots
+        ``[0:n_init]`` plus remnant-tail slots ``[n_init:S]``.
+    ``occupancy``
+        Per-slot occupancy ``o ∈ [0, 1]`` — the *continuous* surviving
+        fraction of each slot.  This is the B.2 analog of B.1's binary
+        ``active_mask``; pass ``w_active · occupancy`` as the density
+        estimator's weights (it carries kernel/natal AD tangents, unlike
+        the hard mask).  ``Σ occupancy·w_active = (1−depletion)·n_init``.
+    ``active_mask``
+        ``occupancy > occ_tol`` — boolean, for eager callers / schema
+        parity with B.1.
+    ``mergers`` / ``v_kicks`` / ``w_mergers`` / ``step_active``
+        Per-step records, shapes ``(n_steps, 8)`` / ``(n_steps,)``.
+        ``w_mergers`` is the occupancy-scaled descendant weight
+        ``0.5(w_i+w_j)·δ`` (so Σ over steps tracks the cascade's
+        cumulative merged mass).  Non-event steps carry NaN / 0.
+    ``stats``
+        ``n_init``, ``n_steps``, ``n_slots`` (= S), ``W_total``,
+        ``depletion`` (= net_removed/n_init, pinned to the target),
+        ``net_removed``, ``orientation``.
+
+    Parameters
+    ----------
+    n_steps : int, optional
+        Inner-loop step budget.  If ``None``, ``int(depletion_fraction ·
+        n_init · n_steps_mult)``.  Unlike B.1's k_ratio, this is an
+        UPPER BOUND, not a precision knob — the depletion budget pins
+        the achieved depletion regardless (provided n_steps is large
+        enough to reach the budget; ``n_steps_mult=3`` is a safe margin
+        for Gaussian-natal × power-law-kernel regimes where
+        K_max/⟨K⟩ ≈ 1.2–1.5).
+    n_steps_mult : float, default 3.0
+        Multiplier for the auto ``n_steps``.  Generous by design.
+    occ_tol : float, default 1e-9
+        Occupancy below this counts as "merged away" for pair-eligibility
+        and the ``active_mask`` boolean.
+    """
+    if not _orientation_is_aligned(cfg.orientation):
+        raise NotImplementedError(
+            "particle_mc_jax_soft currently supports only Aligned "
+            "orientation; non-Aligned per-event vector physics is the "
+            "J2b follow-up (see demo/PLAN_jax_mc.md § J2)."
+        )
+
+    key_natal, key_loop = jax.random.split(key)
+    m0, chi0, w0 = sample_natals_jax(
+        cfg, key_natal, filter_zero_weights=False,
+    )
+    n_init = int(m0.shape[0])
+
+    if n_steps is None:
+        n_steps = max(
+            1, int(cfg.depletion_fraction * n_init * float(n_steps_mult))
+        )
+    S = n_init + n_steps
+
+    # Pre-allocated slot arrays: parents [0:n_init] + remnant tail.
+    m_arr0 = jnp.zeros(S, dtype=m0.dtype).at[:n_init].set(m0)
+    chi_arr0 = jnp.zeros(S, dtype=chi0.dtype).at[:n_init].set(chi0)
+    w_arr0 = jnp.zeros(S, dtype=w0.dtype).at[:n_init].set(w0)
+    occ0 = jnp.zeros(S, dtype=m0.dtype).at[:n_init].set(1.0)
+    gen0 = jnp.zeros(S, dtype=jnp.int32).at[:n_init].set(1)
+
+    a_k = jnp.asarray(cfg.kernel_a)
+    b_k = jnp.asarray(cfg.kernel_b)
+    v_esc = jnp.asarray(cfg.v_esc)
+    R_target = jnp.asarray(cfg.depletion_fraction) * n_init
+
+    carry0 = (m_arr0, chi_arr0, w_arr0, occ0, gen0,
+              jnp.asarray(0.0, dtype=m0.dtype), key_loop)
+
+    def step_fn(carry, k):
+        m_arr, chi_arr, w_arr, occ, gen, net_removed, key = carry
+
+        occ_active = occ > occ_tol
+        n_active = jnp.sum(occ_active)
+        budget_left = R_target - net_removed
+        step_active_now = (n_active >= 2) & (budget_left > occ_tol)
+
+        # K_max from current occupied pool (NaN-safe via inf padding).
+        m_for_min = jnp.where(occ_active, m_arr, jnp.inf)
+        m_for_max = jnp.where(occ_active, m_arr, -jnp.inf)
+        m_min_active = jnp.min(m_for_min)
+        m_max_active = jnp.max(m_for_max)
+        K_max = _kernel_upper_bound_jax(m_min_active, m_max_active, a_k, b_k)
+        K_max = jnp.where(step_active_now, K_max, 1.0)
+
+        # Occupancy-weighted pair draw (soft analog of numpy's uniform-
+        # over-active draw): P(slot) ∝ o.  Two splits, j != i.
+        key, k_i, k_j = jax.random.split(key, 3)
+        p_occ = jnp.where(occ_active, occ, 0.0)
+        denom_i = jnp.maximum(p_occ.sum(), occ_tol)
+        p_i = p_occ / denom_i
+        i = jax.random.choice(k_i, S, p=p_i)
+        p_j_unnorm = jnp.where(jnp.arange(S) == i, 0.0, p_occ)
+        denom_j = jnp.maximum(p_j_unnorm.sum(), occ_tol)
+        p_j = p_j_unnorm / denom_j
+        j = jax.random.choice(k_j, S, p=p_j)
+
+        m_i = m_arr[i]; m_j = m_arr[j]
+        chi_i = chi_arr[i]; chi_j = chi_arr[j]
+        w_i = w_arr[i]; w_j = w_arr[j]
+        g_i = gen[i]; g_j = gen[j]
+        o_i = occ[i]; o_j = occ[j]
+
+        # Soft K-gate: deterministic occupancy flow.  δ = (K_ij/K_max) ·
+        # min(o_i, o_j) — smooth in the kernel params, bounded by the
+        # smaller partner's occupancy so neither slot can go negative.
+        K_ij = _kernel_K_jax(m_i, m_j, a_k, b_k)
+        w_event = K_ij / K_max
+        delta_raw = w_event * jnp.minimum(o_i, o_j)
+
+        # Aligned remnant physics — pair-selection order (matches numpy /
+        # B.1 bit-for-bit; heavier-first is applied only to the record).
+        m_new = _M_rem_jax(m_i, m_j, chi_i, chi_j)
+        chi_new = _chi_rem_jax(m_i, m_j, chi_i, chi_j)
+        v_kick_evt = _v_kick_aligned_jax(m_i, m_j, chi_i, chi_j)
+        retain = _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
+
+        # Net occupancy removed by a FULL-δ step is ``mult · δ`` with
+        # ``mult = 1`` if retained (2 consumed − 1 born) else ``2``.
+        mult = jnp.where(retain, 1.0, 2.0)
+
+        # Depletion-budget cap — division-free, gradient-SAFE.  Cap δ so
+        # this step's net removal cannot overshoot the remaining budget:
+        #   δ_cap = max(budget_left, 0) / mult     (mult ∈ {1, 2})
+        #   δ     = min(δ_raw, δ_cap)
+        # This pins cumulative net removal to R_target exactly (when
+        # δ_raw > δ_cap the step contributes mult·δ_cap = budget_left) and
+        # — crucially — has a BOUNDED gradient.  The earlier form
+        # ``clip_scale = budget_left / max(net_full, occ_tol)`` divided by
+        # the step's own removal, whose derivative −budget_left/net_full²
+        # blows up to inf/NaN as net_full → 0 (e.g. SVI pushing kernel_b
+        # into a regime where most pairs have tiny K).  That NaN poisoned
+        # the whole SVI run under gate="soft" (M4 ELBO → nan) while the
+        # forward pass stayed finite — a backward-only hazard.  ``mult`` is
+        # 1 or 2, so ``budget_left / mult`` has no small-denominator
+        # explosion, and ``minimum`` is gradient-safe.  Once the budget is
+        # spent, δ_cap = 0 ⇒ δ = 0 (cheap no-op steps).
+        delta_cap = jnp.maximum(budget_left, 0.0) / mult
+        delta = jnp.minimum(delta_raw, delta_cap)
+        delta = jnp.where(step_active_now, delta, 0.0)
+        net_this = mult * delta
+
+        # Occupancy updates on the two parents.
+        new_occ = occ.at[i].add(-delta)
+        new_occ = new_occ.at[j].add(-delta)
+
+        # Remnant born into tail slot (n_init + k) — the scan counter is
+        # the static write index, so no write-pointer.  Occupancy δ if
+        # retained, else 0 (the slot stays empty and contributes nothing).
+        tail = n_init + k
+        tail_occ = jnp.where(retain, delta, 0.0)
+        new_m_arr = m_arr.at[tail].set(m_new)
+        new_chi_arr = chi_arr.at[tail].set(chi_new)
+        new_w_arr = w_arr.at[tail].set(0.5 * (w_i + w_j))
+        new_occ = new_occ.at[tail].set(tail_occ)
+        new_gen = gen.at[tail].set(
+            (jnp.maximum(g_i, g_j) + 1).astype(jnp.int32)
+        )
+
+        new_net_removed = net_removed + net_this
+
+        # Per-step records (heavier-first; NaN/0 on non-events).
+        is_event = (delta > occ_tol)
+        heavier_is_i = m_i >= m_j
+        m1_rec = jnp.where(heavier_is_i, m_i, m_j)
+        m2_rec = jnp.where(heavier_is_i, m_j, m_i)
+        chi1_rec = jnp.where(heavier_is_i, chi_i, chi_j)
+        chi2_rec = jnp.where(heavier_is_i, chi_j, chi_i)
+        g1_rec = jnp.where(heavier_is_i, g_i, g_j).astype(m_arr.dtype)
+        g2_rec = jnp.where(heavier_is_i, g_j, g_i).astype(m_arr.dtype)
+        retain_rec = retain.astype(m_arr.dtype)
+        m_rem_rec = jnp.where(retain, m_new, jnp.nan)
+        rec_event = jnp.stack(
+            [m1_rec, m2_rec, chi1_rec, chi2_rec, g1_rec, g2_rec,
+             retain_rec, m_rem_rec]
+        )
+        nan_row = jnp.full_like(rec_event, jnp.nan)
+        rec = jnp.where(is_event, rec_event, nan_row)
+        v_kick_out = jnp.where(is_event, v_kick_evt, jnp.nan)
+        # Occupancy-scaled descendant weight (smooth in kernel params via
+        # δ — no straight-through needed, the B.2 AD headline).
+        w_out = 0.5 * (w_i + w_j) * delta
+        step_flag = is_event.astype(jnp.int32)
+
+        new_carry = (new_m_arr, new_chi_arr, new_w_arr, new_occ, new_gen,
+                     new_net_removed, key)
+        return new_carry, (rec, v_kick_out, w_out, step_flag)
+
+    final_carry, outputs = jax.lax.scan(
+        step_fn, carry0, jnp.arange(n_steps)
+    )
+    (m_f, chi_f, w_f, occ_f, gen_f, net_removed_f, _key_f) = final_carry
+    (mergers_arr, v_kicks_arr, w_mergers_arr, step_flags) = outputs
+
+    W_total = jnp.sum(occ_f * w_f)
+    out_dict = dict(
+        m_active=m_f,
+        chi_active=chi_f,
+        w_active=w_f,
+        gen_active=gen_f,
+        occupancy=occ_f,
+        active_mask=occ_f > occ_tol,
+        mergers=mergers_arr,
+        v_kicks=v_kicks_arr,
+        w_mergers=w_mergers_arr,
+        step_active=step_flags.astype(bool),
+        stats=dict(
+            n_init=n_init,
+            n_steps=int(n_steps),
+            n_slots=int(S),
+            W_total=W_total,
+            net_removed=net_removed_f,
+            depletion=net_removed_f / max(n_init, 1),
+            sum_w_mergers=jnp.sum(w_mergers_arr),
+            orientation="Aligned",
+        ),
+    )
+    return out_dict
+
+
 def _kish_n_eff(weights: np.ndarray) -> float:
     """Kish (1965) effective sample size ``(Σ w)² / Σ w²``.
 
@@ -1370,42 +1670,64 @@ _STAGE1 = dict(
 
 
 def _plot_active_marginals(result: dict, cfg: MCConfig, out_dir: Path) -> None:
+    r"""Raw HISTOGRAMS of the surviving population — no KDE.
+
+    KDE smoothing is murder on the deep-cascade peaks (3G+ remnants pile
+    at discrete ``M_rem`` cascade locations with only ~100 counts/bin, so
+    a kernel bandwidth wide enough to look smooth washes the peaks out).
+    Per the standing preference + ``feedback-gaussian-kde-over-smooths-
+    cascade-peaks``, this smoke driver plots step histograms instead.
+    Occupancy-weighted if the result carries an ``occupancy`` field (the
+    B.2 soft-gate output); uniform otherwise (numpy / B.1).
+    """
     import matplotlib.pyplot as plt
 
-    m_active = result["m_active"]
-    chi_active = result["chi_active"]
+    m_active = np.asarray(result["m_active"])
+    chi_active = np.asarray(result["chi_active"])
     gen_active = result["gen_active"]
+    gen_active = None if gen_active is None else np.asarray(gen_active)
+    # Occupancy weights for the soft-gate output; uniform otherwise.
+    w = result.get("occupancy", None)
+    w = np.ones_like(m_active) if w is None else np.asarray(w)
 
-    m_eval = np.geomspace(cfg.m_min, cfg.m_max * 2, 400)
-    chi_eval = np.linspace(0.001, 0.999, 400)
+    n_bins_m = 40
+    m_edges = np.geomspace(cfg.m_min, cfg.m_max * 2, n_bins_m + 1)
+    m_centers = np.sqrt(m_edges[:-1] * m_edges[1:])
+    m_binw = np.diff(m_edges)
+    n_bins_chi = 50
+    chi_edges = np.linspace(0.0, 1.0, n_bins_chi + 1)
+    chi_centers = 0.5 * (chi_edges[:-1] + chi_edges[1:])
+    chi_binw = np.diff(chi_edges)[0]
 
-    # Total (all surviving particles).
+    def _hist(x, weights, edges, binw):
+        h, _ = np.histogram(x, bins=edges, weights=weights)
+        return h / binw
+
+    # ---- dN/dm (raw step histogram) ----
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    if m_active.size >= 2:
-        dN_dm = make_marginal(m_active, m_eval, kind="kde",
-                              bounds=(cfg.m_min, cfg.m_max * 2), log_space=True)
-        ax.loglog(m_eval, np.maximum(dN_dm, 1e-30), lw=2.0, color="C3",
-                  label=f"all surviving (N={m_active.size})")
-
-    # Per-generation breakdown if tracked.
-    if gen_active is not None:
-        G = int(gen_active.max()) if gen_active.size else 0
+    peak = 0.0
+    if m_active.size >= 1:
+        dN_dm = _hist(m_active, w, m_edges, m_binw)
+        peak = max(peak, dN_dm.max())
+        ax.loglog(m_centers, np.maximum(dN_dm, 1e-30), drawstyle="steps-mid",
+                  lw=2.0, color="C3",
+                  label=f"all surviving (Σw={w.sum():.0f})")
+    if gen_active is not None and gen_active.size:
+        G = int(gen_active.max())
         colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(G, 1)))
         for g in range(1, G + 1):
             mask = gen_active == g
-            n_g = int(mask.sum())
-            if n_g < 2:
+            if int(mask.sum()) < 1:
                 continue
-            dN = make_marginal(m_active[mask], m_eval, kind="kde",
-                               bounds=(cfg.m_min, cfg.m_max * 2), log_space=True)
-            ax.loglog(m_eval, np.maximum(dN, 1e-30), lw=1.4, ls="--",
-                      color=colors[g - 1], label=f"{g}G (N={n_g})")
+            dN = _hist(m_active[mask], w[mask], m_edges, m_binw)
+            ax.loglog(m_centers, np.maximum(dN, 1e-30), drawstyle="steps-mid",
+                      lw=1.3, ls="--", color=colors[g - 1],
+                      label=f"{g}G (Σw={w[mask].sum():.0f})")
     ax.set_xlabel(r"single-BH mass $m \;[M_\odot]$")
-    ax.set_ylabel(r"$dN/dm$ (KDE on surviving particles)")
+    ax.set_ylabel(r"$dN/dm$ (raw histogram, per $M_\odot$)")
     ax.set_title("Backup 1 — pure particle MC, surviving population $dN/dm$")
-    if m_active.size:
-        ax.set_ylim(bottom=float(make_marginal(m_active, m_eval, kind="kde",
-                    bounds=(cfg.m_min, cfg.m_max * 2), log_space=True).max()) * 1e-6)
+    if peak > 0:
+        ax.set_ylim(bottom=peak * 1e-6)
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend(loc="upper right", frameon=False, fontsize="small")
     fig.tight_layout()
@@ -1414,30 +1736,34 @@ def _plot_active_marginals(result: dict, cfg: MCConfig, out_dir: Path) -> None:
     plt.close(fig)
     print(f"  wrote {out}")
 
-    # Spin.
+    # ---- dN/dχ (raw step histogram) ----
     fig, ax = plt.subplots(figsize=(7.5, 5))
-    if chi_active.size >= 2:
-        dN_dchi = make_marginal(chi_active, chi_eval, kind="kde",
-                                bounds=(0.0, 1.0))
-        ax.semilogy(chi_eval, np.maximum(dN_dchi, 1e-30), lw=2.0, color="C3",
-                    label=f"all surviving (N={chi_active.size})")
-    if gen_active is not None:
-        G = int(gen_active.max()) if gen_active.size else 0
+    peak = 0.0
+    if chi_active.size >= 1:
+        dN_dchi = _hist(chi_active, w, chi_edges, chi_binw)
+        peak = max(peak, dN_dchi.max())
+        ax.semilogy(chi_centers, np.maximum(dN_dchi, 1e-30),
+                    drawstyle="steps-mid", lw=2.0, color="C3",
+                    label=f"all surviving (Σw={w.sum():.0f})")
+    if gen_active is not None and gen_active.size:
+        G = int(gen_active.max())
         colors = plt.cm.viridis(np.linspace(0.15, 0.85, max(G, 1)))
         for g in range(1, G + 1):
             mask = gen_active == g
-            n_g = int(mask.sum())
-            if n_g < 2:
+            if int(mask.sum()) < 1:
                 continue
-            dN = make_marginal(chi_active[mask], chi_eval, kind="kde",
-                               bounds=(0.0, 1.0))
-            ax.semilogy(chi_eval, np.maximum(dN, 1e-30), lw=1.4, ls="--",
-                        color=colors[g - 1], label=f"{g}G (N={n_g})")
+            dN = _hist(chi_active[mask], w[mask], chi_edges, chi_binw)
+            ax.semilogy(chi_centers, np.maximum(dN, 1e-30),
+                        drawstyle="steps-mid", lw=1.3, ls="--",
+                        color=colors[g - 1],
+                        label=f"{g}G (Σw={w[mask].sum():.0f})")
     ax.axvline(0.6865, color="0.4", lw=0.7, ls=":", label=r"$\chi_{\rm rem}(1,0)$")
     ax.set_xlabel(r"single-BH spin $\chi$")
-    ax.set_ylabel(r"$dN/d\chi$ (KDE on surviving particles)")
+    ax.set_ylabel(r"$dN/d\chi$ (raw histogram)")
     ax.set_title("Backup 1 — pure particle MC, surviving population $dN/d\\chi$")
     ax.set_xlim(0, 1)
+    if peak > 0:
+        ax.set_ylim(bottom=peak * 1e-4)
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend(loc="upper right", frameon=False, fontsize="small")
     fig.tight_layout()

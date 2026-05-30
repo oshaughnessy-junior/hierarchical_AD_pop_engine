@@ -790,6 +790,16 @@ def build_gaussian_coagulation(
     # parity).  See
     # ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` § 5.
     mc_jax_k_ratio: float = 1.5,
+    # Session B.2 (soft K-gate): selects the cascade gate mechanism.
+    # ``"bernoulli"`` keeps the round-3 B.1 path (default, unchanged);
+    # ``"soft"`` routes to particle_mc_jax_soft — deterministic
+    # occupancy-flow gate that removes the k_ratio precision knob and the
+    # straight-through bias.  See
+    # ``demo/PLAN_jax_mc_time_decoupling_diagnosis.md`` § 5.B.2 and
+    # ``project-jax-mc-b2-soft-gate-followup``.  ``mc_jax_n_steps_mult``
+    # sizes the soft path's n_steps upper bound (ignored under bernoulli).
+    mc_jax_gate: str = "bernoulli",
+    mc_jax_n_steps_mult: float = 3.0,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -895,6 +905,8 @@ def build_gaussian_coagulation(
             depletion_fraction=mc_depletion_fraction,
             n_steps=mc_jax_n_steps,
             k_ratio=float(mc_jax_k_ratio),
+            gate=mc_jax_gate,
+            n_steps_mult=float(mc_jax_n_steps_mult),
         )
         import equinox as _eqx
         response = _eqx.tree_at(
