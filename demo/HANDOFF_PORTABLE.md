@@ -229,9 +229,31 @@ If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
 * Mock catalogue with **multi-sample-per-event** posteriors + matching
   `ln_offsets` (reference-prior log-weights) — the bridge already handles
   the `(n_events, n_samples, 4)` shape via vmap; M4 used 1 sample/event.
-* **Add `pdet(θ)` selection** (Stage 2): analytic SNR surrogate
-  `SNR ∝ m_chirp^{5/6}`, threshold 8, `expit`-smoothed → fold into a
-  `pdet`-weighted `poisson_mean_estimator` (Monte-Carlo the VT integral).
+* **DONE (2026-05-30): `pdet(θ)` / VT(θ) selection.**
+  `src/hierarchical_ad_pop_engine/inference/selection.py` — the detected-rate
+  Poisson mean `μ = T_obs·∫ VT(x)·intensity(x) d⁴x` (Stage-1 was flat `VT≡1`).
+  `vt_powerlaw` is the primary toy: Euclidean sensitive volume
+  `VT ∝ M_chirp^{15/6}` (the `SNR ∝ M_chirp^{5/6}` scaling cubed into
+  `V ∝ SNR³`) — smooth, AD-clean, **no threshold/smoothing scale**;
+  `exponent=0` recovers flat.  `snr_threshold_pdet` is the declared
+  `expit(SNR−8)` horizon surrogate (PLAN option *a*, explicit `steepness`).
+  `make_vt_poisson_mean_estimator` is the gwkokab `(model,**kw)->(μ,var)`
+  estimator: a **deterministic** separable-grid integral of the black-box
+  `exp(model.log_prob)` on `m₁×m₂×χ₁×χ₂` (log-trapezoid mass measure, matching
+  `MCEvaluatorJax.total_rate`), so it is *solver-agnostic* and **exactly linear
+  in VT** → reduces to `make_flat_grid_poisson_mean_estimator` at `VT≡1`.
+  `var=0` (deterministic; keep `variance_cut_threshold=None`).  Drops into the
+  Stage-1 wiring via `poisson_mean_estimator=...` /
+  `build_coagulation_likelihood(poisson_mean_estimator=...)`.  Tests
+  `tests/test_gwkokab_selection.py`: S1–S9 (chirp-mass closed form,
+  `M_chirp^{15/6}` scaling, VT linearity, `T_obs` scaling, `pdet≤flat`, AD
+  nonzero in rate+shape, the `(μ,var)` contract) in the lightweight sandbox;
+  S10 (plug into the REAL `analytical_poisson_likelihood_fn` + `jax.grad`)
+  `importorskip`-gated, **green in-VM via the RIFT stub**.  NB the grid spans
+  the model box `[m_min, m_max_factor·m_max]` and is INDEPENDENT of
+  `evaluator.total_rate` — the §4.3 metric bias stays orthogonal; for a flat
+  baseline under selection use `make_flat_grid_poisson_mean_estimator` (same
+  method), not the bridge's grid `coagulation_poisson_mean_estimator`.
 * **Two-pulse natal IMF** + float `kernel_a` (10 params).
 * Open questions (PLAN_gwkokab_fit.md): `ScaledMixture.sample` vs
   inverse-CDF for mock gen; cleanest `pdet` API (callable vs injection
@@ -421,9 +443,10 @@ sessions before.
 * **B.2 soft gate** — DONE, green both gates, uncommitted.  (this file)
 * **total_rate metric bias** — OPEN; gate-independent KDE+quadrature; §4.3.
 * **gwkokab Stage 2** — IN PROGRESS; priors/variables/variables_index wiring
-  DONE + green (incl. real-gwkokab W7–W9 via the RIFT stub), §4.2.  Remaining:
-  multi-sample mock catalogue + `ln_offsets`, `pdet(θ)` selection, the 2-pulse
-  10-param model, and a runnable end-to-end SVI/NUTS fit on cardassia.
+  (`stage1_wiring.py`) AND `pdet(θ)`/VT selection (`selection.py`) DONE + green
+  (incl. real-gwkokab W7–W9 / S10 via the RIFT stub), §4.2.  Remaining:
+  multi-sample mock catalogue + `ln_offsets`, the 2-pulse 10-param model, and a
+  runnable end-to-end SVI/NUTS fit on cardassia.
 * **J2b non-Aligned MC** — NOT STARTED; §4.4.
 * **implicit/Picard revisit** — DEFERRED to after gwkokab ships (user).
 * **aligned-χ cascade under-resolution / dN/dχ_eff engine-MC bias** —
