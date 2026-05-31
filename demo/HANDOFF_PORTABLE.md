@@ -296,7 +296,26 @@ If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
   `AutoNormal(init_scale=0.1)` + `optax.clip_by_global_norm` + lr 0.01.  **NUTS
   at n_seed=300 OOMs the 3.9 GB VM** → full-resolution NUTS is a workstation
   task.  Figs `demo/figures/stage1_posterior_{svi,nuts}.png`.
-* **Two-pulse natal IMF** + float `kernel_a` (10 params).
+* **DONE (2026-05-30): observables recovery — PPC/PPD.**
+  `demo/ppc_stage1_gwkokab.py` forward-models the population at each posterior
+  draw (MC per posterior point) → component-mass & component-spin **PPD bands**
+  (median + 90%) vs the observed catalogue + an **event scatter over the
+  predicted 2-D density**.  `--detection {none,vt}` = intrinsic PPC (band
+  straddles data = goodness-of-fit, consistent with the flat fit) vs the
+  `M_chirp^{15/6}` detection-weighted view; `--gate {soft,bernoulli}`.  The
+  per-draw forward map is **jitted once** (`forward_one`: build + sample + JAX
+  histogram) — eager per-draw builds OOM the VM.  `sample_from_model` gained an
+  optional `vt_fn` and is now jit-safe (dropped a `float()`).  **Findings:**
+  intrinsic PPD bands straddle the observed mass & spin histograms (good fit);
+  the soft gate NaNs SVI on the detection-weighted (higher-mass) catalogue →
+  **`--gate bernoulli` is the SVI-robust choice** there.  Figs
+  `stage1_ppd_mass_spin_{none,vt}.png`, `stage1_ppc_scatter_{none,vt}.png`.
+  **► User runbook + look-ahead: `demo/INSTRUCTIONS_gwkokab_stage1.md`** (how to
+  run all 3 demos, the env/stub recipe, gotchas, and the two-pulse / Fisher-κ
+  methods-paper plan with prerequisites).
+* **Two-pulse natal IMF** + float `kernel_a` (10 params) — the next escalation;
+  see INSTRUCTIONS §5–6.  Needs a two-pulse natal builder; the Fisher-κ
+  alignment experiments are gated on J2b (non-Aligned MC, §4.4).
 * Open questions (PLAN_gwkokab_fit.md): `ScaledMixture.sample` vs
   inverse-CDF for mock gen; cleanest `pdet` API (callable vs injection
   set).  Acceptance: 10-param recovery, truth in 90% CI, `μ₁<μ₂` ordering.
@@ -489,10 +508,11 @@ sessions before.
   (incl. real-gwkokab W7–W9 / S10 via the RIFT stub), §4.2.  Multi-sample mock
   catalogue + single-pulse identifiability/recovery DONE too (all 6 params
   identified, unique origin; `mock_catalog.py` + `fit_stage1_gwkokab.py`).
-  Full SVI/NUTS posterior on the single-pulse toy DONE (SVI 6/6 coverage; NUTS
-  5/6 cross-check; `posterior_stage1_gwkokab.py`).  Remaining: the 2-pulse
-  10-param model, full-resolution NUTS (workstation, VM OOMs at n_seed=300),
-  and the `kernel_b`/`spin_loc` weak-ID follow-up.
+  Full SVI/NUTS posterior + observables-recovery PPC/PPD on the single-pulse
+  toy DONE (SVI 6/6 coverage; NUTS 5/6; PPD bands straddle the data;
+  `posterior_stage1_gwkokab.py` + `ppc_stage1_gwkokab.py`; user runbook
+  `demo/INSTRUCTIONS_gwkokab_stage1.md`).  Remaining: the 2-pulse 10-param model
+  + full-resolution NUTS (workstation), then J2b-gated Fisher-κ experiments.
 * **J2b non-Aligned MC** — NOT STARTED; §4.4.
 * **implicit/Picard revisit** — DEFERRED to after gwkokab ships (user).
 * **aligned-χ cascade under-resolution / dN/dχ_eff engine-MC bias** —
