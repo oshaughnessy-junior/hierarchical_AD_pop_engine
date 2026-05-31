@@ -167,6 +167,12 @@ def main():
         widths = jnp.diff(edges)
         return counts / (jnp.sum(counts) * widths)
 
+    # keep a fixed subsample of each draw's predicted events so the scatter
+    # density is the FULL posterior-predictive (pooled over draws), not a single
+    # median-model realization — individual draws reach lower masses than the
+    # median, so the median density spuriously excludes low-m2 injections.
+    n_cloud_keep = min(args.n_pred, 600)
+
     @jax.jit
     def forward_one(theta_vec, pk):
         th = {p: theta_vec[i] for i, p in enumerate(PARAM_NAMES)}
@@ -174,17 +180,20 @@ def main():
         pred = fit.sample_pairs_from_particles(mdl, args.n_pred, pk, vt_fn=vt_fn)
         comp_m = jnp.concatenate([pred[:, 0], pred[:, 1]])
         comp_chi = jnp.concatenate([pred[:, 2], pred[:, 3]])
-        return _hist_density(comp_m, m_edges), _hist_density(comp_chi, chi_edges)
+        return (_hist_density(comp_m, m_edges), _hist_density(comp_chi, chi_edges),
+                pred[:n_cloud_keep])
 
     # jit once → bounded memory + fast across all draws (per-draw EAGER builds
     # otherwise accumulate device buffers and OOM the 3.9 GB VM).
     m_dens = np.zeros((len(draws), m_cent.size))
     chi_dens = np.zeros((len(draws), chi_cent.size))
+    cloud_parts = []
     pred_keys = jax.random.split(k_pred, len(draws))
     for d, (row, pk) in enumerate(zip(draws, pred_keys)):
-        mh, ch = forward_one(jnp.asarray(row), pk)
+        mh, ch, psub = forward_one(jnp.asarray(row), pk)
         m_dens[d] = np.asarray(mh)
         chi_dens[d] = np.asarray(ch)
+        cloud_parts.append(np.asarray(psub))
         if d % 10 == 0:
             print(f"   draw {d}/{len(draws)}", flush=True)
 
@@ -196,10 +205,8 @@ def main():
     obs_m = np.concatenate([obs_pts[:, 0], obs_pts[:, 1]])
     obs_chi = np.concatenate([obs_pts[:, 2], obs_pts[:, 3]])
 
-    # --- median-model predicted 2-D density (big cloud) for the scatter ------
-    med_model = dist_fn(**median_theta)
-    cloud = np.asarray(fit.sample_pairs_from_particles(
-        med_model, 15000, jax.random.PRNGKey(args.seed + 99), vt_fn=vt_fn))
+    # --- posterior-predictive 2-D density (pooled over ALL draws) for scatter -
+    cloud = np.concatenate(cloud_parts, axis=0)
 
     # persist the computed bands so figures survive a killed/again run
     np.savez(_DEMO / "figures" / f"stage1_ppc_data_{args.detection}.npz",
