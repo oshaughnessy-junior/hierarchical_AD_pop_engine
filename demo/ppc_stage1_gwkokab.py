@@ -17,9 +17,10 @@ selection (the "detection-weighted" view); default ``none`` is the intrinsic
 PPC consistent with the flat-selection fit (the band should straddle the data —
 the actual goodness-of-fit check).
 
-Forward sampling reuses ``fit_stage1_gwkokab.sample_from_model`` (inverse-CDF on
-the model's own pair intensity, optionally ``vt``-weighted), so it is
-solver-agnostic.
+Forward sampling uses ``fit_stage1_gwkokab.sample_pairs_from_particles`` —
+**grid-free**: it resamples the engine's own MC particle pool into binary pairs
+``∝ K·w_i·w_j·VT`` (the discrete high-χ 2G remnant spins are represented
+exactly; no density grid or KDE).
 
 Run (full stack; in the Cowork VM use the RIFT stub — HANDOFF_PORTABLE §4.2):
 
@@ -72,7 +73,7 @@ def main():
     ap.add_argument("--n-draws", type=int, default=80,
                     help="posterior draws forward-modelled for the PPD band")
     ap.add_argument("--n-pred", type=int, default=2000,
-                    help="predicted events sampled per posterior draw")
+                    help="predicted binary pairs resampled per posterior draw")
     ap.add_argument("--detection", choices=["none", "vt"], default="none")
     ap.add_argument("--gate", choices=["soft", "bernoulli"], default="soft",
                     help="cascade K-gate; bernoulli (B.1) is more SVI-robust")
@@ -104,11 +105,13 @@ def main():
 
     truth_model = dist_fn(**theta_star)
     k_true, k_scat = jax.random.split(k_cat, 2)
-    obs_true = fit.sample_from_model(truth_model, args.n_obs, k_true,
-                                     m_lo=fixed["m_min"], m_hi=m_hi, vt_fn=vt_fn)
+    obs_true = fit.sample_pairs_from_particles(truth_model, args.n_obs, k_true,
+                                               vt_fn=vt_fn)
     events = scatter_to_posteriors(obs_true, args.n_samples, k_scat, m_hi=m_hi)
     ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
-    obs_pts = np.asarray(jnp.mean(events, axis=1))  # per-event PE mean → (N,4)
+    # plot the INJECTIONS (obs_true) — the PPD predicts the astrophysical
+    # distribution; the per-event PE mean would distort it (regression to mean).
+    obs_pts = np.asarray(obs_true)
     print(f"[cat] events {tuple(events.shape)}; log_rate*={theta_star['log_rate']:.3f}")
 
     # --- posterior via robust SVI -------------------------------------------
@@ -151,7 +154,7 @@ def main():
     print(f"[post] {len(stack)} finite draws; forward-modelling {len(draws)}")
 
     # --- forward-model each posterior draw → predicted component m, χ --------
-    m_bins = np.linspace(fixed["m_min"], 0.7 * m_hi, 41)
+    m_bins = np.geomspace(fixed["m_min"], 0.7 * m_hi, 41)  # log-spaced for log-x
     chi_bins = np.linspace(0.0, 1.0, 31)
     m_cent = 0.5 * (m_bins[:-1] + m_bins[1:])
     chi_cent = 0.5 * (chi_bins[:-1] + chi_bins[1:])
@@ -168,8 +171,7 @@ def main():
     def forward_one(theta_vec, pk):
         th = {p: theta_vec[i] for i, p in enumerate(PARAM_NAMES)}
         mdl = dist_fn(**th)
-        pred = fit.sample_from_model(mdl, args.n_pred, pk, m_lo=fixed["m_min"],
-                                     m_hi=m_hi, vt_fn=vt_fn, n_sm=16, n_sc=6)
+        pred = fit.sample_pairs_from_particles(mdl, args.n_pred, pk, vt_fn=vt_fn)
         comp_m = jnp.concatenate([pred[:, 0], pred[:, 1]])
         comp_chi = jnp.concatenate([pred[:, 2], pred[:, 3]])
         return _hist_density(comp_m, m_edges), _hist_density(comp_chi, chi_edges)
@@ -196,9 +198,8 @@ def main():
 
     # --- median-model predicted 2-D density (big cloud) for the scatter ------
     med_model = dist_fn(**median_theta)
-    cloud = np.asarray(fit.sample_from_model(
-        med_model, 15000, jax.random.PRNGKey(args.seed + 99),
-        m_lo=fixed["m_min"], m_hi=m_hi, vt_fn=vt_fn, n_sm=16, n_sc=6))
+    cloud = np.asarray(fit.sample_pairs_from_particles(
+        med_model, 15000, jax.random.PRNGKey(args.seed + 99), vt_fn=vt_fn))
 
     # persist the computed bands so figures survive a killed/again run
     np.savez(_DEMO / "figures" / f"stage1_ppc_data_{args.detection}.npz",
@@ -211,6 +212,26 @@ def main():
     print("\n=== DONE ===")
 
 
+def _ppd_panel(ax, cent, lo, med, hi, obs, bins, xlabel, *,
+               logx=False, logy=False):
+    if logy:
+        floor = max(float(np.max(med)), 1e-30) * 1e-4
+        lo = np.clip(lo, floor, None)
+        med = np.clip(med, floor, None)
+        hi = np.clip(hi, floor, None)
+    ax.fill_between(cent, lo, hi, color="C0", alpha=0.3, label="90% band")
+    ax.plot(cent, med, color="C0", lw=2, label="posterior median")
+    ax.hist(obs, bins=bins, density=True, histtype="step", color="C3", lw=2,
+            label="injections")
+    if logx:
+        ax.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(r"$p$ (log)" if logy else r"$p$")
+    ax.grid(True, which="both", ls=":", alpha=0.4)
+
+
 def _figures(args, m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
              chi_cent, c_lo_, c_med, c_hi_, obs_chi, chi_bins,
              obs_pts, cloud, fixed):
@@ -221,48 +242,45 @@ def _figures(args, m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
     tag = args.detection
     figdir = _DEMO / "figures"
     figdir.mkdir(exist_ok=True)
+    m_xlabel = r"component mass $m\ [M_\odot]$"
+    chi_xlabel = r"component spin $\chi$"
 
-    # PPD in mass + spin
-    fig, ax = plt.subplots(1, 2, figsize=(13, 5))
-    ax[0].fill_between(m_cent, m_lo_, m_hi_, color="C0", alpha=0.3,
-                       label="90% predictive band")
-    ax[0].plot(m_cent, m_med, color="C0", lw=2, label="posterior median")
-    ax[0].hist(obs_m, bins=m_bins, density=True, histtype="step",
-               color="C3", lw=2, label="observed (component)")
-    ax[0].set_xlabel(r"component mass $m\ [M_\odot]$")
-    ax[0].set_ylabel(r"$p(m)$ (normalised)")
-    ax[0].set_title(f"Mass PPD ({tag} selection)")
-    ax[0].legend(fontsize=9)
-    ax[0].grid(True, ls=":", alpha=0.4)
-
-    ax[1].fill_between(chi_cent, c_lo_, c_hi_, color="C0", alpha=0.3,
-                       label="90% predictive band")
-    ax[1].plot(chi_cent, c_med, color="C0", lw=2, label="posterior median")
-    ax[1].hist(obs_chi, bins=chi_bins, density=True, histtype="step",
-               color="C3", lw=2, label="observed (component)")
-    ax[1].set_xlabel(r"component spin $\chi$")
-    ax[1].set_ylabel(r"$p(\chi)$ (normalised)")
-    ax[1].set_title(f"Spin PPD ({tag} selection)")
-    ax[1].legend(fontsize=9)
-    ax[1].grid(True, ls=":", alpha=0.4)
-    fig.suptitle("Stage-1 posterior-predictive distributions "
-                 f"(N={args.n_obs}, {args.n_draws} draws × {args.n_pred} pred)")
+    # PPD: rows = {linear-y, log-p y}; cols = {mass (log-x), spin}.
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+    _ppd_panel(ax[0, 0], m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
+               m_xlabel, logx=True)
+    _ppd_panel(ax[0, 1], chi_cent, c_lo_, c_med, c_hi_, obs_chi, chi_bins,
+               chi_xlabel)
+    _ppd_panel(ax[1, 0], m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
+               m_xlabel, logx=True, logy=True)
+    _ppd_panel(ax[1, 1], chi_cent, c_lo_, c_med, c_hi_, obs_chi, chi_bins,
+               chi_xlabel, logy=True)
+    ax[0, 0].set_title("Mass PPD — linear")
+    ax[0, 1].set_title("Spin PPD — linear")
+    ax[1, 0].set_title(r"Mass PPD — $\log p$ (dynamic range)")
+    ax[1, 1].set_title(r"Spin PPD — $\log p$ (the 2G high-$\chi$ bump)")
+    ax[0, 0].legend(fontsize=9)
+    fig.suptitle(f"Stage-1 posterior-predictive distributions "
+                 f"({tag} selection; N={args.n_obs}, {args.n_draws} draws × "
+                 f"{args.n_pred} pred pairs; particle-resampled)")
     fig.tight_layout()
     out1 = figdir / f"stage1_ppd_mass_spin_{tag}.png"
     fig.savefig(out1, dpi=140)
     print(f"[fig] {out1}")
 
-    # Event scatter over predicted 2-D density
-    fig2, axs = plt.subplots(figsize=(6.5, 6))
-    h, xe, ye = np.histogram2d(cloud[:, 0], cloud[:, 1], bins=60,
-                               range=[[fixed["m_min"], 0.7 * fixed["m_max"] * 2.5],
-                                      [fixed["m_min"], 0.7 * fixed["m_max"] * 2.5]])
-    axs.pcolormesh(xe, ye, h.T, cmap="Blues", shading="auto")
-    axs.scatter(obs_pts[:, 0], obs_pts[:, 1], s=22, facecolor="none",
-                edgecolor="C3", lw=1.2, label="observed events")
+    # Event scatter over predicted 2-D density (log-log mass plane)
+    fig2, axs = plt.subplots(figsize=(6.8, 6.2))
+    hi_m = 0.7 * fixed["m_max"] * 2.5
+    edges = np.geomspace(fixed["m_min"], hi_m, 60)
+    h, xe, ye = np.histogram2d(cloud[:, 0], cloud[:, 1], bins=[edges, edges])
+    axs.pcolormesh(xe, ye, np.log10(h.T + 1.0), cmap="Blues", shading="auto")
+    axs.scatter(obs_pts[:, 0], obs_pts[:, 1], s=24, facecolor="none",
+                edgecolor="C3", lw=1.3, label="injections")
+    axs.set_xscale("log")
+    axs.set_yscale("log")
     axs.set_xlabel(r"$m_1\ [M_\odot]$")
     axs.set_ylabel(r"$m_2\ [M_\odot]$")
-    axs.set_title(f"Events over predicted population density ({tag})")
+    axs.set_title(f"Events over predicted density — $\\log_{{10}}$ counts ({tag})")
     axs.legend(fontsize=9, loc="upper left")
     fig2.tight_layout()
     out2 = figdir / f"stage1_ppc_scatter_{tag}.png"

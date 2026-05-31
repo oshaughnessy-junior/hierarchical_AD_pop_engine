@@ -74,6 +74,45 @@ def _unpack(theta):
     return {k: theta[i] for i, k in enumerate(PARAM_NAMES)}
 
 
+def sample_pairs_from_particles(model, n_events, key, *, vt_fn=None):
+    r"""Grid-free MC draw of ``(N,4)`` binary events by **resampling the engine's
+    own particles** — the correct Monte-Carlo way (no grid, no KDE).
+
+    The mc_jax cascade leaves a pool of single-BH particles
+    ``(m_active, chi_active, weights)`` (the surviving remnants across all
+    generations; zero weight = inactive slot).  A merging binary is a pair
+    ``(i, j)`` drawn with probability ``∝ K(m_i,m_j)·w_i·w_j·VT(m_i,m_j)``
+    (the pair rate density evaluated on the particles), and the event is just
+    the two particles' actual masses and spins — so the discrete high-χ 2G+
+    remnant spins are represented EXACTLY, with none of the resolution loss a
+    density grid or KDE would impose.
+
+    ``vt_fn(m1,m2,χ1,χ2)`` (optional) detection-weights the pair draw.
+    Self-pairs (``i==j``) are excluded.  jit-safe.
+    """
+    from hierarchical_ad_pop_engine.evaluation.mc_jax import _log_pairing_kernel_jax
+
+    ev = model._response.mc_jax_response.evaluator
+    m = ev.m_active
+    chi = ev.chi_active
+    w = ev.weights
+    n = m.shape[0]
+
+    logK = _log_pairing_kernel_jax(m[:, None], m[None, :], ev.kernel_a, ev.kernel_b)
+    P = jnp.exp(logK) * w[:, None] * w[None, :]
+    if vt_fn is not None:
+        P = P * vt_fn(m[:, None], m[None, :], jnp.zeros(()), jnp.zeros(()))
+    P = P * (1.0 - jnp.eye(n))          # no self-pairs
+    p = (P / jnp.sum(P)).reshape(-1)
+
+    idx = jax.random.choice(key, n * n, shape=(n_events,), p=p)
+    i, j = idx // n, idx % n
+    m1, m2, c1, c2 = m[i], m[j], chi[i], chi[j]
+    hi = m1 >= m2                        # order m1 >= m2, carry spins
+    return jnp.stack([jnp.where(hi, m1, m2), jnp.where(hi, m2, m1),
+                      jnp.where(hi, c1, c2), jnp.where(hi, c2, c1)], axis=-1)
+
+
 def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8,
                       vt_fn=None):
     r"""Self-consistent mock: inverse-CDF draw of ``(N,4)`` true events from the
