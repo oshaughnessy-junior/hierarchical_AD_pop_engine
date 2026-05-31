@@ -110,26 +110,54 @@ python3 demo/ppc_stage1_gwkokab.py --detection none --n-draws 80 --n-pred 2000 \
 
 ## 5. Next: two-pulse + full-resolution NUTS (the fun run)
 
-On cardassia, the immediately-doable escalation:
+### 5.0 Two-pulse natal IMF — LANDED 2026-05-30 (`natal_family="two_gaussian"`)
 
-1. **Two-pulse natal IMF.**  Needs a `build_two_pulse_coagulation` (or a
-   `natal_family="two_gaussian"` arm): natal density
-   `(1−λ)·N(μ₁,σ₁) + λ·N(μ₂,σ₂)`, +1 weight + 2 location/scale params, and
-   `kernel_a` floated → 10 free params.  Extend `stage1_wiring`'s
-   `STAGE1_PARAM_NAMES`/priors and the `dist_fn` keyword set; everything
-   downstream (likelihood, selection, PPC) is param-count-agnostic.
-2. **Full-resolution NUTS** (n_seed≥2000, n_obs≥100) with the `--gate bernoulli`
-   robustness; report r̂ and the corner.  Watch the μ₁↔μ₂ label switch — order
-   the centres (`μ₁<μ₂`) or parameterise `μ₂=μ₁+Δμ, Δμ>0`.
+The two-pulse stack is **built and sandbox-validated**; only the
+full-stack run (gwkokab analytical-Poisson) is workstation-tier.  What
+shipped, bottom-up:
+
+| layer | what |
+|---|---|
+| `natal/mass.py` | `log_natal_mass_two_gaussian(m, mu_1, sigma_1, mu_2, sigma_2, lambda_2, m_min, m_max)` — normalised mix of two truncnorms (each independently normalised ⇒ mix is too). |
+| `red_team/backup_particle_mc.py` | `MCConfig` + `mu_natal_2`/`sigma_natal_2`/`lambda_natal` (all `None` ⇒ single-pulse, bit-for-bit). `sample_natals_jax` grows an **IS-weight two-pulse branch**: masses drawn from a *fixed 50/50* mixture proposal, the true λ-mixture carried through smooth per-particle weights `w = f_mix(m;λ)/(½c₁+½c₂)`. **λ enters only the weight numerator ⇒ its gradient flows** (hard component assignment would zero it — see the chosen design). |
+| `response/coagulation.py` | `_natal_log_density` dispatch on `natal_mass_kind=="two_gaussian"`; new `build_two_pulse_coagulation(...)` (twin of `build_gaussian_coagulation`, shares the solver-attach tail via `_finalize_response_solver`). |
+| `response/mc_jax.py` | accepts `natal_mass_kind ∈ {gaussian, two_gaussian}`; threads pulse-2 params into `MCConfig`. |
+| `inference/gwkokab_bridge.py` | `make_coagulation_dist_fn(..., natal_family="two_gaussian", float_kernel_a=True)` → 9/10-keyword `dist_fn`. |
+| `inference/stage1_wiring.py` | `TWO_PULSE_PARAM_NAMES` (10), `two_pulse_prior_factories()`, `build_two_pulse_variables()`. Label switch broken **structurally**: disjoint mass windows `μ₁∈(5,20)`, `μ₂∈(20,50)` (gwkokab's `JointDistribution` takes independent marginals, so no `OrderedTransform`). |
+| `demo/fit_two_pulse_gwkokab.py` | identifiability profiles + AD-MAP + `--label-switch-probe` (MAP from a swapped start, confirm truth ordering) + a **natal-IMF reconstruction figure** (`two_pulse_natal_recovery.png`) — the methods-paper headline. |
+| `tests/test_two_pulse_natal.py` | 7 sandbox invariants (density norm, IS unbiasedness, λ/μ₁/μ₂ AD-vs-FD, single-pulse regression, **full-cascade AD in λ**, both-pulses-seed-pool). 7/7 green; existing single-pulse suite 24/24 unaffected. |
+
+**Run the two-pulse identifiability/recovery (cardassia or VM+RIFT-stub):**
+```bash
+python3 demo/fit_two_pulse_gwkokab.py --n-obs 60 --n-samples 5 \
+    --n-seed 600 --k-max 3 --map-steps 200 --label-switch-probe
+#   → demo/figures/two_pulse_identifiability_profiles.png
+#   → demo/figures/two_pulse_natal_recovery.png   (PROMOTE to paper)
+```
+
+Sandbox AD payoff measured: `d⟨m⟩/dλ` AD-vs-FD rel 1.6e-8 through the
+pool, and through the **full `particle_mc_jax_soft` cascade** rel 1.6e-8 —
+so SVI/NUTS recovery of λ is unblocked end-to-end.
+
+**Still workstation-tier:** the SVI/NUTS posterior on all 10 params, and
+the full-resolution corner.  Mirror `posterior_stage1_gwkokab.py` with the
+10-param `build_two_pulse_variables`; reuse the §4 gotchas verbatim.
+
+### 5.1 Full-resolution NUTS
+
+**Full-resolution NUTS** (n_seed≥2000, n_obs≥100) with the `--gate bernoulli`
+robustness; report r̂ and the corner.  The μ₁↔μ₂ label switch is already
+broken by the disjoint-window priors above; if a future experiment needs
+*overlapping* pulses, switch to a `μ₂=μ₁+Δμ, Δμ>0` reparam in the `dist_fn`.
 
 ## 6. Methods-paper experiments (and their prerequisites)
 
 The three scenarios you flagged, in dependency order:
 
-* **(easiest) Two-component, small initial spins — inject at 10 & 30 M⊙.**
-  The cleanest two-pulse demo: two near-zero-spin natal pulses at 10 and 30 M⊙.
-  Only needs the two-pulse IMF (§5.1); spins stay the existing narrow natal
-  truncnorm.  Good first two-pulse recovery + label-switch test.
+* **(easiest — NOW UNBLOCKED) Two-component, small initial spins — inject at
+  10 & 30 M⊙.**  The two-pulse IMF landed (§5.0); `demo/fit_two_pulse_gwkokab.py`
+  is the recovery + label-switch demo.  Remaining: run it full-stack on
+  cardassia + the 10-param SVI/NUTS posterior.
 * **Natal alignment — one-pulse, vary Fisher κ, recover κ.**  Requires **J2b**
   (non-Aligned vector physics in the mc_jax soft gate: per-event orientation
   sampling + vector Barausse-Rezzolla spin / Lousto-Zlochower kick + retention).
@@ -141,9 +169,14 @@ The three scenarios you flagged, in dependency order:
   J2b (a Fisher-family likelihood vs Aligned-truth data).  A clean
   model-misspecification study once the Fisher MC path exists.
 
-So: **two-pulse small-spin** is reachable with just the two-pulse IMF; both
-**Fisher-κ** experiments are gated on **J2b** (the next engine milestone after
-the two-pulse fit).
+So: **two-pulse small-spin** is reachable with just the two-pulse IMF (DONE,
+§5.0); both **Fisher-κ** experiments are gated on **J2b** (the next engine
+milestone).  **J2b is now scaffolded** — see `demo/PLAN_j2b_vector_mc.md`: the
+primitive audit + AD de-risk is done (Fisher.sample is κ-reparametrised; the
+`*_at_orientation` vector remnants are AD-clean; sandbox κ→χ_rem AD-vs-FD rel
+1.8e-7, v_esc→retain rel 1.4e-6), so the milestone is pure wiring of an
+orientation-sampled + soft-retention remnant step into `particle_mc_jax_soft`
+(exact insertion site `red_team/backup_particle_mc.py:1353-1356`).
 
 ---
 

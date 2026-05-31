@@ -185,6 +185,29 @@ class MCConfig:
     # and just wants to inject the resulting weights.
     weight_array: Optional[np.ndarray] = None
 
+    # ------------------------------------------------------------------
+    # Two-pulse natal IMF (``natal_family="two_gaussian"``) — the
+    # methods-paper two-component experiment (INSTRUCTIONS_gwkokab_stage1
+    # §5.1).  All three default ``None`` ⇒ single-pulse, and every code
+    # path is bit-for-bit unchanged (``_two_pulse_active`` is ``False``).
+    #
+    # When set, the natal mass marginal becomes the normalised mixture
+    #   (1 − λ)·TruncN(μ₁, σ₁) + λ·TruncN(μ₂, σ₂)
+    # with ``(μ₁, σ₁) = (mu_natal, sigma_natal)`` the FIRST pulse and
+    # ``(μ₂, σ₂) = (mu_natal_2, sigma_natal_2)`` the second; ``λ =
+    # lambda_natal`` the weight of pulse 2.  The natal SPIN marginal is
+    # the single ``natal_spin_{loc,scale}`` truncnorm shared by both
+    # pulses (the two-pulse experiments hold spins narrow + common).
+    #
+    # AD: the JAX sampler routes λ through SMOOTH importance weights
+    # (fixed 50/50 mixture proposal; λ enters only the weight numerator)
+    # so SVI/NUTS can recover λ, μ₁, μ₂, σ₁, σ₂ — see
+    # :func:`sample_natals_jax`.  Caller owns the μ₁ < μ₂ label-switch
+    # convention.
+    mu_natal_2: Optional[float] = None
+    sigma_natal_2: Optional[float] = None
+    lambda_natal: Optional[float] = None
+
 
 def _orientation_is_aligned(orientation: object) -> bool:
     """``True`` if ``orientation`` should route to the v1 scalar path.
@@ -445,22 +468,77 @@ def sample_natals(
 # (this is what unblocks the eventual M4 SVI integration test under
 # ``solver="mc_jax"``).
 # ===========================================================================
+def _two_pulse_active(cfg: MCConfig) -> bool:
+    r"""``True`` iff the two-pulse natal mass marginal is configured.
+
+    Activated by ``cfg.lambda_natal is not None``.  In that case
+    ``mu_natal_2`` and ``sigma_natal_2`` must also be set.  When
+    ``False`` every natal code path is the bit-for-bit single-pulse v1.
+    """
+    if cfg.lambda_natal is None:
+        return False
+    if cfg.mu_natal_2 is None or cfg.sigma_natal_2 is None:
+        raise ValueError(
+            "two-pulse natal requires mu_natal_2 and sigma_natal_2 to be "
+            "set alongside lambda_natal"
+        )
+    return True
+
+
+def _two_pulse_mass_component_logpdfs_jax(m, cfg: MCConfig):
+    r"""``(log c₁(m), log c₂(m))`` — the two truncnorm mass components.
+
+    Each component is a truncated normal on ``[m_min, m_max]``; returned
+    in log space.  AD-clean in ``mu_natal{,_2}`` / ``sigma_natal{,_2}``.
+    """
+    from jax.scipy.stats import truncnorm as _jt
+    m_min = jnp.asarray(cfg.m_min)
+    m_max = jnp.asarray(cfg.m_max)
+    mu1 = jnp.asarray(cfg.mu_natal)
+    sig1 = jnp.asarray(cfg.sigma_natal)
+    mu2 = jnp.asarray(cfg.mu_natal_2)
+    sig2 = jnp.asarray(cfg.sigma_natal_2)
+    a1, b1 = (m_min - mu1) / sig1, (m_max - mu1) / sig1
+    a2, b2 = (m_min - mu2) / sig2, (m_max - mu2) / sig2
+    log_c1 = _jt.logpdf(m, a1, b1, loc=mu1, scale=sig1)
+    log_c2 = _jt.logpdf(m, a2, b2, loc=mu2, scale=sig2)
+    return log_c1, log_c2
+
+
+def _two_pulse_mass_logpdf_jax(m, cfg: MCConfig):
+    r"""log f_mass(m) for the two-pulse mixture (normalised over support).
+
+    ``log[(1−λ)·c₁(m) + λ·c₂(m)]`` with the λ-gradient flowing smoothly
+    via ``log1p(-λ)`` / ``log(λ)``.
+    """
+    lam = jnp.asarray(cfg.lambda_natal)
+    log_c1, log_c2 = _two_pulse_mass_component_logpdfs_jax(m, cfg)
+    return jnp.logaddexp(jnp.log1p(-lam) + log_c1, jnp.log(lam) + log_c2)
+
+
 def _natal_log_pdf_jax(m, chi, cfg: MCConfig):
     r"""JAX mirror of :func:`_natal_log_pdf` — joint log p_natal(m, χ).
 
     Uses ``jax.scipy.stats.truncnorm.logpdf``; output dtype follows JAX
     default precision (float32 unless ``jax_enable_x64``).  Differentiable
     in ``cfg.mu_natal`` / ``sigma_natal`` / ``natal_spin_loc`` /
-    ``natal_spin_scale`` via standard truncnorm autodiff.
+    ``natal_spin_scale`` via standard truncnorm autodiff.  When the
+    two-pulse marginal is active (:func:`_two_pulse_active`) the mass
+    factor is the two-Gaussian mixture (differentiable additionally in
+    ``mu_natal_2`` / ``sigma_natal_2`` / ``lambda_natal``); the spin
+    factor is unchanged.
     """
     from jax.scipy.stats import truncnorm as _jt
-    mu = jnp.asarray(cfg.mu_natal)
-    sig = jnp.asarray(cfg.sigma_natal)
     loc_c = jnp.asarray(cfg.natal_spin_loc)
     sc_c = jnp.asarray(cfg.natal_spin_scale)
-    a_m = (jnp.asarray(cfg.m_min) - mu) / sig
-    b_m = (jnp.asarray(cfg.m_max) - mu) / sig
-    log_p_m = _jt.logpdf(m, a_m, b_m, loc=mu, scale=sig)
+    if _two_pulse_active(cfg):
+        log_p_m = _two_pulse_mass_logpdf_jax(m, cfg)
+    else:
+        mu = jnp.asarray(cfg.mu_natal)
+        sig = jnp.asarray(cfg.sigma_natal)
+        a_m = (jnp.asarray(cfg.m_min) - mu) / sig
+        b_m = (jnp.asarray(cfg.m_max) - mu) / sig
+        log_p_m = _jt.logpdf(m, a_m, b_m, loc=mu, scale=sig)
     a_c = (0.0 - loc_c) / sc_c
     b_c = (1.0 - loc_c) / sc_c
     log_p_chi = _jt.logpdf(chi, a_c, b_c, loc=loc_c, scale=sc_c)
@@ -574,6 +652,45 @@ def sample_natals_jax(
         weights = jnp.exp(log_w)
     elif cfg.stratify is not None:
         m, chi, weights = _stratified_natal_jax(cfg, key)
+    elif _two_pulse_active(cfg):
+        # ---------- Two-pulse IS-weight path. ----------
+        # Sample masses from a FIXED 50/50 mixture proposal of the two
+        # components (so the proposal is λ-independent); carry the true
+        # λ-mixture through smooth per-particle importance weights.  λ
+        # enters ONLY the weight numerator ⇒ AD in λ flows cleanly; μ₁,
+        # σ₁, μ₂, σ₂ enter both the reparametrised sample positions and
+        # the weights.  Spin is the single shared natal truncnorm,
+        # sampled from its exact pdf ⇒ contributes weight 1.
+        mu1 = jnp.asarray(cfg.mu_natal)
+        sig1 = jnp.asarray(cfg.sigma_natal)
+        mu2 = jnp.asarray(cfg.mu_natal_2)
+        sig2 = jnp.asarray(cfg.sigma_natal_2)
+        loc_c = jnp.asarray(cfg.natal_spin_loc)
+        sc_c = jnp.asarray(cfg.natal_spin_scale)
+        m_min = jnp.asarray(cfg.m_min)
+        m_max = jnp.asarray(cfg.m_max)
+        a1, b1 = (m_min - mu1) / sig1, (m_max - mu1) / sig1
+        a2, b2 = (m_min - mu2) / sig2, (m_max - mu2) / sig2
+        a_c, b_c = (0.0 - loc_c) / sc_c, (1.0 - loc_c) / sc_c
+        key_m1, key_m2, key_lab, key_chi = jax.random.split(key, 4)
+        # Reparametrised draw from each component; select per-particle by
+        # a fixed 50/50 label (label is λ-independent, so the discrete
+        # assignment never blocks λ's gradient; each chosen component is
+        # reparametrised so ∂position/∂μ_i,σ_i flows).
+        m1 = mu1 + sig1 * jax.random.truncated_normal(
+            key_m1, a1, b1, shape=(cfg.n_seed,))
+        m2 = mu2 + sig2 * jax.random.truncated_normal(
+            key_m2, a2, b2, shape=(cfg.n_seed,))
+        pick2 = jax.random.uniform(key_lab, shape=(cfg.n_seed,)) < 0.5
+        m = jnp.where(pick2, m2, m1)
+        z_chi = jax.random.truncated_normal(
+            key_chi, a_c, b_c, shape=(cfg.n_seed,))
+        chi = loc_c + sc_c * z_chi
+        # IS weight = f_mix(m;λ) / q_prop(m),  q_prop = ½c₁ + ½c₂.
+        log_f_mix = _two_pulse_mass_logpdf_jax(m, cfg)
+        log_c1, log_c2 = _two_pulse_mass_component_logpdfs_jax(m, cfg)
+        log_q = jnp.logaddexp(jnp.log(0.5) + log_c1, jnp.log(0.5) + log_c2)
+        weights = jnp.exp(log_f_mix - log_q)
     else:
         # ---------- Reparametrised truncnorm path. ----------
         mu = jnp.asarray(cfg.mu_natal)

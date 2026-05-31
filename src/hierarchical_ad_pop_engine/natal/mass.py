@@ -155,6 +155,71 @@ def log_natal_mass_gaussian(
     return truncnorm.logpdf(m, a=a, b=b, loc=mu, scale=sigma)
 
 
+def log_natal_mass_two_gaussian(
+    m: Array,
+    mu_1: ArrayLike,
+    sigma_1: ArrayLike,
+    mu_2: ArrayLike,
+    sigma_2: ArrayLike,
+    lambda_2: ArrayLike,
+    m_min: ArrayLike,
+    m_max: ArrayLike,
+) -> Array:
+    r"""Two-pulse (two-Gaussian) natal IMF — a normalised mixture of truncnorms.
+
+    .. math::
+
+        f_{\rm IMF}(m) = (1 - \lambda_2)\,\mathrm{TruncN}(m; \mu_1, \sigma_1)
+                       + \lambda_2\,\mathrm{TruncN}(m; \mu_2, \sigma_2)
+
+    Each component is a truncated normal on ``[m_min, m_max]`` (so each is
+    independently normalised over the support), hence the convex
+    combination is itself normalised: ``∫ exp(log f) dm = 1``.  This is the
+    ``natal_family="two_gaussian"`` model of the two-pulse coagulation fit
+    (``INSTRUCTIONS_gwkokab_stage1.md`` §5.1) — e.g. the methods-paper
+    "inject at 10 & 30 M⊙" small-spin recovery experiment.
+
+    Built from the same ``jax.scipy.stats.truncnorm`` primitive as
+    :func:`log_natal_mass_gaussian`, so it is fully normalised and AD-safe;
+    differentiable in ``mu_1, sigma_1, mu_2, sigma_2`` and (smoothly, via
+    ``log1p(-lambda_2)`` / ``log(lambda_2)``) in the mixing weight
+    ``lambda_2``.
+
+    Parameters
+    ----------
+    m
+        Mass query points (solar masses).
+    mu_1, sigma_1
+        Mean / std of the first (lower-mass-by-convention) pulse.
+    mu_2, sigma_2
+        Mean / std of the second pulse.  The caller owns the label-switch
+        convention (``mu_1 < mu_2``); this function enforces no ordering.
+    lambda_2
+        Fractional weight of the **second** pulse, ``∈ (0, 1)``.
+    m_min, m_max
+        Hard truncation limits shared by both components.
+
+    Returns
+    -------
+    Array
+        ``log f_IMF(m)``, normalised over ``[m_min, m_max]``.
+    """
+    mu_1 = jnp.asarray(mu_1)
+    sigma_1 = jnp.asarray(sigma_1)
+    mu_2 = jnp.asarray(mu_2)
+    sigma_2 = jnp.asarray(sigma_2)
+    lambda_2 = jnp.asarray(lambda_2)
+    a1 = (m_min - mu_1) / sigma_1
+    b1 = (m_max - mu_1) / sigma_1
+    a2 = (m_min - mu_2) / sigma_2
+    b2 = (m_max - mu_2) / sigma_2
+    log_c1 = truncnorm.logpdf(m, a=a1, b=b1, loc=mu_1, scale=sigma_1)
+    log_c2 = truncnorm.logpdf(m, a=a2, b=b2, loc=mu_2, scale=sigma_2)
+    log_w1 = jnp.log1p(-lambda_2) + log_c1
+    log_w2 = jnp.log(lambda_2) + log_c2
+    return jnp.logaddexp(log_w1, log_w2)
+
+
 # Kept for backward compat with existing callers that pass a params dict;
 # now just returns the dict so callers can splat it into log_natal_mass.
 def build_natal_mass(

@@ -66,6 +66,9 @@ __all__ = [
     "build_stage1_priors",
     "build_coagulation_likelihood",
     "build_stage1_likelihood",
+    "TWO_PULSE_PARAM_NAMES",
+    "two_pulse_prior_factories",
+    "build_two_pulse_variables",
 ]
 
 
@@ -130,14 +133,29 @@ def build_stage1_variables(
         :data:`STAGE1_PARAM_NAMES`.
     """
     factories = prior_factories if prior_factories is not None else stage1_prior_factories()
-    missing = set(STAGE1_PARAM_NAMES) - set(factories)
-    extra = set(factories) - set(STAGE1_PARAM_NAMES)
+    return _build_variables_from_factories(STAGE1_PARAM_NAMES, factories)
+
+
+def _build_variables_from_factories(
+    param_names: Tuple[str, ...],
+    factories: Dict[str, Callable[[], Distribution]],
+) -> Tuple[Dict[str, Distribution], Dict[str, int]]:
+    r"""``(variables, variables_index)`` for an arbitrary parameter set.
+
+    Shared core of :func:`build_stage1_variables` /
+    :func:`build_two_pulse_variables`.  ``variables_index`` follows
+    gwkokab's exact convention — position in the **alphabetically sorted**
+    variable list — so samples drawn in sorted order land in the right
+    ``dist_fn`` keyword regardless of how many parameters there are.
+    """
+    missing = set(param_names) - set(factories)
+    extra = set(factories) - set(param_names)
     if missing or extra:
         raise ValueError(
-            f"prior_factories keys must be exactly {STAGE1_PARAM_NAMES}; "
+            f"prior_factories keys must be exactly {param_names}; "
             f"missing={sorted(missing)} extra={sorted(extra)}"
         )
-    variables: Dict[str, Distribution] = {name: factories[name]() for name in STAGE1_PARAM_NAMES}
+    variables: Dict[str, Distribution] = {name: factories[name]() for name in param_names}
     variables_index: Dict[str, int] = {
         name: i for i, name in enumerate(sorted(variables.keys()))
     }
@@ -287,3 +305,88 @@ def build_stage1_likelihood(
         "poisson_mean_estimator": poisson_mean_estimator,
         "log_likelihood_fn": log_likelihood_fn,
     }
+
+
+# ===========================================================================
+# Two-pulse (10-parameter) model — INSTRUCTIONS_gwkokab_stage1 §5.1 / §6.
+# The natal mass marginal is a two-Gaussian mixture; ``kernel_a`` is floated
+# (pass ``float_kernel_a=True`` to ``make_coagulation_dist_fn``).  Everything
+# downstream of ``build_*_variables`` is parameter-count-agnostic, so the
+# same likelihood factory (:func:`build_coagulation_likelihood`) and
+# ``JointDistribution`` builder (:func:`build_stage1_priors`, which sorts an
+# arbitrary ``variables`` dict) serve both stages.
+# ===========================================================================
+TWO_PULSE_PARAM_NAMES: Tuple[str, ...] = (
+    "mu_natal",
+    "sigma_natal",
+    "mu_natal_2",
+    "sigma_natal_2",
+    "lambda_natal",
+    "natal_spin_loc",
+    "natal_spin_scale",
+    "kernel_a",
+    "kernel_b",
+    "log_rate",
+)
+
+
+def two_pulse_prior_factories() -> Dict[str, Callable[[], Distribution]]:
+    r"""Canonical two-pulse priors (the "inject at 10 & 30 M⊙" experiment).
+
+    +---------------------+------------------------------+
+    | name                | prior                        |
+    +=====================+==============================+
+    | ``mu_natal``        | ``Uniform(5, 20)`` M⊙        |
+    | ``sigma_natal``     | ``LogUniform(0.3, 5)`` M⊙    |
+    | ``mu_natal_2``      | ``Uniform(20, 50)`` M⊙       |
+    | ``sigma_natal_2``   | ``LogUniform(0.3, 8)`` M⊙    |
+    | ``lambda_natal``    | ``Uniform(0.05, 0.95)``      |
+    | ``natal_spin_loc``  | ``Uniform(0, 0.3)``          |
+    | ``natal_spin_scale``| ``LogUniform(0.02, 0.3)``    |
+    | ``kernel_a``        | ``Uniform(-2, 4)``           |
+    | ``kernel_b``        | ``Uniform(-2, 6)``           |
+    | ``log_rate``        | ``Uniform(-2, 6)``           |
+    +---------------------+------------------------------+
+
+    **Label-switch handling.**  The ``μ₁ < μ₂`` ambiguity is broken
+    *structurally* by **non-overlapping mass ranges** — ``mu_natal``'s
+    prior tops out at 20 M⊙ and ``mu_natal_2``'s starts at 20 M⊙ — rather
+    than an ordered/joint transform, because gwkokab's
+    ``JointDistribution`` consumes the priors as **independent marginals**
+    (so an ``OrderedTransform`` would not survive the sorted-marginal
+    contract).  The disjoint windows enclose the canonical 10 / 30 M⊙
+    injection cleanly.  If a future experiment needs overlapping pulses,
+    switch to a ``μ₂ = μ₁ + Δμ, Δμ > 0`` reparametrisation in the
+    ``dist_fn`` instead (INSTRUCTIONS §5.2).
+    """
+    return {
+        "mu_natal": lambda: dist.Uniform(5.0, 20.0),
+        "sigma_natal": lambda: dist.LogUniform(0.3, 5.0),
+        "mu_natal_2": lambda: dist.Uniform(20.0, 50.0),
+        "sigma_natal_2": lambda: dist.LogUniform(0.3, 8.0),
+        "lambda_natal": lambda: dist.Uniform(0.05, 0.95),
+        "natal_spin_loc": lambda: dist.Uniform(0.0, 0.3),
+        "natal_spin_scale": lambda: dist.LogUniform(0.02, 0.3),
+        "kernel_a": lambda: dist.Uniform(-2.0, 4.0),
+        "kernel_b": lambda: dist.Uniform(-2.0, 6.0),
+        "log_rate": lambda: dist.Uniform(-2.0, 6.0),
+    }
+
+
+def build_two_pulse_variables(
+    prior_factories: Optional[Dict[str, Callable[[], Distribution]]] = None,
+) -> Tuple[Dict[str, Distribution], Dict[str, int]]:
+    r"""``(variables, variables_index)`` for the 10-param two-pulse fit.
+
+    Two-pulse analogue of :func:`build_stage1_variables`; same sorted-order
+    contract.  Feed the returned ``variables`` to :func:`build_stage1_priors`
+    (it sorts any ``variables`` dict) for the ``JointDistribution``, and the
+    ``variables`` / ``variables_index`` straight to
+    :func:`build_coagulation_likelihood` alongside a ``dist_fn`` built with
+    ``natal_family="two_gaussian", float_kernel_a=True``.
+    """
+    factories = (
+        prior_factories if prior_factories is not None
+        else two_pulse_prior_factories()
+    )
+    return _build_variables_from_factories(TWO_PULSE_PARAM_NAMES, factories)
