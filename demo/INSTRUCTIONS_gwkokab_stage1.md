@@ -94,6 +94,15 @@ python3 demo/ppc_stage1_gwkokab.py --detection none --n-draws 80 --n-pred 2000 \
 * **Forward-model loop must be jitted ONCE.**  Per-draw eager engine builds
   accumulate device buffers and OOM; `ppc_stage1_gwkokab.forward_one` jits the
   whole per-draw map (build + sample + JAX histogram).  Pattern to reuse.
+* **Forward sampling is grid-free particle resampling** (`fit_stage1_gwkokab.
+  sample_pairs_from_particles`): it draws binary pairs straight from the
+  engine's mc_jax particle pool ∝ `K·w_i·w_j·VT`, so the discrete 2G high-χ
+  remnant spins are exact.  Do NOT reintroduce a density grid / KDE sampler for
+  observables — it under-resolves the χ≈0.68 2G peak (that was the original
+  spin-PPD artifact).  (The identifiability/posterior scripts still use the
+  older grid `sample_from_model` only for the self-consistent *event positions*
+  — the likelihood itself never samples — but switching them to
+  `sample_pairs_from_particles` too is a clean unification when convenient.)
 * **`n_seed=300` is the known-stable SVI point** at these settings.  Lower
   n_seed has diverged.
 

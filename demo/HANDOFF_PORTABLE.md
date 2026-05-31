@@ -300,7 +300,13 @@ If G6/G7 pass, the bridge is real-validated; then proceed to the fit.
   `demo/ppc_stage1_gwkokab.py` forward-models the population at each posterior
   draw (MC per posterior point) → component-mass & component-spin **PPD bands**
   (median + 90%) vs the observed catalogue + an **event scatter over the
-  predicted 2-D density**.  `--detection {none,vt}` = intrinsic PPC (band
+  predicted density**.  Forward sampling is **grid-free particle resampling**
+  (`sample_pairs_from_particles`: resample the engine's mc_jax particle pool
+  `evaluator.{m_active,chi_active,weights}` into pairs ∝ `K·w_i·w_j·VT`; the
+  discrete 2G high-χ remnant spins are exact — no grid, no KDE.  An earlier
+  grid inverse-CDF sampler under-resolved the χ≈0.68 2G peak and was scrapped,
+  commit b66e9f3).  Figures use log-m x + a log(p) row (dynamic range).
+  `--detection {none,vt}` = intrinsic PPC (band
   straddles data = goodness-of-fit, consistent with the flat fit) vs the
   `M_chirp^{15/6}` detection-weighted view; `--gate {soft,bernoulli}`.  The
   per-draw forward map is **jitted once** (`forward_one`: build + sample + JAX
