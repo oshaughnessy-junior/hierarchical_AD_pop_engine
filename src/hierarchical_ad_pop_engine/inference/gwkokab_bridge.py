@@ -207,6 +207,9 @@ def make_coagulation_dist_fn(
     mc_jax_key: Any = None,
     grid: Any = None,
     m_max_factor: float = 2.5,
+    natal_family: str = "gaussian",
+    float_kernel_a: bool = False,
+    kde_adaptive: bool = False,
 ) -> Callable[..., CoagulationPopulation]:
     r"""Build the ``dist_fn`` gwkokab calls as ``dist_fn(**params) -> Distribution``.
 
@@ -234,44 +237,37 @@ def make_coagulation_dist_fn(
 
     Default ``gate="soft"`` (B.2) — the cleaner branch; pass
     ``gate="bernoulli"`` for the B.1 cross-check.
+
+    Two-pulse model
+    ---------------
+    ``natal_family="two_gaussian"`` switches the returned ``dist_fn`` to the
+    two-pulse natal IMF (``build_two_pulse_coagulation``;
+    INSTRUCTIONS_gwkokab_stage1 §5.1).  The closure then consumes the
+    expanded keyword set ``mu_natal, sigma_natal, mu_natal_2, sigma_natal_2,
+    lambda_natal, natal_spin_loc, natal_spin_scale, kernel_b, log_rate`` —
+    and ``kernel_a`` too when ``float_kernel_a=True`` (the §5.1 "kernel_a
+    floated → 10 free params" setup).  ``(mu_natal, sigma_natal)`` is pulse
+    1, ``(mu_natal_2, sigma_natal_2)`` pulse 2, ``lambda_natal`` the weight
+    of pulse 2; the ``mu_natal < mu_natal_2`` label-switch convention is
+    enforced fit-side by the priors / reparametrisation in
+    :mod:`stage1_wiring`, not here.
     """
     if mc_jax_key is None:
         mc_jax_key = jax.random.PRNGKey(0)
+    if natal_family not in ("gaussian", "two_gaussian"):
+        raise ValueError(
+            "natal_family must be 'gaussian' or 'two_gaussian'; got "
+            f"{natal_family!r}"
+        )
 
     # Lazy import — pulls the engine response package (→ gwkokab) only when
     # a fit actually builds responses, not at bridge-module import time.
-    from ..response.coagulation import build_gaussian_coagulation
+    from ..response.coagulation import (
+        build_gaussian_coagulation,
+        build_two_pulse_coagulation,
+    )
 
-    def dist_fn(
-        *,
-        mu_natal,
-        sigma_natal,
-        natal_spin_loc,
-        natal_spin_scale,
-        kernel_b,
-        log_rate,
-        **_extra,
-    ) -> CoagulationPopulation:
-        response = build_gaussian_coagulation(
-            mu=mu_natal,
-            sigma=sigma_natal,
-            m_min=m_min,
-            m_max=m_max,
-            natal_spin_loc=natal_spin_loc,
-            natal_spin_scale=natal_spin_scale,
-            kernel_a=kernel_a,
-            kernel_b=kernel_b,
-            log_R_env=log_rate,
-            k_max=k_max,
-            grid=grid,
-            solver="mc_jax",
-            mc_v_esc=v_esc,
-            mc_n_seed=n_seed,
-            mc_depletion_fraction=depletion_fraction,
-            mc_jax_key=mc_jax_key,
-            mc_jax_gate=gate,
-            mc_jax_n_steps_mult=n_steps_mult,
-        )
+    def _wrap(response) -> CoagulationPopulation:
         env = {"v_esc": jnp.asarray(v_esc)}
         total_rate_fn = (
             lambda **kw: response.mc_jax_response.total_rate(**kw)
@@ -280,5 +276,79 @@ def make_coagulation_dist_fn(
             response, env, total_rate_fn,
             m_min=m_min, m_max=m_max, m_max_factor=m_max_factor,
         )
+
+    if natal_family == "gaussian":
+        def dist_fn(
+            *,
+            mu_natal,
+            sigma_natal,
+            natal_spin_loc,
+            natal_spin_scale,
+            kernel_b,
+            log_rate,
+            kernel_a=kernel_a,
+            **_extra,
+        ) -> CoagulationPopulation:
+            response = build_gaussian_coagulation(
+                mu=mu_natal,
+                sigma=sigma_natal,
+                m_min=m_min,
+                m_max=m_max,
+                natal_spin_loc=natal_spin_loc,
+                natal_spin_scale=natal_spin_scale,
+                kernel_a=kernel_a,
+                kernel_b=kernel_b,
+                log_R_env=log_rate,
+                k_max=k_max,
+                grid=grid,
+                solver="mc_jax",
+                mc_v_esc=v_esc,
+                mc_n_seed=n_seed,
+                mc_depletion_fraction=depletion_fraction,
+                mc_jax_key=mc_jax_key,
+                mc_jax_gate=gate,
+                mc_jax_n_steps_mult=n_steps_mult,
+            )
+            return _wrap(response)
+    else:  # two_gaussian
+        def dist_fn(
+            *,
+            mu_natal,
+            sigma_natal,
+            mu_natal_2,
+            sigma_natal_2,
+            lambda_natal,
+            natal_spin_loc,
+            natal_spin_scale,
+            kernel_b,
+            log_rate,
+            kernel_a=kernel_a,
+            **_extra,
+        ) -> CoagulationPopulation:
+            response = build_two_pulse_coagulation(
+                mu_1=mu_natal,
+                sigma_1=sigma_natal,
+                mu_2=mu_natal_2,
+                sigma_2=sigma_natal_2,
+                lambda_2=lambda_natal,
+                m_min=m_min,
+                m_max=m_max,
+                natal_spin_loc=natal_spin_loc,
+                natal_spin_scale=natal_spin_scale,
+                kernel_a=kernel_a,
+                kernel_b=kernel_b,
+                log_R_env=log_rate,
+                k_max=k_max,
+                grid=grid,
+                solver="mc_jax",
+                mc_v_esc=v_esc,
+                mc_n_seed=n_seed,
+                mc_depletion_fraction=depletion_fraction,
+                mc_jax_key=mc_jax_key,
+                mc_jax_gate=gate,
+                mc_jax_n_steps_mult=n_steps_mult,
+                mc_jax_kde_adaptive=kde_adaptive,
+            )
+            return _wrap(response)
 
     return dist_fn

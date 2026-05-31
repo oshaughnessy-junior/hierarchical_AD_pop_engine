@@ -39,7 +39,11 @@ from jaxtyping import ArrayLike
 from ..grids import BinaryGrid
 from ..interp import log_density_at
 from ..kernels import log_pairing_kernel_grid
-from ..natal.mass import log_natal_mass, log_natal_mass_gaussian
+from ..natal.mass import (
+    log_natal_mass,
+    log_natal_mass_gaussian,
+    log_natal_mass_two_gaussian,
+)
 from ..natal.spin import build_natal_spin, log_natal_spin
 from ..remnants.kick_vector import v_kick_vec
 from ..remnants.marginal import (
@@ -563,6 +567,8 @@ class CoagulationResponse(eqx.Module):
         spin_dist = build_natal_spin(**self.natal_spin_params)
         if self.natal_mass_kind == "gaussian":
             log_f_m = log_natal_mass_gaussian(self.grid.m, **self.natal_mass_params)
+        elif self.natal_mass_kind == "two_gaussian":
+            log_f_m = log_natal_mass_two_gaussian(self.grid.m, **self.natal_mass_params)
         else:
             log_f_m = log_natal_mass(self.grid.m, **self.natal_mass_params)  # (N_m,)
         log_g_chi = log_natal_spin(spin_dist, self.grid.chi)  # (N_chi,)
@@ -855,7 +861,48 @@ def build_gaussian_coagulation(
     if orientation is not None:
         kwargs["orientation"] = orientation
     response = CoagulationResponse(**kwargs)
+    return _finalize_response_solver(
+        response,
+        solver=solver,
+        mc_v_esc=mc_v_esc,
+        mc_n_seed=mc_n_seed,
+        mc_depletion_fraction=mc_depletion_fraction,
+        mc_rng_seed=mc_rng_seed,
+        mc_orientation_key_seed=mc_orientation_key_seed,
+        mc_k=mc_k,
+        mc_jax_key=mc_jax_key,
+        mc_jax_n_steps=mc_jax_n_steps,
+        mc_jax_k_ratio=mc_jax_k_ratio,
+        mc_jax_gate=mc_jax_gate,
+        mc_jax_n_steps_mult=mc_jax_n_steps_mult,
+    )
 
+
+def _finalize_response_solver(
+    response: "CoagulationResponse",
+    *,
+    solver: str,
+    mc_v_esc: Optional[ArrayLike],
+    mc_n_seed: int,
+    mc_depletion_fraction: float,
+    mc_rng_seed: Optional[int],
+    mc_orientation_key_seed: int,
+    mc_k: Optional[int],
+    mc_jax_key: Optional[jax.Array],
+    mc_jax_n_steps: Optional[int],
+    mc_jax_k_ratio: float,
+    mc_jax_gate: str,
+    mc_jax_n_steps_mult: float,
+    mc_jax_kde_adaptive: bool = False,
+) -> "CoagulationResponse":
+    """Run + attach the eager MC solver state (shared by the builders).
+
+    Factored out of :func:`build_gaussian_coagulation` so the two-pulse
+    builder (:func:`build_two_pulse_coagulation`) reuses the identical
+    ``solver`` dispatch without duplication.  No-op for the analytic
+    solvers (``perturbative`` / ``implicit`` / ``basis``); returns the
+    response unchanged.
+    """
     # Session M2: under ``solver="mc"`` we eagerly run the particle MC
     # driver and stash the result on the response via the new
     # ``mc_response`` field.  ``mc_v_esc`` is the MC's escape-velocity
@@ -907,6 +954,7 @@ def build_gaussian_coagulation(
             k_ratio=float(mc_jax_k_ratio),
             gate=mc_jax_gate,
             n_steps_mult=float(mc_jax_n_steps_mult),
+            kde_adaptive=bool(mc_jax_kde_adaptive),
         )
         import equinox as _eqx
         response = _eqx.tree_at(
@@ -914,6 +962,116 @@ def build_gaussian_coagulation(
             is_leaf=lambda x: x is None,
         )
     return response
+
+
+def build_two_pulse_coagulation(
+    *,
+    mu_1: ArrayLike = 10.0,
+    sigma_1: ArrayLike = 1.0,
+    mu_2: ArrayLike = 30.0,
+    sigma_2: ArrayLike = 2.0,
+    lambda_2: ArrayLike = 0.4,
+    m_min: ArrayLike = 2.0,
+    m_max: ArrayLike = 200.0,
+    natal_spin_loc: ArrayLike = 0.0,
+    natal_spin_scale: ArrayLike = 0.05,
+    kernel_a: ArrayLike = 0.0,
+    kernel_b: ArrayLike = 2.0,
+    log_R_env: ArrayLike = 0.0,
+    k_max: int = 4,
+    grid: Optional[BinaryGrid] = None,
+    solver: str = "perturbative",
+    epsilon: ArrayLike = 1.0,
+    orientation: object = None,
+    retention_kind: Literal["heaviside", "sigmoid"] = "sigmoid",
+    w_over_v_esc: float = 1.0,
+    mc_v_esc: Optional[ArrayLike] = None,
+    mc_n_seed: int = 5000,
+    mc_depletion_fraction: float = 0.5,
+    mc_rng_seed: Optional[int] = None,
+    mc_orientation_key_seed: int = 0,
+    mc_k: Optional[int] = None,
+    mc_jax_key: Optional[jax.Array] = None,
+    mc_jax_n_steps: Optional[int] = None,
+    mc_jax_k_ratio: float = 1.5,
+    mc_jax_gate: str = "bernoulli",
+    mc_jax_n_steps_mult: float = 3.0,
+    mc_jax_kde_adaptive: bool = False,
+) -> "CoagulationResponse":
+    r"""Two-pulse (two-Gaussian) natal-IMF coagulation response.
+
+    The ``natal_family="two_gaussian"`` sibling of
+    :func:`build_gaussian_coagulation`: the natal mass marginal is the
+    normalised mixture
+
+    .. math::
+
+        f_{\rm IMF}(m) = (1 - \lambda_2)\,\mathrm{TruncN}(m; \mu_1, \sigma_1)
+                       + \lambda_2\,\mathrm{TruncN}(m; \mu_2, \sigma_2)
+
+    (see :func:`natal.mass.log_natal_mass_two_gaussian`), with a single
+    shared natal-spin truncnorm.  The defaults — pulses at ``μ₁ = 10`` and
+    ``μ₂ = 30 M⊙`` with near-zero spin — are the methods-paper two-pulse
+    small-spin recovery experiment (INSTRUCTIONS_gwkokab_stage1 §6).
+
+    Caller owns the ``μ₁ < μ₂`` label-switch convention; the fit-side
+    priors / reparametrisation in ``inference/stage1_wiring`` enforce it.
+
+    Same ``solver`` dispatch as :func:`build_gaussian_coagulation`
+    (``"mc_jax"`` for the AD-traceable SVI/NUTS path); the cascade,
+    remnant physics, and selection downstream are entirely natal-family
+    agnostic.
+    """
+    if grid is None:
+        grid = BinaryGrid.default(
+            m_min=float(jnp.asarray(m_min)),
+            m_max=float(jnp.asarray(m_max)),
+        )
+    kwargs = dict(
+        grid=grid,
+        k_max=k_max,
+        natal_mass_params=dict(
+            mu_1=jnp.asarray(mu_1),
+            sigma_1=jnp.asarray(sigma_1),
+            mu_2=jnp.asarray(mu_2),
+            sigma_2=jnp.asarray(sigma_2),
+            lambda_2=jnp.asarray(lambda_2),
+            m_min=jnp.asarray(m_min),
+            m_max=jnp.asarray(m_max),
+        ),
+        natal_spin_params=dict(
+            loc=jnp.asarray(natal_spin_loc),
+            scale=jnp.asarray(natal_spin_scale),
+        ),
+        kernel_params=dict(
+            a=jnp.asarray(kernel_a),
+            b=jnp.asarray(kernel_b),
+        ),
+        log_R_env=jnp.asarray(log_R_env),
+        natal_mass_kind="two_gaussian",
+        solver=solver,
+        epsilon=jnp.asarray(epsilon),
+        retention_kind=retention_kind,
+        w_over_v_esc=w_over_v_esc,
+    )
+    if orientation is not None:
+        kwargs["orientation"] = orientation
+    response = CoagulationResponse(**kwargs)
+    return _finalize_response_solver(
+        response,
+        solver=solver,
+        mc_v_esc=mc_v_esc,
+        mc_n_seed=mc_n_seed,
+        mc_depletion_fraction=mc_depletion_fraction,
+        mc_rng_seed=mc_rng_seed,
+        mc_orientation_key_seed=mc_orientation_key_seed,
+        mc_k=mc_k,
+        mc_jax_key=mc_jax_key,
+        mc_jax_n_steps=mc_jax_n_steps,
+        mc_jax_k_ratio=mc_jax_k_ratio,
+        mc_jax_gate=mc_jax_gate,
+        mc_jax_n_steps_mult=mc_jax_n_steps_mult,
+    )
 
 
 def build_default_coagulation(

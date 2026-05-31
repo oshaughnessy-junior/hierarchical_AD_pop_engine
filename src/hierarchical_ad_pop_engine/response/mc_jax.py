@@ -80,6 +80,22 @@ if TYPE_CHECKING:
 __all__ = ["MCResponseJax", "build_mc_jax_response"]
 
 
+def _safe_log_floor(x: Array, floor: float) -> Array:
+    r"""``log(x)`` floored at ``floor`` with a ZERO-gradient floored branch.
+
+    A bare ``jnp.log(jnp.maximum(x, floor))`` still routes the gradient through
+    the live ``x`` whenever ``x`` is tiny-but-positive, giving ``1/x`` →
+    overflow → ``0·inf = nan`` inside the downstream ``logsumexp`` (the
+    two-pulse MAP failure, localised 2026-05-31).  Per
+    ``[[feedback-where-guards-forward-not-backward]]`` we evaluate ``log`` on a
+    ``maximum``-clamped argument AND ``jnp.where`` the result, so that where
+    ``x <= floor`` the output is the constant ``log(floor)`` with no tangent
+    back to ``x``.  Where ``x > floor`` the value and gradient are exact.
+    """
+    x_safe = jnp.maximum(x, floor)
+    return jnp.where(x > floor, jnp.log(x_safe), jnp.log(floor))
+
+
 # ---------------------------------------------------------------------------
 # Stash carrier — JAX-array dynamic fields.
 # ---------------------------------------------------------------------------
@@ -123,6 +139,20 @@ class MCResponseJax(eqx.Module):
     # dynamic JAX scalar (would force a recompile if it changed).  This
     # field doesn't need to be AD-traceable.
     n_init: int = eqx.field(static=True)
+    # Density log-floor.  An event the model assigns ~zero density (a binary in
+    # the KDE-sparse inter-pulse region) gets a FLOORED log-likelihood with
+    # ZERO gradient, instead of a 1/N gradient that overflows to inf and makes
+    # logsumexp return 0·inf = nan.  1e-300 (the old bare ``maximum`` floor) is
+    # far too low to cap 1/N before overflow — the damage happens in the
+    # 1e-280…1e-12 band ABOVE it (localised 2026-05-31: T1a nan @1e-300,
+    # T1b/T1d finite @1e-12).  ``[[feedback-where-guards-forward-not-backward]]``:
+    # a bare ``log(maximum(N,eps))`` still differentiates the live branch, so we
+    # ``where``-guard with a safe argument on BOTH branches.  default 1e-12 is a
+    # log-likelihood of ~−27.6 per factor — well below any informative event,
+    # so it floors only genuine model-zeros.  This is a robustness floor, NOT a
+    # physics fudge; the real cure for the zeros is the gen≥2 estimator upgrade
+    # (see [[project-two-pulse-fit-bias]]).
+    density_floor: float = eqx.field(static=True, default=1e-12)
 
     def log_rate_density(
         self,
@@ -166,8 +196,8 @@ class MCResponseJax(eqx.Module):
             a=self.evaluator.kernel_a, b=self.evaluator.kernel_b,
         )
         # log[½ R_env K N1 N2] = log_R_env − log 2 + log K + log N1 + log N2.
-        log_N1 = jnp.log(jnp.maximum(N1_pdf, 1e-300))
-        log_N2 = jnp.log(jnp.maximum(N2_pdf, 1e-300))
+        log_N1 = _safe_log_floor(N1_pdf, self.density_floor)
+        log_N2 = _safe_log_floor(N2_pdf, self.density_floor)
         return (
             self.evaluator.log_R_env
             - jnp.log(2.0)
@@ -210,6 +240,9 @@ def build_mc_jax_response(
     k_ratio: float = 1.5,
     gate: str = "bernoulli",
     n_steps_mult: float = 3.0,
+    hybrid_1g: Optional[bool] = None,
+    query_chunk: Optional[int] = 512,
+    kde_adaptive: bool = False,
 ) -> MCResponseJax:
     r"""Build an :class:`MCResponseJax` by running ``particle_mc_jax`` traced.
 
@@ -300,12 +333,20 @@ def build_mc_jax_response(
             f"gate must be 'bernoulli' (B.1) or 'soft' (B.2); got {gate!r}"
         )
 
-    if response.natal_mass_kind != "gaussian":
+    # Hybrid analytic-1G density: default ON for the two-pulse natal IMF
+    # (fixes the bimodal-KDE width-recovery floor — see
+    # demo/PLAN_hybrid_analytic_1g_density.md), OFF for single-Gaussian until
+    # validated.  Callers may override explicitly with hybrid_1g=True/False.
+    if hybrid_1g is None:
+        hybrid_1g = response.natal_mass_kind == "two_gaussian"
+
+    if response.natal_mass_kind not in ("gaussian", "two_gaussian"):
         raise NotImplementedError(
-            "MCResponseJax currently supports natal_mass_kind='gaussian' "
-            f"only; got {response.natal_mass_kind!r}.  Adding pl_peak / "
-            "power-law natal sampling is a follow-up to Session J4 — "
-            "see demo/PLAN_jax_mc.md."
+            "MCResponseJax currently supports natal_mass_kind in "
+            "{'gaussian', 'two_gaussian'}; got "
+            f"{response.natal_mass_kind!r}.  Adding pl_peak / power-law "
+            "natal sampling is a follow-up to Session J4 — see "
+            "demo/PLAN_jax_mc.md."
         )
 
     # Reject non-Aligned at factory time — particle_mc_jax already does
@@ -327,9 +368,25 @@ def build_mc_jax_response(
     # lets AD flow through cfg.mu_natal etc.  Note m_min / m_max enter
     # the truncated-normal bounds via standardisation; JAX handles their
     # derivative through truncnorm correctly.
+    # natal_mass param-key set differs by family: single-Gaussian uses
+    # ``mu``/``sigma``; two-pulse uses ``mu_1``/``sigma_1`` (→ pulse 1 =
+    # MCConfig.mu_natal/sigma_natal) plus ``mu_2``/``sigma_2``/``lambda_2``
+    # (→ the MCConfig two-pulse fields, which activate the IS-weight
+    # sampler in :func:`sample_natals_jax`).
+    if response.natal_mass_kind == "two_gaussian":
+        two_pulse_fields = dict(
+            mu_natal=jnp.asarray(natal_mass["mu_1"]),
+            sigma_natal=jnp.asarray(natal_mass["sigma_1"]),
+            mu_natal_2=jnp.asarray(natal_mass["mu_2"]),
+            sigma_natal_2=jnp.asarray(natal_mass["sigma_2"]),
+            lambda_natal=jnp.asarray(natal_mass["lambda_2"]),
+        )
+    else:
+        two_pulse_fields = dict(
+            mu_natal=jnp.asarray(natal_mass["mu"]),
+            sigma_natal=jnp.asarray(natal_mass["sigma"]),
+        )
     cfg = MCConfig(
-        mu_natal=jnp.asarray(natal_mass["mu"]),
-        sigma_natal=jnp.asarray(natal_mass["sigma"]),
         m_min=jnp.asarray(natal_mass["m_min"]),
         m_max=jnp.asarray(natal_mass["m_max"]),
         natal_spin_loc=jnp.asarray(natal_spin["loc"]),
@@ -340,6 +397,7 @@ def build_mc_jax_response(
         n_seed=int(n_seed),
         depletion_fraction=float(depletion_fraction),
         orientation=orientation,
+        **two_pulse_fields,
     )
 
     if gate == "soft":
@@ -392,6 +450,13 @@ def build_mc_jax_response(
             "b": jnp.asarray(kernel["b"]),
         },
         weights=masked_weights,
+        gen_active=(out["gen_active"] if hybrid_1g else None),
+        hybrid_1g=hybrid_1g,
+        natal_mass_kind=(response.natal_mass_kind if hybrid_1g else None),
+        natal_mass_params=(response.natal_mass_params if hybrid_1g else None),
+        natal_spin_params=(response.natal_spin_params if hybrid_1g else None),
+        query_chunk=query_chunk,
+        kde_adaptive=kde_adaptive,
     )
     return MCResponseJax(
         evaluator=evaluator,
