@@ -74,7 +74,8 @@ def _unpack(theta):
     return {k: theta[i] for i, k in enumerate(PARAM_NAMES)}
 
 
-def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8):
+def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8,
+                      vt_fn=None):
     r"""Self-consistent mock: inverse-CDF draw of ``(N,4)`` true events from the
     FIT model's own pair intensity ``exp(model.log_prob)`` on a coarse
     ``m₁×m₂×χ₁×χ₂`` grid (geomspaced mass, linear χ), jittered within cells.
@@ -82,6 +83,11 @@ def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8):
     Generating the data from the SAME model we fit removes the
     implicit-vs-mc_jax solver mismatch, so a profile peak away from θ* is then a
     genuine identifiability statement, not a forward-model discrepancy.
+
+    ``vt_fn(m1,m2,chi1,chi2)`` (optional): a selection weight applied to the
+    sampling density BEFORE normalising, so draws are **detection-weighted**
+    (the predicted *observed* catalogue under that ``VT``).  ``None`` → the
+    intrinsic distribution.
     """
     log_m = jnp.linspace(jnp.log(m_lo), jnp.log(m_hi), n_sm)
     m_grid = jnp.exp(log_m)
@@ -89,14 +95,17 @@ def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8):
     M1, M2, C1, C2 = jnp.meshgrid(m_grid, m_grid, chi, chi, indexing="ij")
     nodes = jnp.stack([M1, M2, C1, C2], axis=-1)
     logp = model.log_prob(nodes)
-    p = jnp.exp(logp - jnp.max(logp)).reshape(-1)
+    p = jnp.exp(logp - jnp.max(logp))
+    if vt_fn is not None:
+        p = p * vt_fn(M1, M2, C1, C2)
+    p = p.reshape(-1)
     p = p / jnp.sum(p)
 
     k_idx, k_jm1, k_jm2, k_jc1, k_jc2 = jax.random.split(key, 5)
     idx = jax.random.choice(k_idx, p.size, shape=(n_events,), p=p)
     i1, i2, j1, j2 = jnp.unravel_index(idx, (n_sm, n_sm, n_sc, n_sc))
-    dlog = float(log_m[1] - log_m[0])
-    dchi = float(chi[1] - chi[0])
+    dlog = log_m[1] - log_m[0]   # keep as jax scalars (jit-safe; float() breaks under jit)
+    dchi = chi[1] - chi[0]
     # jitter: uniform in log-m within the mass cell, linear within the χ cell.
     m1 = jnp.exp(log_m[i1] + dlog * (jax.random.uniform(k_jm1, (n_events,)) - 0.5))
     m2 = jnp.exp(log_m[i2] + dlog * (jax.random.uniform(k_jm2, (n_events,)) - 0.5))
