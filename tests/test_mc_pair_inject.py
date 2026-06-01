@@ -128,3 +128,22 @@ def test_bisect_returns_nearest_endpoint_when_target_out_of_bracket():
         f_of_eps, 0.999999, 1e-3, 1.0, max_iter=10, tol=1e-9)
     assert eps_star == 1.0           # nearer endpoint
     print(f"\n[H2] out-of-bracket target clamps to endpoint ε={eps_star}")
+
+
+@pytest.mark.parametrize("f_target", [0.1, 0.25, 0.5])
+def test_match_epsilon_survives_high_eps_divergence(f_target):
+    r"""Regression for the ε*=0.001 −inf bug: f_natal_depleted(ε) DIVERGES
+    (non-finite) at large ε; the matcher must scan the converging range, skip
+    the garbage, and still bracket the crossing — NOT fall back to the floor."""
+    def f_of_eps(e):
+        if e > 20.0:                 # Picard divergence regime → garbage
+            return float("nan")
+        return 0.6 * e / (1.0 + 0.6 * e)   # converging, monotone 0→~0.92
+
+    eps_star, f_hit, status = fit._match_epsilon_to_fdep(
+        f_of_eps, f_target, lo=1e-3, hi=50.0)
+    assert status == "ok"
+    assert abs(f_hit - f_target) < 5e-3
+    assert eps_star > 1e-3           # did NOT collapse to the lower bracket
+    print(f"\n[H2] divergence-robust match f*={f_target}: ε*={eps_star:.4g} "
+          f"f={f_hit:.4f} ({status})")

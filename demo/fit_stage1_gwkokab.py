@@ -203,6 +203,42 @@ def pair_sample_from_mc(evaluator, n_events, key):
                       jnp.where(hi, c1, c2), jnp.where(hi, c2, c1)], axis=-1)
 
 
+def _match_epsilon_to_fdep(f_of_eps, target, *, lo=1e-3, hi=50.0, n_scan=11,
+                           tol=3e-3):
+    r"""Find ε with ``f_of_eps(ε) ≈ target`` ROBUSTLY (PLAN_cross_method Step 2).
+
+    ``f_of_eps`` is ``implicit f_natal_depleted(ε)``, monotone-increasing 0→1
+    in the regime where the Picard solve CONVERGES — but it diverges at large ε
+    and returns non-finite / non-monotone garbage there.  So we cannot trust a
+    fixed [lo, hi] bracket (the naive version returned the lo endpoint when
+    ``f_of_eps(1e3)`` diverged → ε*=0.001, no cascade, −inf recovery).
+
+    Strategy: scan a log-ε grid in the converging range, drop non-finite
+    points, find the first finite crossing ``f ≥ target``, then geometric-
+    bisect within that bracket.  Returns ``(eps, f_at_eps, status)`` where
+    status ∈ {"ok", "UNREACHED" (target above every converging point),
+    "BELOW_GRID" (already ≥ target at the smallest ε)}.
+    """
+    grid = np.geomspace(lo, hi, n_scan)
+    lo_e = lo_f = hi_e = hi_f = None
+    for e in grid:
+        v = f_of_eps(float(e))
+        if not np.isfinite(v):
+            continue                       # diverged solve — skip
+        if v >= target:
+            hi_e, hi_f = float(e), float(v)
+            break
+        lo_e, lo_f = float(e), float(v)
+    if hi_e is None:
+        return (lo_e if lo_e is not None else float(grid[0])), \
+               (lo_f if lo_f is not None else float("nan")), "UNREACHED"
+    if lo_e is None:
+        return hi_e, hi_f, "BELOW_GRID"
+    e_star, f_star = _bisect_geometric(
+        f_of_eps, target, lo_e, hi_e, max_iter=20, tol=tol)
+    return e_star, f_star, "ok"
+
+
 def _bisect_geometric(fn, target, lo, hi, *, max_iter=30, tol=1e-3):
     r"""Geometric bisection for a MONOTONE-INCREASING ``fn`` (ε spans orders of
     magnitude, so bisect in log-ε).  Returns ``(x, fn(x))`` with
@@ -400,11 +436,16 @@ def main():
             res = solve_implicit_fixed_point(_impl_resp, _v, epsilon=float(eps))
             return float(res.f_natal_depleted)
 
-        recovery_epsilon, f_impl = _bisect_geometric(
-            _f_of_eps, f_target, 1e-3, 1e3, max_iter=28, tol=2e-3)
+        recovery_epsilon, f_impl, _status = _match_epsilon_to_fdep(
+            _f_of_eps, f_target, lo=1e-3, hi=50.0)
         print(f"[ε-match] MC injection f_dep={f_target:.4f}  →  implicit "
               f"ε*={recovery_epsilon:.4g} (f_natal_depleted={f_impl:.4f}, "
-              f"|Δf|={abs(f_impl - f_target):.4f})  [H2 parity gate]")
+              f"|Δf|={abs(f_impl - f_target):.4f}, {_status})  [H2 parity gate]")
+        if _status != "ok" or abs(f_impl - f_target) > 0.02:
+            print("[ε-match] WARNING: depletion NOT matched in the converging ε "
+                  "range — recovery cascade depth differs from injection; the "
+                  "cross-method fit is unreliable until this is resolved "
+                  "(raise hi / check implicit convergence at this grid).")
 
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
