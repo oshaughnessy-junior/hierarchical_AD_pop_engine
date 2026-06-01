@@ -48,6 +48,29 @@ def test_interpolation_outside_grid_is_neg_inf():
     assert jnp.isneginf(out)
 
 
+def test_interpolation_at_upper_edge_is_finite_not_nan():
+    r"""Regression: a query EXACTLY at the upper grid edge (and in the last
+    half-cell) must be finite.  The old ``mode='constant', cval=-inf`` gave
+    ``0·(-inf)=NaN`` at the last node and spurious ``-inf`` in the last
+    half-cell, which poisoned the cross-method likelihood (scattered spins land
+    near the χ edges).  ``mode='nearest'`` returns the edge value."""
+    g = BinaryGrid.default(n_m=8, n_chi=4)
+    log_dens = jnp.outer(jnp.linspace(-2.0, 1.0, 8), jnp.linspace(0.0, 1.0, 4))
+    # exact upper corner → the corner grid value, finite (no NaN)
+    corner = log_density_at(g.log_m, g.chi, log_dens, g.m[-1], g.chi[-1])
+    assert jnp.isfinite(corner)
+    assert jnp.allclose(corner, log_dens[-1, -1])
+    # a point in the last χ half-cell (between χ_{N-2} and χ_{N-1}) → finite
+    chi_near_edge = 0.5 * (g.chi[-2] + g.chi[-1])
+    mid = log_density_at(g.log_m, g.chi, log_dens, g.m[3], chi_near_edge)
+    assert jnp.isfinite(mid)
+    # grad at the edge must also be finite (the −inf variant gave NaN grads)
+    gm = jax.grad(
+        lambda c: log_density_at(g.log_m, g.chi, log_dens, g.m[3], c).sum()
+    )(g.chi[-1])
+    assert jnp.isfinite(gm)
+
+
 def test_interpolation_is_jittable_and_grad_friendly():
     g = BinaryGrid.default(n_m=8, n_chi=4)
     log_dens = jnp.outer(jnp.linspace(-2.0, 1.0, 8), jnp.linspace(0.0, 1.0, 4))

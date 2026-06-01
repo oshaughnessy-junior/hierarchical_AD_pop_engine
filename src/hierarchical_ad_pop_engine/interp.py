@@ -33,17 +33,27 @@ def log_density_at(
     i = jnp.interp(log_m, log_m_grid, jnp.arange(log_m_grid.size))
     j = jnp.interp(chi, chi_grid, jnp.arange(chi_grid.size))
 
-    # 2D map_coordinates with linear order is the JAX-friendly way:
+    # 2D map_coordinates with linear order is the JAX-friendly way.
+    #
+    # ``mode="nearest"`` (NOT ``"constant", cval=-inf``): the constant/-inf
+    # variant has two boundary pathologies that poison reverse-mode AD and the
+    # likelihood.  For a query in the last half-cell the ``order=1`` stencil
+    # reaches the out-of-bounds neighbour and returns ``w·val + (1-w)·(-inf) =
+    # -inf`` even though the point is INSIDE the grid box; and exactly at the
+    # last node ``w=0`` gives ``0·(-inf) = NaN`` (the memory'd boundary NaN).
+    # ``"nearest"`` clamps the out-of-bounds index to the edge value, so
+    # interior/edge queries are finite and C¹; the explicit ``inside`` mask
+    # below still enforces the documented "-inf strictly outside" contract —
+    # but without the NaN / spurious-inf at the boundary itself.
     from jax.scipy.ndimage import map_coordinates
 
     out = map_coordinates(
         log_density,
         jnp.stack([i, j], axis=0),
         order=1,
-        mode="constant",
-        cval=-jnp.inf,
+        mode="nearest",
     )
-    # Mask points strictly outside the grid box.
+    # Mask points strictly outside the grid box (boundary inclusive → finite).
     inside = (
         (log_m >= log_m_grid[0])
         & (log_m <= log_m_grid[-1])

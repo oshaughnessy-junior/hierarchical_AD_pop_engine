@@ -511,6 +511,22 @@ def main():
         events = scatter_to_posteriors(
             true_pts, args.n_samples, k_scat, m_hi=m_hi,
             sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
+        # Clip scattered samples to the RECOVERY grid box.  The implicit grid
+        # density is only defined on [m₀,m_N]×[χ₀,χ_N]; scatter (esp. spin:
+        # natal χ≈0.05 blurs below χ₀, cascade χ≈0.69 toward 1) can push a
+        # sample off-grid → log_density_at = −inf, and one fully-off-grid event
+        # makes logL = −inf.  Clipping keeps the cross-method PE samples on the
+        # support the recovery model can represent (delta case is unaffected —
+        # particles are already interior).
+        gm, gc = fit_grid.m, fit_grid.chi
+        m_clip = (float(gm[0]), float(gm[-1]))
+        c_clip = (float(gc[0]), float(gc[-1]))
+        events = jnp.stack([
+            jnp.clip(events[..., 0], *m_clip),
+            jnp.clip(events[..., 1], *m_clip),
+            jnp.clip(events[..., 2], *c_clip),
+            jnp.clip(events[..., 3], *c_clip),
+        ], axis=-1)
         ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
     else:
         events, ln_offsets = make_mock_posteriors(
