@@ -55,7 +55,13 @@ for p in (str(_DEMO), str(_REPO), str(_REPO / "src")):
         sys.path.insert(0, p)
 
 import demo_gwkokab_fit_stage1 as demo  # noqa: E402
-from fit_stage1_gwkokab import sample_from_model  # noqa: E402  (generic; uses model.log_prob)
+from fit_stage1_gwkokab import (  # noqa: E402  (shared cross-method machinery)
+    sample_from_model,            # grid sampler (--gen self)
+    pair_sample_from_mc,          # exact-particle MC pairing (--gen mc)
+    _match_epsilon_to_fdep,       # H2 ε↔depletion matching
+    cross_method_js,              # H1 inject-θ JS gate
+    _H1_JS_WARN,
+)
 from mock_catalog import scatter_to_posteriors  # noqa: E402
 
 from hierarchical_ad_pop_engine.inference.gwkokab_bridge import (  # noqa: E402
@@ -227,23 +233,85 @@ def main():
                          "(sharpens the cascade-remnant peaks the global "
                          "Silverman bandwidth oversmooths — the σ₂/λ pulse-2 "
                          "recovery fix). Default off = fixed-bandwidth KDE.")
+    ap.add_argument("--solver", choices=["mc_jax", "implicit"], default="mc_jax",
+                    help="recovery density backend.")
+    ap.add_argument("--epsilon", type=float, default=1.0,
+                    help="implicit coupling (ignored by mc_jax / overridden by "
+                         "the ε-match under --gen mc).")
+    ap.add_argument("--gen", choices=["self", "mc"], default="self",
+                    help="'self' = grid sampler from the fit model; 'mc' = EXACT "
+                         "particle-MC injection (cross-method). Two-pulse gives "
+                         "the q spread (1×1, 1×2, 2×2 pairings) that actually "
+                         "pins kernel_b — pair with --solver implicit.")
+    ap.add_argument("--n-m", type=int, default=None)
+    ap.add_argument("--n-chi", type=int, default=None)
+    ap.add_argument("--sigma-log-m", type=float, default=0.1)
+    ap.add_argument("--sigma-chi", type=float, default=0.1)
     args = ap.parse_args()
 
     fixed = demo.FIXED
     print(f"[cfg] TWO-PULSE  n_obs={args.n_obs} n_samples={args.n_samples} "
           f"n_seed={args.n_seed} k_max={args.k_max}")
 
-    fit_grid = demo._grid_for_fit()
+    if args.n_m or args.n_chi:
+        from hierarchical_ad_pop_engine.grids import BinaryGrid
+        fit_grid = BinaryGrid.default(
+            m_min=fixed["m_min"], m_max=fixed["m_max"],
+            n_m=int(args.n_m or demo.N_M_FIT),
+            n_chi=int(args.n_chi or demo.N_CHI_FIT))
+    else:
+        fit_grid = demo._grid_for_fit()
     theta_star = dict(THETA_STAR_2P)
 
-    # dist_fn: two-pulse family, kernel_a floated (10 params).
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat, k_map = jax.random.split(key, 3)
-    dist_fn = make_coagulation_dist_fn(
+    _INJECT_DEPLETION = 0.10
+
+    _common = dict(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc,
-        natal_family="two_gaussian", float_kernel_a=True,
+        gate="soft", grid=fit_grid, natal_family="two_gaussian",
+        float_kernel_a=True)
+
+    # Cross-method ε-matching (PLAN_cross_method Step 2 / H2): build the MC
+    # injection up-front, match the implicit recovery ε to its depletion.
+    recovery_epsilon = args.epsilon
+    mc_inject_ev = _impl_resp = None
+    if args.gen == "mc" and args.solver == "implicit":
+        mc_resp = make_coagulation_dist_fn(
+            **_common, depletion_fraction=_INJECT_DEPLETION, mc_jax_key=k_mc,
+            solver="mc_jax")(**{**theta_star, "log_rate": 0.0})._response.mc_jax_response
+        mc_inject_ev = mc_resp.evaluator
+        n_init = int(getattr(mc_resp, "n_init", args.n_seed))
+        W_total = float(jnp.sum(jnp.asarray(mc_inject_ev.weights)))
+        f_target = max(0.0, min(0.999, 1.0 - W_total / max(n_init, 1)))
+        from hierarchical_ad_pop_engine.response.implicit import (
+            solve_implicit_fixed_point,
+        )
+        _impl_resp = make_coagulation_dist_fn(
+            **_common, solver="implicit", epsilon=1.0)(
+                **{**theta_star, "log_rate": 0.0})._response
+        _v = jnp.asarray(fixed["v_esc"])
+        recovery_epsilon, f_impl, _st = _match_epsilon_to_fdep(
+            lambda e: float(solve_implicit_fixed_point(
+                _impl_resp, _v, epsilon=float(e)).f_natal_depleted),
+            f_target, lo=1e-3, hi=50.0)
+        print(f"[ε-match] MC f_dep={f_target:.4f} → implicit ε*="
+              f"{recovery_epsilon:.4g} (f={f_impl:.4f}, |Δf|="
+              f"{abs(f_impl - f_target):.4f}, {_st})")
+        _jm, _jc, _j2 = cross_method_js(
+            _impl_resp, mc_inject_ev, fit_grid, fixed["v_esc"],
+            epsilon=recovery_epsilon)
+        print(f"[H1-JS ] inject-θ JS(implicit‖MC): dN/dm={_jm:.4f}  "
+              f"dN/dχ={_jc:.4f}  N(m,χ)2D={_j2:.4f} nats")
+        if max(_jm, _jc, _j2) > _H1_JS_WARN:
+            print(f"[H1-JS ] WARNING: JS > {_H1_JS_WARN} — cross-method shape "
+                  f"mismatch at θ*; recovery carries it as a systematic.")
+
+    # dist_fn: two-pulse family, kernel_a floated (10 params).
+    dist_fn = make_coagulation_dist_fn(
+        **_common, depletion_fraction=_INJECT_DEPLETION, mc_jax_key=k_mc,
+        solver=args.solver, epsilon=recovery_epsilon,
         kde_adaptive=args.kde_adaptive)
     if args.kde_adaptive:
         print("[cfg] gen≥2 KDE: Abramson adaptive (variable-bandwidth)")
@@ -256,15 +324,40 @@ def main():
     theta_star["log_rate"] = log_rate_star
     print(f"[cal] μ(logR=0)={float(mu_unit):.4g} → log_rate* = {log_rate_star:.3f}")
 
-    # self-consistent mock catalogue (the fit model generates the events).
     m_hi = fixed["m_max"] * 2.5
-    truth_model = dist_fn(**theta_star)
     k_true, k_scat = jax.random.split(k_cat, 2)
-    true_pts = sample_from_model(
-        truth_model, args.n_obs, k_true, m_lo=fixed["m_min"], m_hi=m_hi)
-    events = scatter_to_posteriors(true_pts, args.n_samples, k_scat, m_hi=m_hi)
+    if args.gen == "mc":
+        # Cross-method: EXACT particle-MC injection (no grid/jitter).
+        if mc_inject_ev is None:  # solver != implicit → build injection here
+            mc_inject_ev = make_coagulation_dist_fn(
+                **_common, depletion_fraction=_INJECT_DEPLETION, mc_jax_key=k_mc,
+                solver="mc_jax")(**theta_star)._response.mc_jax_response.evaluator
+        true_pts = pair_sample_from_mc(mc_inject_ev, args.n_obs, k_true)
+        events = scatter_to_posteriors(
+            true_pts, args.n_samples, k_scat, m_hi=m_hi,
+            sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
+        gm, gc = fit_grid.m, fit_grid.chi
+        events = jnp.stack([
+            jnp.clip(events[..., 0], float(gm[0]), float(gm[-1])),
+            jnp.clip(events[..., 1], float(gm[0]), float(gm[-1])),
+            jnp.clip(events[..., 2], float(gc[0]), float(gc[-1])),
+            jnp.clip(events[..., 3], float(gc[0]), float(gc[-1])),
+        ], axis=-1)
+        print(f"[mock] MC injection: {int(mc_inject_ev.m_active.shape[0])} "
+              f"particle slots; exact-particle pairing ∝ w·w·K")
+    else:
+        # self-consistent grid sampler (faithful: 2× fit grid).
+        truth_model = dist_fn(**theta_star)
+        n_sm, n_sc = 2 * int(fit_grid.m.shape[0]), 2 * int(fit_grid.chi.shape[0])
+        true_pts = sample_from_model(
+            truth_model, args.n_obs, k_true, m_lo=fixed["m_min"], m_hi=m_hi,
+            n_sm=n_sm, n_sc=n_sc)
+        events = scatter_to_posteriors(
+            true_pts, args.n_samples, k_scat, m_hi=m_hi,
+            sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
     ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
-    print(f"[cat] events {tuple(events.shape)}  ln_offsets {tuple(ln_offsets.shape)}")
+    print(f"[cat] gen={args.gen} events {tuple(events.shape)}  "
+          f"ln_offsets {tuple(ln_offsets.shape)}")
 
     logL = build_logL(events, ln_offsets, dist_fn, estimator,
                       T_obs=1.0, n_quad=args.n_quad)
