@@ -105,10 +105,14 @@ def _build_responses(theta):
 def test_cross_method_js_below_gate(theta):
     impl_resp, ev, grid, eps_star, status = _build_responses(theta)
     assert status == "ok", f"ε-match failed at θ={theta} (status={status})"
-    js_m, js_c = fit.cross_method_js(
+    js_m, js_c, js_2d = fit.cross_method_js(
         impl_resp, ev, grid, _V_ESC, epsilon=eps_star)
     print(f"\n[H1] θ+{theta or 'star'}: ε*={eps_star:.4g}  "
-          f"JS dN/dm={js_m:.4f}  dN/dχ={js_c:.4f} nats")
-    assert np.isfinite(js_m) and np.isfinite(js_c)
+          f"JS dN/dm={js_m:.4f}  dN/dχ={js_c:.4f}  N(m,χ)2D={js_2d:.4f} nats")
+    assert np.isfinite(js_m) and np.isfinite(js_c) and np.isfinite(js_2d)
     assert js_m < _JS_GATE, f"dN/dm JS {js_m:.4f} ≥ gate {_JS_GATE} at θ={theta}"
     assert js_c < _JS_GATE, f"dN/dχ JS {js_c:.4f} ≥ gate {_JS_GATE} at θ={theta}"
+    # 2D JS is the structural metric; gate it a bit looser (it sees the
+    # correlation the 1D marginals miss).  Printed regardless for diagnosis.
+    assert js_2d < 1.5 * _JS_GATE, \
+        f"N(m,χ) 2D JS {js_2d:.4f} ≥ gate {1.5 * _JS_GATE} at θ={theta}"

@@ -281,7 +281,30 @@ def cross_method_js(impl_response, mc_evaluator, grid, v_esc, *, epsilon):
 
     js_m = js_divergence(np.asarray(dm_i), np.asarray(dm_m), np.asarray(m_ax))
     js_c = js_divergence(np.asarray(dc_i), np.asarray(dc_m), np.asarray(c_ax))
-    return float(js_m), float(js_c)
+
+    # 2D JS of the JOINT N(m,χ) on the grid measure — the quantity the
+    # likelihood actually reads pointwise (N(m1,χ1)·N(m2,χ2)).  The 1D
+    # marginals integrate out the (m,χ) correlation and the pair structure
+    # kernel_b lives in, so they UNDER-report the cross-method disagreement
+    # that biases σ / kernel_b.  js_2d is the structural sensitivity.
+    w_m, w_chi = _obs.trapezoid_weights(grid)
+    w2d = np.asarray(w_m)[:, None] * np.asarray(w_chi)[None, :]
+    js_2d = _js_2d(np.asarray(N_impl), np.asarray(N_mc), w2d)
+    return float(js_m), float(js_c), float(js_2d)
+
+
+def _js_2d(P, Q, w2d, eps=1e-30):
+    r"""Jensen–Shannon divergence (nats) between two ≥0 densities ``P, Q`` on a
+    2-D grid with cell-measure weights ``w2d`` (renormalised so ∫P=∫Q=1)."""
+    Zp = float(np.sum(P * w2d))
+    Zq = float(np.sum(Q * w2d))
+    if not (Zp > 0 and Zq > 0):
+        return float("nan")
+    p, q = P / Zp, Q / Zq
+    m = 0.5 * (p + q)
+    kl_pm = float(np.sum(np.where(p > 0, p * np.log((p + eps) / (m + eps)), 0.0) * w2d))
+    kl_qm = float(np.sum(np.where(q > 0, q * np.log((q + eps) / (m + eps)), 0.0) * w2d))
+    return 0.5 * (kl_pm + kl_qm)
 
 
 def _bisect_geometric(fn, target, lo, hi, *, max_iter=30, tol=1e-3):
@@ -497,16 +520,20 @@ def main():
         # disagreement (the kernel_b / σ residuals) at the matched ε — if this
         # is large the recovered posterior is a cross-method systematic, not a
         # measurement.
-        _js_m, _js_c = cross_method_js(
+        _js_m, _js_c, _js_2d = cross_method_js(
             _impl_resp, mc_inject_ev, fit_grid, fixed["v_esc"],
             epsilon=recovery_epsilon)
         print(f"[H1-JS ] inject-θ JS(implicit‖MC): dN/dm={_js_m:.4f}  "
-              f"dN/dχ={_js_c:.4f} nats (ln2≈0.693 max)  [cross-method gate]")
-        if max(_js_m, _js_c) > _H1_JS_WARN:
+              f"dN/dχ={_js_c:.4f}  N(m,χ)2D={_js_2d:.4f} nats  [cross-method gate]")
+        print(f"[H1-JS ] (the 2D N(m,χ) JS is the structural one — the likelihood "
+              f"reads N pointwise; 1D marginals miss the σ/kernel_b-driving "
+              f"correlation. If 2D ≫ 1D, the recovery bias is forward-model, "
+              f"not statistical.)")
+        if max(_js_m, _js_c, _js_2d) > _H1_JS_WARN:
             print(f"[H1-JS ] WARNING: JS > {_H1_JS_WARN} — implicit and MC "
-                  f"disagree on the population SHAPE at θ*; the cross-method "
-                  f"recovery carries this as a systematic (chase kernel_b / "
-                  f"resolution / H3 primitive parity before trusting the fit).")
+                  f"disagree on the population structure at θ*; the cross-method "
+                  f"recovery carries this as a systematic (localize with "
+                  f"compare_all per-generation marginals before trusting it).")
 
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
