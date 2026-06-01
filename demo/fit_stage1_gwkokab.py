@@ -239,6 +239,51 @@ def _match_epsilon_to_fdep(f_of_eps, target, *, lo=1e-3, hi=50.0, n_scan=11,
     return e_star, f_star, "ok"
 
 
+# Cross-method JS warn level (nats).  ~0.05 is the red_team/compare_all
+# same-physics agreement scale (engine_v2 ↔ particle MC ≈ 0.007 at ε=1); a
+# cross-method inject/recover above this is a SHAPE systematic worth chasing.
+_H1_JS_WARN = 0.05
+
+
+def cross_method_js(impl_response, mc_evaluator, grid, v_esc, *, epsilon):
+    r"""H1 cross-method gate (PLAN_cross_method Step 3): Jensen–Shannon
+    divergence between the IMPLICIT and the MC ``dN/dm`` & ``dN/dχ`` at a fixed
+    θ, on a common grid.
+
+    Both single-BH densities are marginalised through the SAME
+    :func:`observables.marginal_1d` forward-rate quadrature, and the JS is
+    shape-only (each marginal is renormalised), so the density-convention
+    constants between the two solvers cancel — the divergence measures the
+    genuine method-to-method SHAPE disagreement (e.g. the kernel_b residual),
+    not a normalisation offset.  The implicit density is taken at the
+    depletion-matched ``epsilon`` so this is NOT contaminated by an
+    ε↔depletion (H2) mismatch.
+
+    Returns ``(js_dN_dm, js_dN_dchi)`` in nats (bounded by ln 2 ≈ 0.693).
+    """
+    from hierarchical_ad_pop_engine.response.implicit import (
+        solve_implicit_fixed_point,
+    )
+    from hierarchical_ad_pop_engine import observables as _obs
+    from red_team.phase1_overlay import js_divergence
+
+    res = solve_implicit_fixed_point(
+        impl_response, jnp.asarray(v_esc), epsilon=float(epsilon))
+    N_impl = jnp.exp(res.log_N)
+    M, C = jnp.meshgrid(grid.m, grid.chi, indexing="ij")
+    N_mc = mc_evaluator.density(M, C)
+
+    kp = impl_response.kernel_params
+    m_ax, dm_i = _obs.marginal_1d(N_impl, grid, kp, axis="m1")
+    _, dm_m = _obs.marginal_1d(N_mc, grid, kp, axis="m1")
+    c_ax, dc_i = _obs.marginal_1d(N_impl, grid, kp, axis="chi1")
+    _, dc_m = _obs.marginal_1d(N_mc, grid, kp, axis="chi1")
+
+    js_m = js_divergence(np.asarray(dm_i), np.asarray(dm_m), np.asarray(m_ax))
+    js_c = js_divergence(np.asarray(dc_i), np.asarray(dc_m), np.asarray(c_ax))
+    return float(js_m), float(js_c)
+
+
 def _bisect_geometric(fn, target, lo, hi, *, max_iter=30, tol=1e-3):
     r"""Geometric bisection for a MONOTONE-INCREASING ``fn`` (ε spans orders of
     magnitude, so bisect in log-ε).  Returns ``(x, fn(x))`` with
@@ -446,6 +491,22 @@ def main():
                   "range — recovery cascade depth differs from injection; the "
                   "cross-method fit is unreliable until this is resolved "
                   "(raise hi / check implicit convergence at this grid).")
+
+        # H1 gate (PLAN Step 3): cross-method JS(implicit ↔ MC) at the injection
+        # θ, BEFORE the fit.  Quantifies the genuine method-to-method shape
+        # disagreement (the kernel_b / σ residuals) at the matched ε — if this
+        # is large the recovered posterior is a cross-method systematic, not a
+        # measurement.
+        _js_m, _js_c = cross_method_js(
+            _impl_resp, mc_inject_ev, fit_grid, fixed["v_esc"],
+            epsilon=recovery_epsilon)
+        print(f"[H1-JS ] inject-θ JS(implicit‖MC): dN/dm={_js_m:.4f}  "
+              f"dN/dχ={_js_c:.4f} nats (ln2≈0.693 max)  [cross-method gate]")
+        if max(_js_m, _js_c) > _H1_JS_WARN:
+            print(f"[H1-JS ] WARNING: JS > {_H1_JS_WARN} — implicit and MC "
+                  f"disagree on the population SHAPE at θ*; the cross-method "
+                  f"recovery carries this as a systematic (chase kernel_b / "
+                  f"resolution / H3 primitive parity before trusting the fit).")
 
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],

@@ -40,10 +40,16 @@ implicit is a trapezoid-measure grid density (`observables.total_rate`,
 calibration. The killer is a **θ-dependent** convention drift — it biases the
 recovered shape, not just the rate.
 
-* **Gate:** `red_team/compare_all.py` JS(engine_v2 implicit ↔ particle MC) must
-  hold **at the injection θ**, not only at one fiducial. Sweep a small θ-ball
-  around the injection point and assert JS < threshold on `dN/dm` AND `dN/dχ`.
-* **Test:** a slow pytest that runs the inject-θ JS check; fails on regression.
+* **Gate (DONE 2026-06-01):** `cross_method_js()` (fit_stage1_gwkokab) computes
+  JS(implicit ‖ MC) on `dN/dm` and `dN/dχ` at θ via `observables.marginal_1d`
+  + `phase1_overlay.js_divergence`, with the implicit density taken at the
+  **depletion-matched ε** (so it is NOT an H2 artefact). Shape-only (renormalised
+  marginals) → convention constants cancel. Wired into `--gen mc` to print
+  `[H1-JS ]` and WARN above `_H1_JS_WARN=0.05` BEFORE the fit.
+* **Test (DONE):** `test_cross_method_js_gate.py` asserts JS < 0.10 (loose
+  regression bound + printed diagnostic) across a θ-ball {θ*, μ+1, σ+0.3,
+  kb+0.4}. Tightening the bound tracks resolving the residual systematics and
+  must be backed by a convergence argument (`feedback_no_fudge_factors`).
 
 ### H2 — ε ↔ depletion-fraction / MC-time mapping (the sharpest one)
 MC stops at a depletion fraction `f`; implicit evolves to ε (coupling×time). If
