@@ -62,6 +62,7 @@ from fit_stage1_gwkokab import (  # noqa: E402  (shared cross-method machinery)
     cross_method_js,              # H1 inject-θ JS gate
     _H1_JS_WARN,
     fisher_1d_sigma,              # conditional 1σ from profile curvature
+    fisher_hessian_report,        # joint Fisher eigen-analysis (degeneracy)
 )
 from mock_catalog import scatter_to_posteriors  # noqa: E402
 
@@ -248,6 +249,12 @@ def main():
     ap.add_argument("--n-chi", type=int, default=None)
     ap.add_argument("--sigma-log-m", type=float, default=0.1)
     ap.add_argument("--sigma-chi", type=float, default=0.1)
+    ap.add_argument("--hessian", action="store_true",
+                    help="after the MAP, report the joint Fisher eigen-spectrum "
+                         "(via FD of the AD gradient) — the flat eigenvector is "
+                         "the degenerate direction; marginal σ + Δ/σ_marg say "
+                         "which params are actually unconstrained (vs the "
+                         "conditional 1D σ).")
     args = ap.parse_args()
 
     fixed = demo.FIXED
@@ -409,6 +416,34 @@ def main():
                 # fisher_1d_sigma docstring.
                 z = f"{(m - t) / sig:+6.1f}σ" if sig else "   flat"
                 print(f"   {name:18s} {t:+8.3f} {m:+8.3f} {m - t:+8.3f}   {z}")
+
+            if args.hessian:
+                print("\n=== JOINT FISHER (degeneracy analysis, AD-grad FD) ===")
+                gfn = jax.jit(jax.grad(logL))
+                evals, evecs, sig_marg = fisher_hessian_report(
+                    gfn, map_recovered, PARAM_NAMES)
+                lam_min = float(evals[0])
+                lam_max = float(evals[-1])
+                cond = lam_max / max(lam_min, 1e-30)
+                print(f"  eigenvalues (asc): "
+                      f"{', '.join(f'{e:.2e}' for e in evals)}")
+                print(f"  cond(F) = λ_max/λ_min = {cond:.2e}  "
+                      f"(λ_min={lam_min:.2e} → flat direction)")
+                # flattest eigenvector = the degenerate direction
+                v = np.asarray(evecs[:, 0])
+                order = np.argsort(-np.abs(v))
+                comp = "  ".join(f"{PARAM_NAMES[k]}:{v[k]:+.2f}"
+                                 for k in order[:4])
+                print(f"  flat direction (eigvec @ λ_min): {comp}")
+                print("\n   param              MAP-Δ     σ_marg    Δ/σ_marg")
+                for i, name in enumerate(PARAM_NAMES):
+                    d = float(map_recovered[i]) - float(theta0[i])
+                    sm = float(sig_marg[i])
+                    zz = f"{d / sm:+6.1f}σ" if sm > 0 and np.isfinite(sm) else "  n/a"
+                    print(f"   {name:18s} {d:+8.3f} {sm:9.3g}   {zz}")
+                print("  → params with the LARGEST σ_marg are the unconstrained "
+                      "ones; if they share the flat eigvec they're mutually "
+                      "degenerate (not individually biased).")
 
             if args.label_switch_probe:
                 print("\n=== LABEL-SWITCH PROBE (start μ₁=30, μ₂=10) ===")
