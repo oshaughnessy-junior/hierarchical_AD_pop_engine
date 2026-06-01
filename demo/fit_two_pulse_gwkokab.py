@@ -451,12 +451,15 @@ def main():
                     print(f"  cond(F̃)|>0 = {pos.max() / pos.min():.1f}  "
                           f"(λ_min,+ = {pos.min():.2e} → softest constrained dir)")
                 if not rep["pd"]:
-                    print("  ⚠ scaled Fisher NOT positive-definite at θ* — the "
-                          "kernel_a (m1+m2)^a μ-sensitivity makes logL "
-                          "exponentially non-quadratic; marginal σ suppressed "
-                          "as untrustworthy. The flat-eigvec below is still "
-                          "informative; for a clean Fisher, fix/reparametrise "
-                          "kernel_a (don't float it, or use log-space).")
+                    print("  ⚠ scaled Fisher NOT positive-definite at the "
+                          "(stabilised) MAP — a residual negative eigenvalue "
+                          "survives because kernel_a's (m1+m2)^a μ-sensitivity "
+                          "makes logL exponentially NON-quadratic (no point "
+                          "polish fixes a non-quadratic direction). Marginal σ "
+                          "suppressed as untrustworthy; the softest-POSITIVE "
+                          "eigvec below still names the degeneracy. For a clean "
+                          "PD Fisher, fix/reparametrise kernel_a (don't float "
+                          "it, or use log-space).")
                 # flat = smallest POSITIVE eigenvalue (skip FD-noise negatives)
                 idx_pos = np.where(evals > 0)[0]
                 kflat = int(idx_pos[0]) if idx_pos.size else 0
