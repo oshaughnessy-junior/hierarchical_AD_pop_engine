@@ -219,6 +219,41 @@ def main():
                          "oracle (cross-solver recovery).")
     ap.add_argument("--seed", type=int, default=20260530)
     ap.add_argument("--no-map", action="store_true")
+    ap.add_argument("--solver", choices=["mc_jax", "implicit", "perturbative"],
+                    default="mc_jax",
+                    help="density backend the fit reads through. 'implicit' is "
+                         "the single-pulse self-consistency check: with --gen "
+                         "self the mock is drawn from the SAME implicit model, "
+                         "so the MLE must recover (mu_natal, sigma_natal) — "
+                         "isolates the implicit forward model from the "
+                         "two-pulse λ machinery.")
+    ap.add_argument("--epsilon", type=float, default=1.0,
+                    help="coupling×time for the implicit solver (ignored by mc_jax).")
+    ap.add_argument("--n-m", type=int, default=None,
+                    help="override fit-grid N_m (default demo's 64).")
+    ap.add_argument("--n-chi", type=int, default=None,
+                    help="override fit-grid N_chi (default demo's 20).")
+    ap.add_argument("--sigma-log-m", type=float, default=0.1,
+                    help="mock mass measurement scatter (default 0.1). Pass 0 "
+                         "for the DELTA control: with --sigma-chi 0 the events "
+                         "are unscattered, so any residual width/spin bias is "
+                         "the forward model, NOT measurement deconvolution.")
+    ap.add_argument("--sigma-chi", type=float, default=0.1,
+                    help="mock spin measurement scatter (default 0.1 — note this "
+                         "EQUALS the truth natal_spin_scale, so spin is barely "
+                         "identifiable). Pass 0 with --sigma-log-m 0 for delta.")
+    ap.add_argument("--n-sm", type=int, default=None,
+                    help="self-consistent SAMPLER mass-grid resolution. Default "
+                         "(None) tracks 2× the fit n_m so the mock is FAITHFUL "
+                         "to the density the likelihood reads — the coarse old "
+                         "default (20 over geomspace [m_min,2.5·m_max], Δlog_m≈"
+                         "0.2 with ~0.5 M⊙ within-cell jitter) was fine for the "
+                         "smooth mc_jax KDE but inflated recovered σ against the "
+                         "SHARP implicit grid density. Set explicitly to probe.")
+    ap.add_argument("--n-sc", type=int, default=None,
+                    help="self-consistent SAMPLER spin-grid resolution. Default "
+                         "(None) tracks 2× the fit n_chi (the old default 8 gave "
+                         "Δχ≈0.14, far coarser than a 0.1-wide natal spin).")
     args = ap.parse_args()
 
     fixed = demo.FIXED
@@ -226,7 +261,14 @@ def main():
           f"n_seed={args.n_seed} k_max={args.k_max} selection={args.selection}")
 
     # --- 1. truth (implicit oracle for event positions) + θ* shape -----------
-    fit_grid = demo._grid_for_fit()
+    if args.n_m or args.n_chi:
+        from hierarchical_ad_pop_engine.grids import BinaryGrid
+        fit_grid = BinaryGrid.default(
+            m_min=demo.FIXED["m_min"], m_max=demo.FIXED["m_max"],
+            n_m=int(args.n_m or demo.N_M_FIT),
+            n_chi=int(args.n_chi or demo.N_CHI_FIT))
+    else:
+        fit_grid = demo._grid_for_fit()
     truth_implicit = demo.build_truth_model_and_calibrate_rate(
         args.n_obs, grid=fit_grid)
     demo.THETA_STAR["natal_spin_loc"] = 0.05  # boundary-corrected (M4 rationale)
@@ -238,7 +280,8 @@ def main():
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc)
+        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc,
+        solver=args.solver, epsilon=args.epsilon)
     if args.selection == "vt":
         estimator = make_vt_poisson_mean_estimator(
             vt_powerlaw(), m_min=fixed["m_min"], m_max=fixed["m_max"])
@@ -259,9 +302,21 @@ def main():
         from mock_catalog import scatter_to_posteriors
         truth_model = dist_fn(**theta_star)
         k_true, k_scat = jax.random.split(k_cat, 2)
+        # Faithful self-consistent sampler: default the SAMPLER grid to 2× the
+        # fit grid so the drawn mock is sharper than the density the likelihood
+        # reads (coarse-cell jitter was the implicit σ-inflation root cause,
+        # 2026-06-01). Override via --n-sm/--n-sc to probe the dependence.
+        n_m_fit, n_chi_fit = int(fit_grid.m.shape[0]), int(fit_grid.chi.shape[0])
+        n_sm = int(args.n_sm) if args.n_sm is not None else 2 * n_m_fit
+        n_sc = int(args.n_sc) if args.n_sc is not None else 2 * n_chi_fit
+        print(f"[mock] self-consistent sampler grid = ({n_sm},{n_sc})  "
+              f"(fit grid ({n_m_fit},{n_chi_fit}); faithful default 2×)")
         true_pts = sample_from_model(
-            truth_model, args.n_obs, k_true, m_lo=fixed["m_min"], m_hi=m_hi)
-        events = scatter_to_posteriors(true_pts, args.n_samples, k_scat, m_hi=m_hi)
+            truth_model, args.n_obs, k_true, m_lo=fixed["m_min"], m_hi=m_hi,
+            n_sm=n_sm, n_sc=n_sc)
+        events = scatter_to_posteriors(
+            true_pts, args.n_samples, k_scat, m_hi=m_hi,
+            sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
         ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
     else:
         events, ln_offsets = make_mock_posteriors(

@@ -210,6 +210,8 @@ def make_coagulation_dist_fn(
     natal_family: str = "gaussian",
     float_kernel_a: bool = False,
     kde_adaptive: bool = False,
+    solver: str = "mc_jax",
+    epsilon: float = 1.0,
 ) -> Callable[..., CoagulationPopulation]:
     r"""Build the ``dist_fn`` gwkokab calls as ``dist_fn(**params) -> Distribution``.
 
@@ -251,6 +253,23 @@ def make_coagulation_dist_fn(
     of pulse 2; the ``mu_natal < mu_natal_2`` label-switch convention is
     enforced fit-side by the priors / reparametrisation in
     :mod:`stage1_wiring`, not here.
+
+    Solver
+    ------
+    ``solver`` (default ``"mc_jax"``) selects the density backend the
+    likelihood reads through.  ``"implicit"`` routes both pieces through
+    the grid Picard fixed point (``response/implicit.py``, AD via its
+    ``@jax.custom_vjp`` IFT): ``log_prob`` falls through
+    :meth:`CoagulationResponse.log_rate_density`'s grid path and
+    ``total_rate`` integrates the converged ``N*`` on the engine's
+    trapezoid measure (``observables.total_rate``).  This is the cure for
+    the two-pulse λ/σ₂ bias: the implicit solver carries the
+    mass-dependent ``N_natal − loss[N]`` term, so the surviving 1G shape
+    is reshaped correctly where the ``mc_jax`` hybrid's scalar ``W_1g ×
+    raw-natal`` factorisation cannot (see
+    ``demo/HANDOFF_two_pulse_recovery.md``).  ``epsilon`` (coupling×time,
+    absolute physical scale) is forwarded to the implicit solver and
+    ignored by the MC backends.
     """
     if mc_jax_key is None:
         mc_jax_key = jax.random.PRNGKey(0)
@@ -258,6 +277,11 @@ def make_coagulation_dist_fn(
         raise ValueError(
             "natal_family must be 'gaussian' or 'two_gaussian'; got "
             f"{natal_family!r}"
+        )
+    if solver not in ("mc_jax", "mc", "implicit", "perturbative", "basis"):
+        raise ValueError(
+            "solver must be one of {'mc_jax','mc','implicit','perturbative',"
+            f"'basis'}}; got {solver!r}"
         )
 
     # Lazy import — pulls the engine response package (→ gwkokab) only when
@@ -269,9 +293,32 @@ def make_coagulation_dist_fn(
 
     def _wrap(response) -> CoagulationPopulation:
         env = {"v_esc": jnp.asarray(v_esc)}
-        total_rate_fn = (
-            lambda **kw: response.mc_jax_response.total_rate(**kw)
-        )
+        if solver == "mc_jax":
+            total_rate_fn = (
+                lambda **kw: response.mc_jax_response.total_rate(**kw)
+            )
+        elif solver == "mc":
+            total_rate_fn = (
+                lambda **kw: response.mc_response.total_rate(**kw)
+            )
+        else:
+            # Grid solvers (implicit / perturbative / basis): integrate the
+            # engine's single-BH density on its own trapezoid measure — the
+            # SAME convention :meth:`CoagulationResponse.log_rate_density`
+            # reads through ``_log_total_density`` (so the gwkokab shape term
+            # and the −μ term are mutually consistent).  AD-traceable: the
+            # implicit solve carries its IFT ``@jax.custom_vjp``; the
+            # quadrature after it is pure.  ``n_quad`` (passed by the
+            # estimator) is irrelevant on a grid and is harmlessly ignored.
+            from ..observables import total_rate as _grid_total_rate
+
+            def total_rate_fn(**_kw):
+                log_N = response._log_total_density(env["v_esc"])
+                N = jnp.exp(log_N)
+                return _grid_total_rate(
+                    N, response.grid, response.kernel_params,
+                    response.log_R_env,
+                )
         return CoagulationPopulation(
             response, env, total_rate_fn,
             m_min=m_min, m_max=m_max, m_max_factor=m_max_factor,
@@ -301,7 +348,8 @@ def make_coagulation_dist_fn(
                 log_R_env=log_rate,
                 k_max=k_max,
                 grid=grid,
-                solver="mc_jax",
+                solver=solver,
+                epsilon=epsilon,
                 mc_v_esc=v_esc,
                 mc_n_seed=n_seed,
                 mc_depletion_fraction=depletion_fraction,
@@ -340,7 +388,8 @@ def make_coagulation_dist_fn(
                 log_R_env=log_rate,
                 k_max=k_max,
                 grid=grid,
-                solver="mc_jax",
+                solver=solver,
+                epsilon=epsilon,
                 mc_v_esc=v_esc,
                 mc_n_seed=n_seed,
                 mc_depletion_fraction=depletion_fraction,

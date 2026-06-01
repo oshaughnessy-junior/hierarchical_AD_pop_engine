@@ -56,14 +56,30 @@ from hierarchical_ad_pop_engine.inference.gwkokab_bridge import (  # noqa: E402
 
 
 def _make(args, key):
-    fit_grid = demo._grid_for_fit()
+    # Resolution sweep hook: --n-m / --n-chi override the demo's default fit
+    # grid (64, 20).  Lets us isolate whether the residual implicit λ bias is
+    # a grid-resolution floor (spin n_chi: natal peak is scale=0.05 on a
+    # Δχ≈0.05 cell at n_chi=20; mass n_m: pulse-2 σ₂=2 ≈ 1.4 cells/σ at n_m=64)
+    # vs a structural degeneracy (peak stays off as both n_m, n_chi grow).
+    n_m = getattr(args, "n_m", None)
+    n_chi = getattr(args, "n_chi", None)
+    if n_m or n_chi:
+        from hierarchical_ad_pop_engine.grids import BinaryGrid
+        fit_grid = BinaryGrid.default(
+            m_min=demo.FIXED["m_min"], m_max=demo.FIXED["m_max"],
+            n_m=int(n_m or demo.N_M_FIT), n_chi=int(n_chi or demo.N_CHI_FIT),
+        )
+    else:
+        fit_grid = demo._grid_for_fit()
     fixed = demo.FIXED
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
         depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=key,
         natal_family="two_gaussian", float_kernel_a=True,
-        kde_adaptive=getattr(args, "kde_adaptive", False))
+        kde_adaptive=getattr(args, "kde_adaptive", False),
+        solver=getattr(args, "solver", "mc_jax"),
+        epsilon=getattr(args, "epsilon", 1.0))
     return dist_fn, coagulation_poisson_mean_estimator, fixed
 
 
@@ -155,16 +171,31 @@ def d3_resolution(args, key):
     for n_seed in args.n_seed_list:
         a = argparse.Namespace(**vars(args)); a.n_seed = int(n_seed)
         dist_fn, estimator, fixed = _make(a, key)
+        # Report the actual grid the solver ran on (implicit ignores n_seed; the
+        # GRID is its resolution knob — see --n-m / --n-chi for the sweep).
+        g = dist_fn(**{**dict(F.THETA_STAR_2P), "log_rate": 0.0})._response.grid
+        n_m, n_chi = int(g.m.shape[0]), int(g.chi.shape[0])
+        dchi = float(g.chi[1] - g.chi[0])
         theta_star, events = _calib_and_catalogue(a, dist_fn, estimator, fixed, key)
-        shp = []
+        obj = []
         for x in xs:
             td = dict(theta_star); td["lambda_natal"] = float(x)
-            s, _ = _shape_and_mu(dist_fn, estimator, events, td, a.n_quad)
-            shp.append(s)
-        pk = xs[int(np.argmax(shp))]
-        print(f"  n_seed={n_seed:5d}  λ shape-peak={pk:+.3f}  (truth={truth_lam:.3f})")
-    print("  → peak → truth as n_seed↑ ⇒ n_seed-resolution-limited gen≥2 KDE "
-          "(fix the 2G+ estimator); peak STAYS off ⇒ a real degeneracy/metric bug.")
+            s, mu = _shape_and_mu(dist_fn, estimator, events, td, a.n_quad)
+            # --full profiles the UNBIASED Poisson objective (shape − μ).  The
+            # default shape-only objective has E[score]=∂μ/∂λ≠0 at truth, so it
+            # is EXPECTED to peak off-truth (mass-dependent depletion ⇒ ∂μ/∂λ<0
+            # ⇒ shape-only peak below truth).  Only shape−μ is the MLE.
+            obj.append(s - mu if getattr(a, "full", False) else s)
+        pk = xs[int(np.argmax(obj))]
+        which = "FULL(shape−μ)" if getattr(args, "full", False) else "shape-only"
+        tag = f"grid=({n_m},{n_chi}) Δχ≈{dchi:.3f}"
+        print(f"  n_seed={n_seed:5d}  {tag}  λ {which}-peak={pk:+.3f}  "
+              f"(truth={truth_lam:.3f})")
+    print("  → SHAPE-ONLY peak is a biased objective (the −μ term is dropped); "
+          "do NOT read it as the recovered λ.  Re-run with --full for the MLE.")
+    print("  → [implicit] n_seed is inert; the grid is the resolution knob "
+          "(--n-m/--n-chi).  If the --full peak sits at truth, implicit works "
+          "and the shape-only offset was the expected ∂μ/∂λ pull.")
 
 
 def main():
@@ -187,6 +218,30 @@ def main():
                     help="use the Abramson variable-bandwidth gen≥2 KDE "
                          "(re-run D1/D3 with it on to check the σ₂/λ peaks "
                          "move toward truth).")
+    ap.add_argument("--solver", type=str, default="mc_jax",
+                    choices=["mc_jax", "implicit", "perturbative"],
+                    help="density backend the likelihood reads through. "
+                         "'implicit' routes through the grid Picard fixed "
+                         "point (carries the mass-dependent loss term that "
+                         "reshapes the surviving 1G pulses) — the pivot from "
+                         "the mc_jax hybrid for the λ/σ₂ bias.")
+    ap.add_argument("--epsilon", type=float, default=1.0,
+                    help="coupling×time for the implicit solver (ignored by mc_jax).")
+    ap.add_argument("--n-m", type=int, default=None,
+                    help="override fit-grid N_m (default demo's 64). Sweep this "
+                         "to test whether the implicit λ bias is mass-resolution "
+                         "limited (pulse-2 σ₂=2 is ~1.4 cells/σ at n_m=64).")
+    ap.add_argument("--n-chi", type=int, default=None,
+                    help="override fit-grid N_chi (default demo's 20). Sweep this "
+                         "to test spin-resolution: natal spin scale=0.05 is ~1 "
+                         "cell wide at n_chi=20 (Δχ≈0.05) — the wall that "
+                         "originally forced the implicit→MC move.")
+    ap.add_argument("--full", action="store_true",
+                    help="profile the UNBIASED Poisson objective (shape − μ) "
+                         "instead of the shape term alone. The shape-only peak "
+                         "is biased by ∂μ/∂λ at truth; only shape−μ is the MLE. "
+                         "Use this to tell 'implicit is biased' from 'D3 was "
+                         "reading the wrong objective'.")
     ap.add_argument("--d3", action="store_true", help="run only the n_seed sweep")
     ap.add_argument("--n-seed-list", type=int, nargs="+",
                     default=[400, 800, 1600])
