@@ -307,6 +307,43 @@ def _js_2d(P, Q, w2d, eps=1e-30):
     return 0.5 * (kl_pm + kl_qm)
 
 
+def fisher_1d_sigma(xs, ys, n_top=5):
+    r"""Conditional 1-σ width from a quadratic fit to the TOP of a 1-D logL
+    profile (the user's "normalise Δ to the local curvature" instrument).
+
+    Near a maximum ``logL(x) ≈ logL_max − ½(x−x̂)²/σ²``, so a parabola fit to
+    the top ``n_top`` points gives ``σ = sqrt(−1/(2·c₂))`` where ``c₂`` is the
+    quadratic coefficient.  Returns ``σ`` (float) or ``None`` when the top is
+    NOT concave — i.e. flat, monotone, or pinned at a rail — exactly the
+    "we don't always have a nice quadratic maximum" case the caller flagged.
+
+    Note: this is the CONDITIONAL 1-σ (the profile holds the other params at
+    truth).  For a parameter in a degenerate direction the MARGINAL σ is much
+    larger, so ``Δ/σ_conditional`` OVER-states significance there — read a large
+    Δ/σ on kernel_a / kernel_b / log_rate as "degenerate", not "biased", and
+    confirm with the joint Hessian.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    if xs.size < 3:
+        return None
+    k = int(np.argmax(ys))
+    lo = max(0, min(k - n_top // 2, xs.size - n_top))
+    hi = min(xs.size, lo + n_top)
+    lo = max(0, hi - n_top)
+    xw, yw = xs[lo:hi], ys[lo:hi]
+    if xw.size < 3 or np.ptp(xw) == 0:
+        return None
+    try:
+        c2, _c1, _c0 = np.polyfit(xw, yw, 2)
+    except Exception:
+        return None
+    if not np.isfinite(c2) or c2 >= 0:        # not concave → unconstrained
+        return None
+    sigma = float(np.sqrt(-1.0 / (2.0 * c2)))
+    return sigma if (np.isfinite(sigma) and sigma > 0) else None
+
+
 def _bisect_geometric(fn, target, lo, hi, *, max_iter=30, tol=1e-3):
     r"""Geometric bisection for a MONOTONE-INCREASING ``fn`` (ε spans orders of
     magnitude, so bisect in log-ε).  Returns ``(x, fn(x))`` with

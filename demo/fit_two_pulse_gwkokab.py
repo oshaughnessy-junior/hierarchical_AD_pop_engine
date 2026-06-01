@@ -61,6 +61,7 @@ from fit_stage1_gwkokab import (  # noqa: E402  (shared cross-method machinery)
     _match_epsilon_to_fdep,       # H2 ε↔depletion matching
     cross_method_js,              # H1 inject-θ JS gate
     _H1_JS_WARN,
+    fisher_1d_sigma,              # conditional 1σ from profile curvature
 )
 from mock_catalog import scatter_to_posteriors  # noqa: E402
 
@@ -368,7 +369,7 @@ def main():
     # --- 1-D profiles --------------------------------------------------------
     print("\n=== 1-D LOG-LIKELIHOOD PROFILES (through θ*) ===")
     ranges = _profile_ranges(theta0)
-    profiles, ident = {}, {}
+    profiles, ident, sig1d = {}, {}, {}
     for i, name in enumerate(PARAM_NAMES):
         xs = ranges[name]
         ys = np.asarray([float(logL_j(theta0.at[i].set(float(x)))) for x in xs])
@@ -377,9 +378,12 @@ def main():
         truth = float(theta0[i])
         span = float(ys.max() - ys.min())
         ident[name] = (peak, truth, span)
+        sig1d[name] = fisher_1d_sigma(xs, ys)
         flag = "IDENTIFIED" if span > 2.0 else "weak/flat"
+        sig = sig1d[name]
+        sig_s = f"σ₁d={sig:.3g}" if sig else "σ₁d=flat"
         print(f"  {name:18s} truth={truth:+.3f}  peak={peak:+.3f}  "
-              f"Δ(logL)={span:6.2f}  [{flag}]")
+              f"Δ(logL)={span:8.2f}  {sig_s:12s}  [{flag}]")
 
     # --- MAP from a perturbed (correctly-ordered) start ----------------------
     map_recovered = None
@@ -395,10 +399,16 @@ def main():
                 [0.3, 0.2, 0.3, 0.2, 0.3, 0.3, 0.2, 0.4, 0.5, 0.4])
             map_recovered = _run_map(
                 logL, theta0, u0, steps=args.map_steps, lr=args.map_lr, tag="ord")
-            print("\n   param              truth      MAP       Δ")
+            print("\n   param              truth      MAP       Δ      Δ/σ₁d")
             for i, name in enumerate(PARAM_NAMES):
                 t, m = float(theta0[i]), float(map_recovered[i])
-                print(f"   {name:18s} {t:+8.3f} {m:+8.3f} {m - t:+8.3f}")
+                sig = sig1d.get(name)
+                # Δ/σ₁d: significance of the bias vs the CONDITIONAL profile
+                # width.  ">N σ" on kernel_a/b/log_rate = degenerate direction
+                # (conditional σ ≪ marginal σ), NOT a clean bias — see the
+                # fisher_1d_sigma docstring.
+                z = f"{(m - t) / sig:+6.1f}σ" if sig else "   flat"
+                print(f"   {name:18s} {t:+8.3f} {m:+8.3f} {m - t:+8.3f}   {z}")
 
             if args.label_switch_probe:
                 print("\n=== LABEL-SWITCH PROBE (start μ₁=30, μ₂=10) ===")
