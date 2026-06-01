@@ -30,18 +30,48 @@ systematic, and a `kernel_a`↔`log_rate` model degeneracy from floating kernel_
 7. **Diagnostics** (`5b6409d`,`bc4f5b6`,`ea501db`): `Δ/σ₁d`, `peak-bias`,
    `--hessian` joint Fisher (scaled, eval@MAP, soft-direction stabilize).
 
-## Scientific state (two-pulse, `--gen mc --solver implicit`, n_obs=60)
+## Scientific state (two-pulse, `--gen mc --solver implicit`)
 
-* **λ recovers**: MAP 0.414 (+0.3σ). Headline result. ✓
-* **mu_natal, mu_natal_2, spins, log_rate-shape**: recover well. ✓
-* **`sigma_natal`**: peak 1.33, MAP 1.30 — a **structural** cross-method bias,
-  2.8σ at n_obs=60 and ~6.9σ at n_obs=400 (it SHARPENS with data → real
-  forward-model floor, the 0.086 2D JS, ~30%). The thing to reduce next.
-* **`sigma_natal_2`**: +1.7–1.9σ (looser — fewer pulse-2 events).
-* **`kernel_a`↔`log_rate`**: 1D-peak at truth, joint MAP slides together
-  (kernel_a −10σ, log_rate +12σ in CONDITIONAL σ). A **model degeneracy** from
-  `float_kernel_a=True`, NOT a bias — the `--hessian` marginal σ_marg/σ₁d
-  inflation + flat eigvec show this. `kernel_b` follows the same valley.
+The n_obs scaling is the key diagnostic — biases that GROW ∝√n_obs are
+structural (forward-model), not statistical:
+
+| param         | n_obs=60     | n_obs=400    | interpretation |
+|---------------|--------------|--------------|----------------|
+| lambda_natal  | 0.414 (+0.3σ)| 0.466 (+3.9σ)| +16%, hidden by noise at n60 |
+| sigma_natal   | 1.30 (+2.6σ) | 1.36 (+7.5σ) | **+36% structural** |
+| sigma_natal_2 | 2.60 (+1.9σ) | 2.72 (+6.0σ) | **+36% structural** |
+| mu_natal_2    | (1.1σ)       | (3.2σ)       | small, sharpening |
+| spins, mu_natal | clean      | clean        | ✓ |
+
+* **The cross-method systematic is WIDTH-DOMINATED** (σ₁, σ₂ both +36%), λ +16%.
+  Physical: the particle-MC vs implicit-Picard cascade difference is a density
+  SHAPE difference, so the width params absorb it most. Quantified by the
+  `[H1-JS] N(m,χ)2D = 0.086` (the canary — it predicted the systematic).
+* **`kernel_a`↔`log_rate`**: a **model degeneracy** from `float_kernel_a=True`,
+  NOT a bias. `--hessian` (eval@MAP + stabilize) now confirms it: softest
+  eigvec = `log_rate:+0.82 kernel_a:-0.55`. A residual negative eigenvalue
+  survives (kernel_a (m1+m2)^a is exponentially non-quadratic — flagged, not
+  fixable by polish). `kernel_b` follows the same valley.
+
+## Paper framing (PROOF-OF-CONCEPT) — agreed 2026-06-01
+
+* **Headline**: cross-method inject-MC / recover-implicit RECOVERS the two-pulse
+  population (λ, μ's, spins), using each method where it's strong (MC: exact
+  injection, no grid bias; implicit: sharp KDE-free recovery).
+* **The width systematic is a forward-model SYSTEMATIC CHECK, not a bug.** It
+  measures "how much does the answer depend on which cascade solver you trust"
+  (~36% on widths at the current grid). The UNBIASED production path is
+  **implicit→implicit** self-consistent recovery (faithful sampler, no
+  cross-method floor) — that's what runs on real data; cross-method is the
+  systematic estimate alongside it.
+* **Resolution hypothesis (testable, expected to hold)**: because H2 (ε-match)
+  and the kernel (H3) are exact and the density convention cancels in the JS,
+  the 0.086 is a DISCRETIZATION difference — it should converge to 0 as the
+  implicit grid AND the MC n_seed refine together. If it does, the width
+  systematic is a resolution knob, not a floor. **This is the first thing to
+  test next session** (sweep n_m/n_chi AND n_seed jointly; watch 2D JS → 0 and
+  σ-bias → 0). Single-axis sweeps didn't move it (each alone insufficient);
+  the joint refinement is the well-calibrated limit.
 
 ## H1/H2/H3 verdicts
 
@@ -53,19 +83,24 @@ systematic, and a `kernel_a`↔`log_rate` model degeneracy from floating kernel_
   pairing, MC cascade (`_kernel_K_jax`, ∝ N·N·K, a=0 ⇒ exact K_max), implicit
   gain/loss + recovery. No kernel bug. ✓
 
-## Open threads (next session)
+## Next session: PAPER CONTENT PREP
 
-1. **Reduce the `sigma_natal` floor.** It's the MC-vs-Picard forward-model
-   difference. Localize with `red_team/compare_all.py` per-generation marginals
-   (gen-1 should agree; if gen-2+ diverges, that's the cascade-placement
-   difference driving σ). n_seed↑ shrinks JS but NOT the bias (structural).
-2. **Lift the `kernel_a`↔`log_rate` degeneracy** for a clean corner: either
-   don't float kernel_a, or reparametrise to (overall-rate, mass-slope)
-   orthogonal coords / log-kernel_a. Then `--hessian` is cleanly PD and the
-   Fisher is publication-grade.
-3. **n_obs scaling study** (user running): confirm sigma_natal bias ∝√n_obs
-   (structural) vs the constrained params staying ~truth.
-4. **Two-pulse SVI/NUTS** corner once the degeneracy is lifted.
+Plan is to start drafting proof-of-concept paper content. Before/while drafting:
+
+1. **JOINT resolution sweep (the key result for the paper).** Sweep implicit
+   `--n-m/--n-chi` AND MC `--n-seed` TOGETHER; tabulate `[H1-JS] N(m,χ)2D` and
+   the σ₁/σ₂ bias vs resolution. Expected: both → 0 in the well-calibrated
+   limit (H2/H3 exact ⇒ the 0.086 is discretization). This converts "36%
+   systematic" into "resolution-controlled, converges away" — the headline
+   robustness claim. n_obs=400 is the right scale to see the bias clearly.
+2. **Figures**: (a) cross-method recovery corner/profiles (λ + natal params);
+   (b) the resolution-convergence plot (JS & σ-bias → 0); (c) the H1/H2/H3
+   gate values; (d) maybe the σ₁d/Δ-σ diagnostic table.
+3. **Lift the `kernel_a`↔`log_rate` degeneracy** for a clean corner: don't float
+   kernel_a, or reparametrise to (overall-rate, mass-slope) coords / log-kernel_a.
+   Then `--hessian` is cleanly PD, publication-grade.
+4. **Method narrative**: implicit→implicit = unbiased production; cross-method =
+   systematic check; resolution controls the residual.
 
 ## Run
 
