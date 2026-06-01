@@ -203,6 +203,36 @@ def pair_sample_from_mc(evaluator, n_events, key):
                       jnp.where(hi, c1, c2), jnp.where(hi, c2, c1)], axis=-1)
 
 
+def _bisect_geometric(fn, target, lo, hi, *, max_iter=30, tol=1e-3):
+    r"""Geometric bisection for a MONOTONE-INCREASING ``fn`` (ε spans orders of
+    magnitude, so bisect in log-ε).  Returns ``(x, fn(x))`` with
+    ``|fn(x)-target| < tol`` or the last midpoint after ``max_iter``.
+
+    Used to match the implicit recovery ε to the MC injection's depletion
+    fraction (PLAN_cross_method Step 2 / H2): ``f_natal_depleted(ε)`` is
+    monotone increasing 0→1, so a unique ε reproduces the MC's cascade depth.
+    No closed-form K_eff needed — the dimensionless depletion fraction is
+    matched directly, sidestepping all weight-normalisation conventions.
+    """
+    flo, fhi = fn(lo), fn(hi)
+    if not (flo <= target <= fhi):
+        # target outside the bracket — return the nearer endpoint.
+        if abs(flo - target) <= abs(fhi - target):
+            return lo, flo
+        return hi, fhi
+    x, fx = (lo * hi) ** 0.5, None
+    for _ in range(max_iter):
+        x = (lo * hi) ** 0.5
+        fx = fn(x)
+        if abs(fx - target) < tol:
+            return x, fx
+        if fx < target:
+            lo = x
+        else:
+            hi = x
+    return x, fx
+
+
 def build_logL(events, ln_offsets, dist_fn, estimator, *, T_obs, n_quad):
     r"""θ-vector → scalar gwkokab analytical-Poisson log-likelihood (jit-able)."""
     from gwkokab.inference.poissonlikelihood_utils import (
@@ -329,11 +359,58 @@ def main():
     # --- 2. dist_fn + estimator (the new wiring) -----------------------------
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat, k_map = jax.random.split(key, 3)
+    _INJECT_DEPLETION = 0.10  # MC injection cascade depth (the budget the soft
+                              # gate pins); the recovery ε is matched to it.
+
+    # Cross-method ε-matching (PLAN_cross_method Step 2 / H2).  For --gen mc we
+    # inject with MC at depletion f and MUST recover with implicit at the ε that
+    # reproduces the SAME cascade depth — otherwise the two methods are at
+    # different "times" and recovery is wildly biased (observed 2026-06-01).
+    # Build the MC injection up-front, read its achieved depletion, then
+    # root-find the implicit ε that matches it.
+    recovery_epsilon = args.epsilon
+    mc_inject_ev = None
+    k_inject = k_cat
+    if args.gen == "mc" and args.solver == "implicit":
+        mc_inject_dist_fn = make_coagulation_dist_fn(
+            v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
+            kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
+            depletion_fraction=_INJECT_DEPLETION, gate="soft", grid=fit_grid,
+            mc_jax_key=k_mc, solver="mc_jax")
+        mc_inject_model = mc_inject_dist_fn(**theta_star)
+        mc_resp = mc_inject_model._response.mc_jax_response
+        mc_inject_ev = mc_resp.evaluator
+        n_init = int(getattr(mc_resp, "n_init", args.n_seed))
+        W_total = float(jnp.sum(jnp.asarray(mc_inject_ev.weights)))
+        f_target = max(0.0, min(0.999, 1.0 - W_total / max(n_init, 1)))
+
+        # f_of_eps: implicit f_natal_depleted at coupling ε (build response once;
+        # vary ε in the solve only — ε does not change natal/kernel).
+        from hierarchical_ad_pop_engine.response.implicit import (
+            solve_implicit_fixed_point,
+        )
+        _impl_dist_fn = make_coagulation_dist_fn(
+            v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
+            kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
+            grid=fit_grid, solver="implicit", epsilon=1.0)
+        _impl_resp = _impl_dist_fn(**theta_star)._response
+        _v = jnp.asarray(fixed["v_esc"])
+
+        def _f_of_eps(eps):
+            res = solve_implicit_fixed_point(_impl_resp, _v, epsilon=float(eps))
+            return float(res.f_natal_depleted)
+
+        recovery_epsilon, f_impl = _bisect_geometric(
+            _f_of_eps, f_target, 1e-3, 1e3, max_iter=28, tol=2e-3)
+        print(f"[ε-match] MC injection f_dep={f_target:.4f}  →  implicit "
+              f"ε*={recovery_epsilon:.4g} (f_natal_depleted={f_impl:.4f}, "
+              f"|Δf|={abs(f_impl - f_target):.4f})  [H2 parity gate]")
+
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc,
-        solver=args.solver, epsilon=args.epsilon)
+        depletion_fraction=_INJECT_DEPLETION, gate="soft", grid=fit_grid,
+        mc_jax_key=k_mc, solver=args.solver, epsilon=recovery_epsilon)
     if args.selection == "vt":
         estimator = make_vt_poisson_mean_estimator(
             vt_powerlaw(), m_min=fixed["m_min"], m_max=fixed["m_max"])
@@ -371,27 +448,25 @@ def main():
             sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
         ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
     elif args.gen == "mc":
-        # Cross-method injection (PLAN_cross_method Step 1): draw EXACT pair
-        # events from the MC particle pool, recover with --solver implicit.
-        # Build a separate mc_jax injection response at θ* (the fit dist_fn is
-        # the recovery solver). log_rate is irrelevant to the injected SHAPE —
-        # the count is fixed at n_obs — so θ*'s calibrated log_rate is fine.
+        # Cross-method injection (PLAN_cross_method Step 1+2): draw EXACT pair
+        # events from the MC particle pool; recover with --solver implicit at
+        # the ε matched to the injection depletion (computed in §2 above).
         from mock_catalog import scatter_to_posteriors
-        k_true, k_scat = jax.random.split(k_cat, 2)
-        mc_inject_dist_fn = make_coagulation_dist_fn(
-            v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
-            kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-            depletion_fraction=0.10, gate="soft", grid=fit_grid,
-            mc_jax_key=k_mc, solver="mc_jax")
-        mc_model = mc_inject_dist_fn(**theta_star)
-        inj_ev = mc_model._response.mc_jax_response.evaluator
-        n_part = int(inj_ev.m_active.shape[0])
-        n_merg = int(jnp.asarray(inj_ev.mergers).shape[0])
+        k_true, k_scat = jax.random.split(k_inject, 2)
+        if mc_inject_ev is None:
+            # solver != implicit (e.g. mc_jax recovery): build injection here.
+            mc_inject_dist_fn = make_coagulation_dist_fn(
+                v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
+                kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
+                depletion_fraction=_INJECT_DEPLETION, gate="soft", grid=fit_grid,
+                mc_jax_key=k_mc, solver="mc_jax")
+            mc_inject_ev = mc_inject_dist_fn(
+                **theta_star)._response.mc_jax_response.evaluator
+        n_part = int(mc_inject_ev.m_active.shape[0])
+        n_merg = int(jnp.asarray(mc_inject_ev.mergers).shape[0])
         print(f"[mock] MC injection: {n_part} particle slots, {n_merg} merger "
-              f"rows  (H2/ε-matching is PLAN Step 2: map MC state → ε via "
-              f"ε=2·n_mergers/(K·N_active²); recovery ε={args.epsilon} is "
-              f"NOT yet matched — Step-1 harness only)")
-        true_pts = pair_sample_from_mc(inj_ev, args.n_obs, k_true)
+              f"rows; exact-particle pairing ∝ w·w·K (no grid/jitter)")
+        true_pts = pair_sample_from_mc(mc_inject_ev, args.n_obs, k_true)
         events = scatter_to_posteriors(
             true_pts, args.n_samples, k_scat, m_hi=m_hi,
             sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)

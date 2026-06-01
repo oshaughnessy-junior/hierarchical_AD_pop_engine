@@ -103,3 +103,28 @@ def test_pair_frequency_matches_wwK():
     np.testing.assert_allclose(emp, pw, atol=0.02)
     print(f"\n[P2] empirical pair freq matches ∝ w·w·K: {np.round(emp,3)} "
           f"vs {np.round(pw,3)}")
+
+
+# ===========================================================================
+# Step 2 (H2) ε-matching: the geometric bisection on the (monotone-increasing)
+# depletion-fraction-vs-ε curve.  Tested against a known saturating analogue
+# f(ε)=ε/(1+ε) so the inverse is closed form (ε = f/(1-f)).
+# ===========================================================================
+@pytest.mark.parametrize("f_target", [0.05, 0.1, 0.25, 0.5, 0.8])
+def test_bisect_matches_depletion_curve(f_target):
+    f_of_eps = lambda e: e / (1.0 + e)          # 0→1 monotone increasing
+    eps_star, f_hit = fit._bisect_geometric(
+        f_of_eps, f_target, 1e-6, 1e6, max_iter=60, tol=1e-9)
+    expected = f_target / (1.0 - f_target)
+    assert abs(f_hit - f_target) < 1e-6
+    np.testing.assert_allclose(eps_star, expected, rtol=1e-3)
+    print(f"\n[H2] f*={f_target}: ε*={eps_star:.5g} vs closed form {expected:.5g}")
+
+
+def test_bisect_returns_nearest_endpoint_when_target_out_of_bracket():
+    f_of_eps = lambda e: e / (1.0 + e)
+    # target above what f can reach within [lo, hi] ⇒ clamp to hi side
+    eps_star, f_hit = fit._bisect_geometric(
+        f_of_eps, 0.999999, 1e-3, 1.0, max_iter=10, tol=1e-9)
+    assert eps_star == 1.0           # nearer endpoint
+    print(f"\n[H2] out-of-bracket target clamps to endpoint ε={eps_star}")

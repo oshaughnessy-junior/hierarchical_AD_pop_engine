@@ -50,13 +50,24 @@ MC stops at a depletion fraction `f`; implicit evolves to ε (coupling×time). I
 `f` and ε do not map to the **same physical evolution time**, the cascade depth
 differs → a 2G+ offset that looks exactly like a real hierarchical feature.
 
-* **Calibration:** the M1 closed form `ε(MC_state) = 2·n_mergers/(K·N_active²)`
-  (`project_mc_jax_total_rate_bias` / M1 work) gives ε from the MC stopping
-  state. Wire it into the harness: inject MC at `f`, read back the implied ε*,
-  recover implicit **at that ε\***. Do not hand-pick ε.
-* **Test:** assert the injected MC `f_natal_depleted` and the implicit
-  `ImplicitSolveResult.f_natal_depleted` agree at the mapped ε* (the engine
-  already exposes `f_natal_depleted` on both paths).
+* **Calibration (DONE 2026-06-01, `--gen mc --solver implicit`):** the M1
+  closed form `ε = 2·n_mergers/(K_eff·N_active²)` is **exact only for
+  constant-K / monodisperse**; for the Stage-1 kernel `K_eff` is a
+  state-averaged self-consistent quantity (see M1 module "Generalisation").
+  Rather than trust the approximate closed form, the harness matches the
+  **dimensionless depletion fraction directly**: read the MC injection's
+  `f_dep = 1 − W_total/n_init`, then root-find (geometric bisection,
+  `_bisect_geometric`) the implicit ε such that
+  `solve_implicit_fixed_point(ε).f_natal_depleted == f_dep`. This is
+  convention-safe (no weight-normalisation or `n_mergers`-padding ambiguity —
+  `f_dep` is a pure ratio defined identically by both methods) and makes the
+  H2 parity **exact by construction**. The M1 closed form remains the sanity
+  reference (`test_mc_time_calibration.py`); the bisection is its
+  convention-robust production replacement for non-constant K.
+* **Test:** `test_mc_pair_inject.py` pins the bisection against the saturating
+  analogue `f(ε)=ε/(1+ε)` (closed-form inverse). The harness prints `|Δf|`
+  between MC `f_dep` and implicit `f_natal_depleted` at ε* every run — the live
+  H2 gate.
 
 ### H3 — shared low-level physics primitives only
 Both paths must call the *same* remnant mass/spin (Barausse–Rezzolla aligned),
