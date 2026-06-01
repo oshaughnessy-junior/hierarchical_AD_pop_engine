@@ -63,6 +63,7 @@ from fit_stage1_gwkokab import (  # noqa: E402  (shared cross-method machinery)
     _H1_JS_WARN,
     fisher_1d_sigma,              # conditional 1σ from profile curvature
     fisher_hessian_report,        # joint Fisher eigen-analysis (degeneracy)
+    stabilize_soft_directions,    # line-max polish along soft directions
 )
 from mock_catalog import scatter_to_posteriors  # noqa: E402
 
@@ -423,11 +424,25 @@ def main():
                 print(f"   {name:18s} {t:+8.3f} {m:+8.3f} {m - t:+8.3f}   {z}")
 
             if args.hessian:
-                print("\n=== JOINT FISHER (degeneracy analysis, AD-grad FD @ θ*) ===")
+                print("\n=== JOINT FISHER (degeneracy analysis, AD-grad FD) ===")
                 gfn = jax.jit(jax.grad(logL))
                 scales = [sig1d.get(n) for n in PARAM_NAMES]
-                # Evaluate at θ* (smooth calibration point), NOT the stiff MAP.
-                rep = fisher_hessian_report(gfn, theta0, PARAM_NAMES, scales)
+                # Evaluate at the MAP (a true local max → −Hessian is PD), not
+                # θ* (which for cross-method is NOT the max → spurious negative
+                # eigenvalues along the θ*→MAP bias direction).
+                theta_fish = np.asarray(map_recovered, dtype=float)
+                rep = fisher_hessian_report(gfn, theta_fish, PARAM_NAMES, scales)
+                if not rep["pd"]:
+                    print("  [stabilize] MAP Fisher not PD — line-maximising "
+                          "logL along the soft/negative directions to polish "
+                          "the stationary point...")
+                    theta_fish, rep = stabilize_soft_directions(
+                        logL, gfn, theta_fish, PARAM_NAMES, scales)
+                    shift = "  ".join(
+                        f"{PARAM_NAMES[i]}:{theta_fish[i] - float(map_recovered[i]):+.3f}"
+                        for i in np.argsort(
+                            -np.abs(theta_fish - np.asarray(map_recovered)))[:4])
+                    print(f"  [stabilize] polished point shift (top 4): {shift}")
                 evals, evecs = rep["evals"], rep["evecs"]
                 print("  scaled eigenvalues (asc): "
                       + ", ".join(f"{e:+.2e}" for e in evals))
@@ -450,16 +465,18 @@ def main():
                 comp = "  ".join(f"{PARAM_NAMES[k]}:{v[k]:+.2f}" for k in order[:4])
                 print(f"  softest direction (scaled eigvec @ λ={evals[kflat]:+.2e}): {comp}")
                 if rep["pd"]:
-                    print("\n   param              MAP-Δ   σ_marg/σ₁d   Δ/σ_marg")
+                    print("\n   param                Δ     σ_marg/σ₁d   Δ/σ_marg")
                     for i, name in enumerate(PARAM_NAMES):
-                        d = float(map_recovered[i]) - float(theta0[i])
+                        d = float(theta_fish[i]) - float(theta0[i])
                         sm = float(rep["sig_marg"][i])
                         infl = float(rep["infl"][i])
                         zz = (f"{d / sm:+6.1f}σ"
                               if sm > 0 and np.isfinite(sm) else "  n/a")
                         print(f"   {name:18s} {d:+8.3f}   {infl:7.1f}×    {zz}")
-                    print("  → large σ_marg/σ₁d (inflation) = degenerate "
-                          "direction; Δ/σ_marg is the HONEST bias significance.")
+                    print("  → Δ = (polished-max − truth); large σ_marg/σ₁d "
+                          "(inflation) = degenerate direction; Δ/σ_marg is the "
+                          "HONEST bias significance (small even at large Δ ⇒ "
+                          "unconstrained, not biased).")
 
             if args.label_switch_probe:
                 print("\n=== LABEL-SWITCH PROBE (start μ₁=30, μ₂=10) ===")

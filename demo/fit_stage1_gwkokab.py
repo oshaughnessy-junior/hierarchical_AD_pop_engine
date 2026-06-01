@@ -367,6 +367,52 @@ def fisher_hessian_report(grad_fn, theta_at, names, scales, *, step_frac=0.1):
                 pd=pd, sig_marg=sig_marg)
 
 
+def _line_max(f, theta, step_vec, ts):
+    r"""1-D maximisation of scalar ``f`` along ``theta + t·step_vec`` over the
+    grid ``ts``; parabolic refinement around the best interior node when the
+    top is concave.  Returns ``(theta_best, f_best)``."""
+    theta = np.asarray(theta, dtype=float)
+    vals = np.array([float(f(jnp.asarray(theta + float(t) * step_vec)))
+                     for t in ts])
+    k = int(np.argmax(vals))
+    t_best = float(ts[k])
+    if 0 < k < len(ts) - 1:
+        y0, y1, y2 = vals[k - 1], vals[k], vals[k + 1]
+        denom = y0 - 2.0 * y1 + y2
+        if denom < 0:                      # concave → parabolic vertex
+            t_best = float(ts[k]) + 0.5 * (y0 - y2) / denom * float(ts[k] - ts[k - 1])
+    return theta + t_best * step_vec, float(np.max(vals))
+
+
+def stabilize_soft_directions(f_logL, grad_fn, theta, names, scales,
+                              *, rounds=3, n_soft=4, soft_tol=1e-2):
+    r"""Polish ``theta`` to a cleaner stationary point by LINE-MAXIMISING logL
+    along the softest / negative-curvature directions of the scaled Fisher —
+    the "walk along the soft directions to stabilise" idea.
+
+    A negative scaled-Fisher eigenvalue means logL curves UP along that
+    eigenvector (the point isn't a max there); climbing it removes the negative
+    curvature.  Genuinely flat (small-positive) directions are the real
+    degeneracy and are left alone.  Iterates until the scaled Fisher is
+    positive-definite or ``rounds`` is hit.
+
+    Returns ``(theta_stabilised, report_dict)``.
+    """
+    theta = np.asarray(theta, dtype=float)
+    rep = fisher_hessian_report(grad_fn, theta, names, scales)
+    for _ in range(rounds):
+        if rep["pd"]:
+            break
+        evals, evecs, s = rep["evals"], rep["evecs"], rep["scales"]
+        for k in range(min(n_soft, evals.size)):
+            if evals[k] >= soft_tol:        # only fix soft/negative directions
+                break
+            d = np.asarray(evecs[:, k])
+            theta, _ = _line_max(f_logL, theta, s * d, np.linspace(-4.0, 4.0, 9))
+        rep = fisher_hessian_report(grad_fn, theta, names, scales)
+    return theta, rep
+
+
 def fisher_1d_sigma(xs, ys, n_top=5):
     r"""Conditional 1-σ width from a quadratic fit to the TOP of a 1-D logL
     profile (the user's "normalise Δ to the local curvature" instrument).
