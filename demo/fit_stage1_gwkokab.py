@@ -307,43 +307,64 @@ def _js_2d(P, Q, w2d, eps=1e-30):
     return 0.5 * (kl_pm + kl_qm)
 
 
-def fisher_hessian_report(grad_fn, theta_at, names, *, rel_step=1e-4):
-    r"""Joint Fisher information ``F = −∂²logL/∂θ²`` at ``theta_at`` and its
-    eigen-structure — the right instrument for a parameter degeneracy (the 1-D
-    profile only gives the CONDITIONAL width; this gives the MARGINAL and the
-    flat direction).
+def fisher_hessian_report(grad_fn, theta_at, names, scales, *, step_frac=0.1):
+    r"""Joint Fisher ``F = −∂²logL/∂θ²`` and its eigen-structure, computed
+    ROBUSTLY for an ill-conditioned, non-quadratic likelihood.
 
-    Built by finite-differencing the **AD gradient** (``grad_fn`` = a
-    1st-order ``jax.grad`` of logL).  This is deliberate: the implicit solver's
-    IFT ``@jax.custom_vjp`` supports 1st-order AD (the MAP already uses it) but
-    NOT necessarily ``jax.hessian`` (forward-over-reverse through the custom
-    VJP).  FD-of-grad needs only the supported 1st-order path, so it works for
-    both the implicit and mc_jax recoveries.  ``2P`` gradient evals.
+    Built by finite-differencing the **AD gradient** (``grad_fn`` = 1st-order
+    ``jax.grad`` of logL) — deliberately not ``jax.hessian``, since the implicit
+    IFT ``@jax.custom_vjp`` supports 1st-order AD (the MAP uses it) but not
+    reliably forward-over-reverse.
 
-    Returns ``(evals, evecs, sig_marg)``: Fisher eigenvalues (ascending; a
-    near-zero one is a degenerate / unconstrained direction), the matching
-    eigenvectors (columns; ``evecs[:,0]`` is the flattest direction in θ-space),
-    and the per-parameter MARGINAL 1-σ ``sqrt(diag(F⁻¹))`` (huge for a
-    parameter living in the degenerate direction).
+    Two robustness fixes over the naive version (which returned negative
+    eigenvalues and a 1e34 condition number):
+
+    * **Per-parameter FD step** ``step_frac · scales[j]`` (``scales`` = the
+      conditional σ₁d from the 1-D profiles).  A fixed ``1e-4`` step probes a
+      sharp direction (e.g. ``kernel_a``, σ₁d≈0.05) at ~0.002σ — pure roundoff;
+      scaling puts every direction at the same fraction of its own curvature.
+    * **Dimensionless (correlation-scaled) Fisher** ``F̃ = diag(s)·F·diag(s)``,
+      so eigenvalues are O(1)…O(cond) instead of spanning 30+ orders.  A small
+      ``F̃`` eigenvalue is a degenerate direction; its eigenvector (in scaled
+      coords, reported back in θ-units) is the flat combination.
+
+    Should be evaluated at a SMOOTH point (θ*, the calibration point) — at the
+    poorly-converged MAP of a stiff problem the curvature is unreliable.
+
+    Returns a dict: ``evals``/``evecs`` of the scaled Fisher (ascending),
+    ``scales``, ``infl`` (marginal/conditional σ ratio per param; NaN if not
+    PD), ``pd`` (bool — was the scaled Fisher positive-definite), ``sig_marg``.
+    Honesty over false precision: ``kernel_a``'s ``(m1+m2)^a`` makes logL
+    exponentially non-quadratic, so a residual non-PD result is a real signal
+    the Fisher of THIS parametrisation is untrustworthy — fix kernel_a or
+    reparametrise rather than trust a forced inverse.
     """
     theta = np.asarray(theta_at, dtype=float)
     P = theta.size
-    step = np.where(np.abs(theta) > 1e-3,
-                    rel_step * np.maximum(np.abs(theta), 1.0), rel_step)
+    s = np.asarray(scales, dtype=float)
+    s = np.where(np.isfinite(s) & (s > 0), s, np.maximum(np.abs(theta), 1.0))
     H = np.zeros((P, P))
     for j in range(P):
         e = np.zeros(P)
-        e[j] = step[j]
+        e[j] = step_frac * s[j]
         gp = np.asarray(grad_fn(jnp.asarray(theta + e)), dtype=float)
         gm = np.asarray(grad_fn(jnp.asarray(theta - e)), dtype=float)
-        H[:, j] = (gp - gm) / (2.0 * step[j])
+        H[:, j] = (gp - gm) / (2.0 * e[j])
     H = 0.5 * (H + H.T)
-    F = -H                                  # Fisher: pos-(semi)def at a maximum
-    evals, evecs = np.linalg.eigh(F)        # ascending
-    lam = np.clip(evals, 1e-12, None)       # floor for the marginal sum
-    C = (evecs / lam) @ evecs.T             # Σ_k v_k v_kᵀ / λ_k  = F⁻¹ (floored)
-    sig_marg = np.sqrt(np.clip(np.diag(C), 0.0, None))
-    return evals, evecs, sig_marg
+    F = -H
+    Fz = (s[:, None] * s[None, :]) * F          # dimensionless / correlation-scaled
+    Fz = 0.5 * (Fz + Fz.T)
+    evals, evecs = np.linalg.eigh(Fz)           # ascending
+    pd = bool(np.all(evals > 0))
+    if pd:
+        Cz = (evecs / evals) @ evecs.T          # F̃⁻¹
+        infl = np.sqrt(np.clip(np.diag(Cz), 0.0, None))   # marginal/conditional
+        sig_marg = s * infl
+    else:
+        infl = np.full(P, np.nan)
+        sig_marg = np.full(P, np.nan)
+    return dict(evals=evals, evecs=evecs, scales=s, infl=infl,
+                pd=pd, sig_marg=sig_marg)
 
 
 def fisher_1d_sigma(xs, ys, n_top=5):

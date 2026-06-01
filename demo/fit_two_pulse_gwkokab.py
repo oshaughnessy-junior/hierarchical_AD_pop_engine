@@ -389,8 +389,13 @@ def main():
         flag = "IDENTIFIED" if span > 2.0 else "weak/flat"
         sig = sig1d[name]
         sig_s = f"σ₁d={sig:.3g}" if sig else "σ₁d=flat"
+        # the PEAK's offset from truth in conditional-σ units — the 1-D bias
+        # significance (grows ∝√n_obs for a structural bias; this is the number
+        # to read, NOT peak vs σ₁d separately).
+        bias_s = (f"peak-bias={abs(peak - truth) / sig:4.1f}σ"
+                  if sig and sig > 0 else "peak-bias=?")
         print(f"  {name:18s} truth={truth:+.3f}  peak={peak:+.3f}  "
-              f"Δ(logL)={span:8.2f}  {sig_s:12s}  [{flag}]")
+              f"Δ(logL)={span:8.2f}  {sig_s:12s} {bias_s:16s} [{flag}]")
 
     # --- MAP from a perturbed (correctly-ordered) start ----------------------
     map_recovered = None
@@ -418,32 +423,43 @@ def main():
                 print(f"   {name:18s} {t:+8.3f} {m:+8.3f} {m - t:+8.3f}   {z}")
 
             if args.hessian:
-                print("\n=== JOINT FISHER (degeneracy analysis, AD-grad FD) ===")
+                print("\n=== JOINT FISHER (degeneracy analysis, AD-grad FD @ θ*) ===")
                 gfn = jax.jit(jax.grad(logL))
-                evals, evecs, sig_marg = fisher_hessian_report(
-                    gfn, map_recovered, PARAM_NAMES)
-                lam_min = float(evals[0])
-                lam_max = float(evals[-1])
-                cond = lam_max / max(lam_min, 1e-30)
-                print(f"  eigenvalues (asc): "
-                      f"{', '.join(f'{e:.2e}' for e in evals)}")
-                print(f"  cond(F) = λ_max/λ_min = {cond:.2e}  "
-                      f"(λ_min={lam_min:.2e} → flat direction)")
-                # flattest eigenvector = the degenerate direction
-                v = np.asarray(evecs[:, 0])
+                scales = [sig1d.get(n) for n in PARAM_NAMES]
+                # Evaluate at θ* (smooth calibration point), NOT the stiff MAP.
+                rep = fisher_hessian_report(gfn, theta0, PARAM_NAMES, scales)
+                evals, evecs = rep["evals"], rep["evecs"]
+                print("  scaled eigenvalues (asc): "
+                      + ", ".join(f"{e:+.2e}" for e in evals))
+                pos = evals[evals > 0]
+                if pos.size:
+                    print(f"  cond(F̃)|>0 = {pos.max() / pos.min():.1f}  "
+                          f"(λ_min,+ = {pos.min():.2e} → softest constrained dir)")
+                if not rep["pd"]:
+                    print("  ⚠ scaled Fisher NOT positive-definite at θ* — the "
+                          "kernel_a (m1+m2)^a μ-sensitivity makes logL "
+                          "exponentially non-quadratic; marginal σ suppressed "
+                          "as untrustworthy. The flat-eigvec below is still "
+                          "informative; for a clean Fisher, fix/reparametrise "
+                          "kernel_a (don't float it, or use log-space).")
+                # flat = smallest POSITIVE eigenvalue (skip FD-noise negatives)
+                idx_pos = np.where(evals > 0)[0]
+                kflat = int(idx_pos[0]) if idx_pos.size else 0
+                v = np.asarray(evecs[:, kflat])
                 order = np.argsort(-np.abs(v))
-                comp = "  ".join(f"{PARAM_NAMES[k]}:{v[k]:+.2f}"
-                                 for k in order[:4])
-                print(f"  flat direction (eigvec @ λ_min): {comp}")
-                print("\n   param              MAP-Δ     σ_marg    Δ/σ_marg")
-                for i, name in enumerate(PARAM_NAMES):
-                    d = float(map_recovered[i]) - float(theta0[i])
-                    sm = float(sig_marg[i])
-                    zz = f"{d / sm:+6.1f}σ" if sm > 0 and np.isfinite(sm) else "  n/a"
-                    print(f"   {name:18s} {d:+8.3f} {sm:9.3g}   {zz}")
-                print("  → params with the LARGEST σ_marg are the unconstrained "
-                      "ones; if they share the flat eigvec they're mutually "
-                      "degenerate (not individually biased).")
+                comp = "  ".join(f"{PARAM_NAMES[k]}:{v[k]:+.2f}" for k in order[:4])
+                print(f"  softest direction (scaled eigvec @ λ={evals[kflat]:+.2e}): {comp}")
+                if rep["pd"]:
+                    print("\n   param              MAP-Δ   σ_marg/σ₁d   Δ/σ_marg")
+                    for i, name in enumerate(PARAM_NAMES):
+                        d = float(map_recovered[i]) - float(theta0[i])
+                        sm = float(rep["sig_marg"][i])
+                        infl = float(rep["infl"][i])
+                        zz = (f"{d / sm:+6.1f}σ"
+                              if sm > 0 and np.isfinite(sm) else "  n/a")
+                        print(f"   {name:18s} {d:+8.3f}   {infl:7.1f}×    {zz}")
+                    print("  → large σ_marg/σ₁d (inflation) = degenerate "
+                          "direction; Δ/σ_marg is the HONEST bias significance.")
 
             if args.label_switch_probe:
                 print("\n=== LABEL-SWITCH PROBE (start μ₁=30, μ₂=10) ===")
