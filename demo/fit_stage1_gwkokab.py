@@ -155,6 +155,54 @@ def sample_from_model(model, n_events, key, *, m_lo, m_hi, n_sm=20, n_sc=8,
                       jnp.where(hi, c1, c2), jnp.where(hi, c2, c1)], axis=-1)
 
 
+def pair_sample_from_mc(evaluator, n_events, key):
+    r"""EXACT-particle MC injection (PLAN_cross_method_injection_recovery Step 1).
+
+    Draw ``(N,4)`` true merger events ``(m₁,m₂,χ₁,χ₂)`` by pairing the surviving
+    MC particle pool with the pairing kernel — i.e. directly from the discrete
+    forward intensity ``½ K(m_i,m_j)·w_i·w_j`` over particles ``i≠j``.  Unlike
+    :func:`sample_from_model`, there is **no grid and no within-cell jitter**:
+    each event's masses and spins are exact particle values straight out of the
+    cascade.  This is the injection-side strength of the cross-method scheme —
+    no grid-resolution bias on generation.
+
+    Sampling factorises without materialising an ``O(N²)`` pair distribution per
+    draw: pick ``i ∝ w_i·Z_i`` (the joint's i-marginal, ``Z_i=Σ_{j≠i} w_j
+    K(m_i,m_j)``), then ``j ∝ w_j K(m_i,m_j)`` — joint ``∝ w_i w_j K``.  Builds
+    the ``(N,N)`` kernel once (fine for demo ``n_seed``; chunk if ``n_seed`` is
+    large).  Self-pairs (``i=j``) are excluded (a BH cannot merge with itself).
+    """
+    from hierarchical_ad_pop_engine.evaluation.mc_jax import (
+        _log_pairing_kernel_jax,
+    )
+
+    m = jnp.asarray(evaluator.m_active)
+    chi = jnp.asarray(evaluator.chi_active)
+    w = jnp.asarray(evaluator.weights)
+    a = float(jnp.asarray(evaluator.kernel_a))
+    b = float(jnp.asarray(evaluator.kernel_b))
+    n = int(m.shape[0])
+
+    logK = _log_pairing_kernel_jax(m[:, None], m[None, :], a, b)  # (N, N)
+    Kw = jnp.exp(logK) * w[None, :]                              # col j weighted w_j
+    Kw = Kw.at[jnp.diag_indices(n)].set(0.0)                     # no self-pairs
+    Z = jnp.sum(Kw, axis=1)                                      # Σ_{j≠i} w_j K
+    Wi = w * Z
+    Wi = jnp.where(jnp.isfinite(Wi) & (Wi > 0.0), Wi, 0.0)
+
+    k_i, k_j = jax.random.split(key)
+    i = jax.random.choice(k_i, n, shape=(n_events,), p=Wi / jnp.sum(Wi))
+    rows = Kw[i]                                                 # (n_events, N) ∝ w_j K(m_i,·)
+    rows = rows / jnp.sum(rows, axis=1, keepdims=True)
+    j = jax.vmap(lambda kk, p: jax.random.choice(kk, n, p=p))(
+        jax.random.split(k_j, n_events), rows)
+
+    m1, m2, c1, c2 = m[i], m[j], chi[i], chi[j]
+    hi = m1 >= m2
+    return jnp.stack([jnp.where(hi, m1, m2), jnp.where(hi, m2, m1),
+                      jnp.where(hi, c1, c2), jnp.where(hi, c2, c1)], axis=-1)
+
+
 def build_logL(events, ln_offsets, dist_fn, estimator, *, T_obs, n_quad):
     r"""θ-vector → scalar gwkokab analytical-Poisson log-likelihood (jit-able)."""
     from gwkokab.inference.poissonlikelihood_utils import (
@@ -213,10 +261,14 @@ def main():
     ap.add_argument("--map-steps", type=int, default=150)
     ap.add_argument("--map-lr", type=float, default=0.05)
     ap.add_argument("--selection", choices=["flat", "vt"], default="flat")
-    ap.add_argument("--gen", choices=["self", "implicit"], default="self",
-                    help="mock-event generator: 'self' = the fit mc_jax model "
-                         "(clean identifiability), 'implicit' = the implicit "
-                         "oracle (cross-solver recovery).")
+    ap.add_argument("--gen", choices=["self", "implicit", "mc"], default="self",
+                    help="mock-event generator: 'self' = the fit model's own "
+                         "grid sampler (clean identifiability); 'implicit' = the "
+                         "implicit oracle; 'mc' = EXACT particle-MC injection "
+                         "(PLAN_cross_method Step 1) — pair the surviving MC "
+                         "particle pool ∝ w_i·w_j·K(m_i,m_j), no grid/jitter. "
+                         "Pair with --solver implicit for cross-method "
+                         "inject-MC / recover-implicit.")
     ap.add_argument("--seed", type=int, default=20260530)
     ap.add_argument("--no-map", action="store_true")
     ap.add_argument("--solver", choices=["mc_jax", "implicit", "perturbative"],
@@ -314,6 +366,32 @@ def main():
         true_pts = sample_from_model(
             truth_model, args.n_obs, k_true, m_lo=fixed["m_min"], m_hi=m_hi,
             n_sm=n_sm, n_sc=n_sc)
+        events = scatter_to_posteriors(
+            true_pts, args.n_samples, k_scat, m_hi=m_hi,
+            sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
+        ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
+    elif args.gen == "mc":
+        # Cross-method injection (PLAN_cross_method Step 1): draw EXACT pair
+        # events from the MC particle pool, recover with --solver implicit.
+        # Build a separate mc_jax injection response at θ* (the fit dist_fn is
+        # the recovery solver). log_rate is irrelevant to the injected SHAPE —
+        # the count is fixed at n_obs — so θ*'s calibrated log_rate is fine.
+        from mock_catalog import scatter_to_posteriors
+        k_true, k_scat = jax.random.split(k_cat, 2)
+        mc_inject_dist_fn = make_coagulation_dist_fn(
+            v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
+            kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
+            depletion_fraction=0.10, gate="soft", grid=fit_grid,
+            mc_jax_key=k_mc, solver="mc_jax")
+        mc_model = mc_inject_dist_fn(**theta_star)
+        inj_ev = mc_model._response.mc_jax_response.evaluator
+        n_part = int(inj_ev.m_active.shape[0])
+        n_merg = int(jnp.asarray(inj_ev.mergers).shape[0])
+        print(f"[mock] MC injection: {n_part} particle slots, {n_merg} merger "
+              f"rows  (H2/ε-matching is PLAN Step 2: map MC state → ε via "
+              f"ε=2·n_mergers/(K·N_active²); recovery ε={args.epsilon} is "
+              f"NOT yet matched — Step-1 harness only)")
+        true_pts = pair_sample_from_mc(inj_ev, args.n_obs, k_true)
         events = scatter_to_posteriors(
             true_pts, args.n_samples, k_scat, m_hi=m_hi,
             sigma_log_m=args.sigma_log_m, sigma_chi=args.sigma_chi)
