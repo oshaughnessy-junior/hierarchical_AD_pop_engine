@@ -83,10 +83,21 @@ structural (forward-model), not statistical:
   pairing, MC cascade (`_kernel_K_jax`, ∝ N·N·K, a=0 ⇒ exact K_max), implicit
   gain/loss + recovery. No kernel bug. ✓
 
-## KEY DECOUPLING (2026-06-01, late) — TWO independent systematics
+## CORRECTION (2026-06-01, late) — the scatter was a HARNESS BUG, not a systematic
 
-The width biases are NOT (mostly) the cross-method floor — they are MEASUREMENT
-SCATTER, and they are DECOUPLED from H1-JS:
+The width biases were LARGELY a harness bug, NOT a real effect: the demos
+scattered events via `scatter_to_posteriors` with NO measurement model in the
+likelihood (`ln_offsets=0`, samples around TRUTH not a noisy datum). That blur is
+never deconvolved → it leaks into the recovered natal widths. **FIXED (f9c4856):
+injection now defaults to EXACT (`--sigma-* 0`)**; scatter>0 warns loudly. Re-run
+all recovery numbers with exact injection — those are the real forward-model
+validation. A correct measurement model (future, deliberate) needs BOTH: (1)
+per-event samples drawn from ℓ(d|ω) about a NOISY datum d; (2) `ln_offsets =
+−log(reference prior)` so the hierarchical term deconvolves. Neither was wired.
+
+H1-JS remains a clean, scatter-free forward-model/resolution metric (converges
+with grid×n_seed). Below: the (still-valid) note that H1-JS and the width bias
+were decoupled — now understood as JS=forward-model vs width-bias=the scatter BUG.
 
 * **H1-JS** = implicit-vs-MC density agreement, NO scatter involved → converges
   with grid/n_seed (0.086→0.046 at n_seed 6400; →less at 200k). Forward-model /
@@ -110,11 +121,11 @@ residual (mostly σ₂) = the genuine cross-method floor the resolution sweep th
 drives down. Earlier evidence: two-pulse delta gave σ₁ MAP 1.024 (clean) vs
 1.302 scattered — the ~0.28 gap IS the scatter.
 
-**Paper framing → THREE labeled effects, all controllable:** (1) measurement
-deconvolution (more n_samples / proper ln_offsets — NOT a method bug); (2)
-forward-model resolution (grid×n_seed → 0, H1-JS); (3) kernel_a↔log_rate model
-degeneracy (don't float kernel_a). Note: H1-JS is SCATTER-BLIND — do not use it
-to gauge (1).
+**Paper framing → TWO real effects (+1 fixed bug):** (BUG, fixed f9c4856:
+scatter w/o measurement model — now exact injection by default); (1)
+forward-model resolution (grid×n_seed → 0, H1-JS); (2) kernel_a↔log_rate model
+degeneracy (don't float kernel_a). A real measurement model is OPTIONAL future
+work, built deliberately with both injection-ℓ(d|ω) and ln_offsets=−log π_ref.
 
 ## Next session: PAPER CONTENT PREP
 
