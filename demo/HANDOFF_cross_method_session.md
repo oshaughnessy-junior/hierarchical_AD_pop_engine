@@ -83,6 +83,39 @@ structural (forward-model), not statistical:
   pairing, MC cascade (`_kernel_K_jax`, ∝ N·N·K, a=0 ⇒ exact K_max), implicit
   gain/loss + recovery. No kernel bug. ✓
 
+## KEY DECOUPLING (2026-06-01, late) — TWO independent systematics
+
+The width biases are NOT (mostly) the cross-method floor — they are MEASUREMENT
+SCATTER, and they are DECOUPLED from H1-JS:
+
+* **H1-JS** = implicit-vs-MC density agreement, NO scatter involved → converges
+  with grid/n_seed (0.086→0.046 at n_seed 6400; →less at 200k). Forward-model /
+  resolution quantity. ✓ resolution hypothesis holds for THIS.
+* **Width bias** = recovery from SCATTERED events (`scatter_to_posteriors`
+  default `sigma_log_m=0.1`, `sigma_chi=0.1`) deconvolved by only n_samples=5
+  with flat `ln_offsets`. Resolution CANNOT touch it — that's why JS drops but
+  σ stays stuck (the user's puzzle, resolved).
+
+Scatter magnitudes predict EXACTLY the biased params:
+* `sigma_log_m=0.1` multiplicative → ~1 M⊙ @ μ=10 (≈σ₁) but **~3 M⊙ @ μ=30 >
+  σ₂=2.0** → `sigma_natal_2` worst (peak 2.55→2.90 as resolution sharpens μ₂).
+* `sigma_chi=0.1` = **2× `natal_spin_scale=0.05`** → spin_scale 7.2σ biased.
+* locations (μ, spin_loc) + λ: symmetric/ratio → UNBIASED, pin to truth. ✓
+The pattern "widths+spin_scale biased, locations+λ clean" = imperfect scatter
+deconvolution, NOT a forward-model defect.
+
+**SEPARATOR TEST (queue first next session):** same high-res run +
+`--sigma-log-m 0 --sigma-chi 0`. Predict σ₁→~1.0, spin_scale→~0.05 collapse;
+residual (mostly σ₂) = the genuine cross-method floor the resolution sweep then
+drives down. Earlier evidence: two-pulse delta gave σ₁ MAP 1.024 (clean) vs
+1.302 scattered — the ~0.28 gap IS the scatter.
+
+**Paper framing → THREE labeled effects, all controllable:** (1) measurement
+deconvolution (more n_samples / proper ln_offsets — NOT a method bug); (2)
+forward-model resolution (grid×n_seed → 0, H1-JS); (3) kernel_a↔log_rate model
+degeneracy (don't float kernel_a). Note: H1-JS is SCATTER-BLIND — do not use it
+to gauge (1).
+
 ## Next session: PAPER CONTENT PREP
 
 Plan is to start drafting proof-of-concept paper content. Before/while drafting:
