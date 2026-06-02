@@ -248,8 +248,17 @@ def main():
                          "pins kernel_b — pair with --solver implicit.")
     ap.add_argument("--n-m", type=int, default=None)
     ap.add_argument("--n-chi", type=int, default=None)
-    ap.add_argument("--sigma-log-m", type=float, default=0.1)
-    ap.add_argument("--sigma-chi", type=float, default=0.1)
+    ap.add_argument("--sigma-log-m", type=float, default=0.0,
+                    help="mock measurement scatter on mass. DEFAULT 0 (exact "
+                         "injection). NON-ZERO IS A TRAP for this harness: "
+                         "scatter_to_posteriors blurs the events but the "
+                         "likelihood marginalises them with ln_offsets=0 around "
+                         "TRUTH (not a drawn datum), so the dispersion is NOT "
+                         "deconvolved — it leaks straight into the recovered "
+                         "widths. Forward-model validation must use exact events.")
+    ap.add_argument("--sigma-chi", type=float, default=0.0,
+                    help="mock spin scatter. DEFAULT 0 — see --sigma-log-m: "
+                         "non-zero biases the recovered natal widths.")
     ap.add_argument("--hessian", action="store_true",
                     help="after the MAP, report the joint Fisher eigen-spectrum "
                          "(via FD of the AD gradient) — the flat eigenvector is "
@@ -261,6 +270,15 @@ def main():
     fixed = demo.FIXED
     print(f"[cfg] TWO-PULSE  n_obs={args.n_obs} n_samples={args.n_samples} "
           f"n_seed={args.n_seed} k_max={args.k_max}")
+    if max(args.sigma_log_m, args.sigma_chi) > 0.0:
+        print("[WARN] measurement scatter is ON but THERE IS NO MEASUREMENT "
+              "MODEL in the likelihood. scatter_to_posteriors blurs the events; "
+              "the gwkokab term marginalises them with ln_offsets=0 around TRUTH "
+              "(not a drawn datum), so the blur is NOT deconvolved → recovered "
+              "natal WIDTHS are biased. A correct measurement model needs: "
+              "samples drawn from the per-event likelihood ℓ(d|ω) about a NOISY "
+              "datum d, AND ln_offsets = −log(reference prior). NOT IMPLEMENTED. "
+              "Use 0 (exact injection) for forward-model validation.")
 
     if args.n_m or args.n_chi:
         from hierarchical_ad_pop_engine.grids import BinaryGrid

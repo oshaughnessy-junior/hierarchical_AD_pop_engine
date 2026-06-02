@@ -562,15 +562,17 @@ def main():
                     help="override fit-grid N_m (default demo's 64).")
     ap.add_argument("--n-chi", type=int, default=None,
                     help="override fit-grid N_chi (default demo's 20).")
-    ap.add_argument("--sigma-log-m", type=float, default=0.1,
-                    help="mock mass measurement scatter (default 0.1). Pass 0 "
-                         "for the DELTA control: with --sigma-chi 0 the events "
-                         "are unscattered, so any residual width/spin bias is "
-                         "the forward model, NOT measurement deconvolution.")
-    ap.add_argument("--sigma-chi", type=float, default=0.1,
-                    help="mock spin measurement scatter (default 0.1 — note this "
-                         "EQUALS the truth natal_spin_scale, so spin is barely "
-                         "identifiable). Pass 0 with --sigma-log-m 0 for delta.")
+    ap.add_argument("--sigma-log-m", type=float, default=0.0,
+                    help="mock mass measurement scatter. DEFAULT 0 (exact "
+                         "injection). NON-ZERO IS A TRAP: there is NO measurement "
+                         "model in the likelihood (scatter blurs events, "
+                         "ln_offsets=0 around truth does NOT deconvolve), so the "
+                         "blur biases recovered natal widths. Forward-model "
+                         "validation requires exact events.")
+    ap.add_argument("--sigma-chi", type=float, default=0.0,
+                    help="mock spin measurement scatter. DEFAULT 0 — see "
+                         "--sigma-log-m: non-zero biases recovered natal widths "
+                         "(no measurement model is wired).")
     ap.add_argument("--n-sm", type=int, default=None,
                     help="self-consistent SAMPLER mass-grid resolution. Default "
                          "(None) tracks 2× the fit n_m so the mock is FAITHFUL "
@@ -604,6 +606,11 @@ def main():
     theta_star = dict(demo.THETA_STAR)
 
     # --- 2. dist_fn + estimator (the new wiring) -----------------------------
+    if max(args.sigma_log_m, args.sigma_chi) > 0.0:
+        print("[WARN] measurement scatter ON but NO measurement model is wired "
+              "(scatter_to_posteriors + ln_offsets=0 around truth does NOT "
+              "deconvolve) → recovered natal WIDTHS biased. Use 0 for exact "
+              "forward-model injection.")
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat, k_map = jax.random.split(key, 3)
     _INJECT_DEPLETION = 0.10  # MC injection cascade depth (the budget the soft
