@@ -4,6 +4,92 @@
 planning scaffold. Next session: user will point to the **gwkokab paper** to
 scaffold the results-section format.
 
+> **UPDATE 2026-06-04 (TECHNICAL ROUND #1 DONE — believable + interesting spin):**
+> Both spin deliverables landed and are sandbox-validated.
+>
+> **(1) Nonuniform χ grid ("believable") — DONE.** Priority-1 item below.
+> Implemented as a *node retrofit*, NOT a basis rewrite: the whole χ
+> machinery (gain-side bilinear scatter, loss-side trapezoid, the F2
+> bilinear-hat surrogate) already reaches the grid only through
+> `jnp.interp(·, grid.chi, ·)` and `jnp.diff(grid.chi)`, so it is exact on
+> any monotone χ grid — the only thing hardcoding uniformity was
+> `grids.BinaryGrid.default`'s `linspace`. New `grids.clustered_chi_nodes()`
+> (smooth inverse-CDF equidistribution: uniform floor + Gaussian bumps at
+> the natal peak χ≈0.05 and the cascade peak χ≈0.6865 = engine
+> `chi_rem(30,30,0,0)`) + `BinaryGrid.clustered_chi(...)` classmethod
+> (drop-in for `.default`, plugs straight into the bridge's `grid=`).
+> Validated: bilinear-hat partition-of-unity exact to machine-0 on the
+> nonuniform nodes; trapezoid exact on linear; **clustered beats uniform
+> 1.8× rel-L1** on a sharp two-peak test density at matched n_χ=32; AD
+> through the implicit solve still finite+nonzero. Tests:
+> `tests/test_clustered_chi_grid.py` (10, gwkokab-free, runs in any
+> sandbox).
+>
+> **(2) Fisher-κ through the bridge ("interesting") — DONE.** Impl-support
+> item 1 below. Added `orientation` / `retention_kind` / `w_over_v_esc`
+> params to `make_coagulation_dist_fn` (gwkokab_bridge.py), forwarded to
+> both `build_gaussian_coagulation` and `build_two_pulse_coagulation`
+> (which already accepted them). Fixed-per-run, inference-ready: the IFT
+> custom-VJP already flows `∂/∂κ` (verified `∂ΣN*/∂κ ≈ 0.11`, finite+nonzero)
+> AND restores a nonzero `∂/∂v_esc` under Fisher+sigmoid (≈ −1.2e-3; it is
+> identically 0 under the Aligned+Heaviside default). Lifting κ to a *fit*
+> parameter later is a one-line closure change, no engine work. Added a
+> read-only `CoagulationPopulation.response` accessor. Tests:
+> `tests/test_fisher_bridge_clustered.py` (4, engine tier, skips if gwkokab
+> absent — same convention as the G6–G7 full-stack tier).
+>
+> **Demo:** `demo/forward_modeling_chi_grid_kappa.py` — two-panel `dN/dχ`
+> figure (LEFT clustered-vs-uniform resolution of the cascade peak; RIGHT
+> the κ sweep Isotropic→aligned). Reduced-res defaults fit the sandbox;
+> production figure is a workstation rerun (`--n-m 64 --n-chi 24`).
+> Output → `demo/figures_chi_grid_kappa/chi_grid_kappa.png`.
+>
+> **Sandbox recipe addendum** (beyond `demo/bootstrap_jax_sandbox.sh`): the
+> full engine import additionally needs `pip install quadax h5py` and the
+> 2-line `RIFT.lalsimutils` shim (`MsunInSec = 4.925491025543576e-06`) on
+> PYTHONPATH, plus `gwkokab/src` — then `solver="implicit"` runs in-VM. All
+> new tests + G1–G7 + orientation_models GREEN in-sandbox this session.
+>
+> **Still open from the priority list below:** (2) full *spectral* basis
+> rendering for `dN/dχ` (the clustered grid + bilinear hats already
+> de-blocks the trace; the engine_fem Chebyshev path remains the
+> higher-order option) and (3) the paper-demo reruns at matched ε +
+> production resolution + the joint resolution sweep — both workstation.
+
+> **UPDATE 2026-06-03:** the paper repo `../../gwk-hierarchical-initial` is now
+> scaffolded — `analyses/ demos/ paper/` + a compiling revtex4-2 LaTeX skeleton
+> (intro 4 paras, methods 1–5, results parts 1–2) with `% TODO/SOURCE/FIG/CITE`
+> anchors mapping every section to this PLAN, the cross-method HANDOFF, DESIGN.md,
+> and the proposal. `refs.bib` is a stub flagged `% RECONCILE` (bibcodes pending
+> the BibtexArchives — not mounted that session). Build-checked via
+> `paper/_buildcheck/` (article class; VM has no RevTeX). See
+> `../../gwk-hierarchical-initial/HANDOFF.md`. Next: bib reconcile, deep-research
+> the background paragraph, run `analyses/` for numbers/figures.
+
+> **UPDATE 2026-06-03 (end of paper-narrative round):** methods 1–5 are PROSE
+> (bib reconciled against BibtexArchives; ZeeMalagon O4a defaults adopted for
+> sensitivity/mixture/real-data); placeholder figures deployed for Results A.1
+> (stage1 set) and 3.A.2 (fmobs panel crops); Results B figure DESIGN specced +
+> implemented in `../../gwk-hierarchical-initial/demos/forward_model_examples/
+> fit_two_pulse_gwkokab.py --paper-figs` (blocked corners mass/spin/couplings +
+> natal-PPD band — run on workstation, images pending). Full state:
+> `../../gwk-hierarchical-initial/HANDOFF.md`.
+>
+> **NEXT ROUND = TECHNICAL (engine), not paper: NONUNIFORM χ QUADRATURE.**
+> The paper round surfaced the priority order:
+> 1. **Nonuniform χ quadrature** in the implicit solver — clustered nodes at
+>    the natal peak (χ≈0, scale~0.05) and the cascade remnant peak (χ≈0.69);
+>    this is H4 of PLAN_cross_method_injection_recovery.md and the root of the
+>    implicit-spin weakness acknowledged in the 3.A.2 figure. Seeds:
+>    engine_fem branch (Chebyshev–Lobatto basis, PLAN_engine_v3_basis.md) or a
+>    direct nonuniform-node retrofit of the uniform grid.
+> 2. **Basis-function rendering for dN/dχ** — plots must evaluate the
+>    low-level basis representation built into the quadrature scheme, not the
+>    blocky grid trace (paper figure TODOs depend on this).
+> 3. Then rerun the paper demos (demos/forward_model_examples/) at matched ε
+>    (H2) + production resolution, and the joint resolution sweep (the
+>    headline robustness figure).
+
 ## Paper structure
 
 * **Methods section.** The hierarchical-coagulation population model + the
