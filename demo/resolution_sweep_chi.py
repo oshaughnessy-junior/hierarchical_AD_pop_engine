@@ -104,7 +104,8 @@ def _cfg_hash(d: dict) -> str:
 
 def solve_marginals(n_m: int, n_chi: int, args) -> dict:
     key = dict(
-        kind="res", n_m=n_m, n_chi=n_chi, m_min=args.m_min, m_max=args.m_max,
+        kind="res", v=2, n_m=n_m, n_chi=n_chi, m_min=args.m_min,
+        m_max=args.m_max,
         mu=args.mu, sigma=args.sigma, sscale=args.natal_spin_scale,
         kb=args.kernel_b, eps=args.epsilon, ve=args.v_esc, kappa=args.kappa,
         nth=args.n_theta, ndp=args.n_dphi, mgf=args.max_gap_factor,
@@ -133,10 +134,15 @@ def solve_marginals(n_m: int, n_chi: int, args) -> dict:
         kernel_b=args.kernel_b, grid=grid, solver="implicit",
         orientation=o, retention_kind="sigmoid",
     )
+    import time as _time
+
+    t0 = _time.perf_counter()
     res = solve_implicit_fixed_point(
         resp, jnp.asarray(args.v_esc), epsilon=args.epsilon,
         max_iter=args.max_iter, tol=1e-7, damping=0.5,
     )
+    res.N.block_until_ready()
+    t_solve = _time.perf_counter() - t0
     dm_w = _dm_log_weights(grid.m, grid.log_m)
     d = np.diff(np.asarray(grid.chi))
     dchi_w = np.concatenate([d[:1] * 0.5, 0.5 * (d[:-1] + d[1:]), d[-1:] * 0.5])
@@ -146,7 +152,59 @@ def solve_marginals(n_m: int, n_chi: int, args) -> dict:
         dN_dchi=np.asarray(jnp.einsum("ij,i->j", res.N, dm_w)),
         dN_dm=np.asarray(res.N) @ dchi_w,
         f_dep=np.asarray(res.f_natal_depleted),
+        # Wall time of the full solve call, INCLUDING one-time jit
+        # compilation for this grid shape (what a production fit pays on
+        # first trace).  The relative scaling across grid sizes is
+        # dominated by the per-iteration O((n_m n_chi)^2) tensor work.
+        time_s=np.asarray(t_solve),
     )
+    np.savez(path, **out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Particle MC benchmark (authoritative; raw weighted histogram, NO KDE).
+# Depletion fraction tracks the benchmark engine solve's converged
+# f_natal_depleted ([[feedback-mc-depletion-tracks-engine]]).
+# ---------------------------------------------------------------------------
+def mc_benchmark_hist(f_dep: float, args) -> dict:
+    key = dict(
+        kind="mc", v=1, kappa=args.kappa, fdep=round(float(f_dep), 6),
+        n_seed=args.mc_n_seed, seed=args.mc_seed, bins=args.mc_bins,
+        m_min=args.m_min, m_max=args.m_max, mu=args.mu, sigma=args.sigma,
+        sscale=args.natal_spin_scale, kb=args.kernel_b, ve=args.v_esc,
+        nth=args.n_theta, ndp=args.n_dphi,
+    )
+    os.makedirs(args.cache_dir, exist_ok=True)
+    path = os.path.join(args.cache_dir, f"mc_{_cfg_hash(key)}.npz")
+    if os.path.exists(path):
+        with np.load(path) as z:
+            return {k: z[k] for k in z.files}
+
+    from red_team.comparison_helpers import run_mc
+
+    theta = dict(
+        mu_natal=args.mu, sigma_natal=args.sigma,
+        m_min=args.m_min, m_max=args.m_max,
+        natal_spin_loc=0.0, natal_spin_scale=args.natal_spin_scale,
+        kernel_a=0.0, kernel_b=args.kernel_b, v_esc=args.v_esc,
+    )
+    if args.kappa == 0.0:
+        o = Isotropic.default(n_theta=args.n_theta, n_dphi=args.n_dphi)
+    elif np.isinf(args.kappa):
+        o = None  # v1 Aligned scalar path
+    else:
+        o = Fisher.default(kappa=args.kappa, n_theta=args.n_theta,
+                           n_dphi=args.n_dphi)
+    rng = np.random.default_rng(args.mc_seed)
+    mc = run_mc(theta, args.mc_n_seed, rng,
+                depletion_fraction=max(float(f_dep), 1e-3), orientation=o)
+    chi_act = np.asarray(mc["chi_active"])
+    w = np.asarray(mc.get("w_active", np.ones_like(chi_act)))
+    edges = np.linspace(0.0, 1.0, args.mc_bins + 1)
+    hist, _ = np.histogram(chi_act, bins=edges, weights=w)
+    dens = hist / np.diff(edges) / max(w.sum(), 1e-30)  # unit-integral
+    out = dict(edges=edges, density=dens, n_active=np.asarray(chi_act.size))
     np.savez(path, **out)
     return out
 
@@ -179,6 +237,7 @@ def run_sweep(args) -> dict:
             n=n,
             rel_chi=rel_l1(c_chi, ref_chi, chi_fine),
             rel_m=rel_l1(c_m, ref_m, m_fine),
+            time_s=float(sol.get("time_s", np.nan)),
             chi=sol["chi"], dN_dchi=sol["dN_dchi"],
         ))
 
@@ -193,7 +252,16 @@ def run_sweep(args) -> dict:
             n=n,
             rel_chi=rel_l1(c_chi, ref_chi_m, chi_fine),
             rel_m=rel_l1(c_m, ref_m_m, m_fine),
+            time_s=float(sol.get("time_s", np.nan)),
         ))
+
+    # ── MC benchmark histogram (matched to the n_chi-sweep benchmark) ──
+    if getattr(args, "mc", False):
+        results["mc"] = mc_benchmark_hist(bench["f_dep"], args)
+        # engine-marginal integral for same-scale overlay
+        d = np.diff(np.asarray(bench["chi"]))
+        w = np.concatenate([d[:1] * 0.5, 0.5 * (d[:-1] + d[1:]), d[-1:] * 0.5])
+        results["mc_scale"] = float(np.sum(w * bench["dN_dchi"]))
     return results
 
 
@@ -206,22 +274,32 @@ def summarize(results, args) -> str:
         "",
         f"n_chi sweep @ n_m={args.bench_n_m} "
         f"(benchmark n_chi={results['chi_sweep'][-1]['n']}):",
-        "  n_chi   relL1[dN/dchi]   relL1[dN/dm]",
+        "  n_chi   relL1[dN/dchi]   relL1[dN/dm]   t_solve[s]",
     ]
     for r in results["chi_sweep"]:
-        lines.append(f"  {r['n']:5d}   {r['rel_chi']:12.4e}   {r['rel_m']:10.4e}")
+        lines.append(
+            f"  {r['n']:5d}   {r['rel_chi']:12.4e}   {r['rel_m']:10.4e}"
+            f"   {r['time_s']:8.2f}"
+        )
     lines += [
         "",
         f"n_m sweep @ n_chi={args.bench_n_chi} "
         f"(benchmark n_m={results['m_sweep'][-1]['n']}):",
-        "  n_m     relL1[dN/dchi]   relL1[dN/dm]",
+        "  n_m     relL1[dN/dchi]   relL1[dN/dm]   t_solve[s]",
     ]
     for r in results["m_sweep"]:
-        lines.append(f"  {r['n']:5d}   {r['rel_chi']:12.4e}   {r['rel_m']:10.4e}")
+        lines.append(
+            f"  {r['n']:5d}   {r['rel_chi']:12.4e}   {r['rel_m']:10.4e}"
+            f"   {r['time_s']:8.2f}"
+        )
     lines += [
         "",
-        "Note: the benchmark row reads 0 by construction; the row above it",
-        "is the honest truncation estimate at that resolution.",
+        "Notes: the benchmark row reads 0 by construction; the row above it",
+        "is the honest truncation estimate at that resolution.  t_solve is",
+        "the wall time of the full implicit solve at that grid, INCLUDING",
+        "one-time jit compilation for the shape (cached rows keep the time",
+        "of their original run; machine-dependent — regenerate on the",
+        "production host).  Per-iteration work scales as O((n_m n_chi)^2).",
     ]
     return "\n".join(lines)
 
@@ -251,6 +329,12 @@ def main() -> int:
     p.add_argument("--bench-n-chi", type=int, default=16)
     p.add_argument("--n-fine", type=int, default=2001)
     p.add_argument("--render", choices=("pchip-log", "hat"), default="pchip-log")
+    # MC benchmark overlay (raw weighted histogram — the authoritative
+    # reference on the reconstruction panel; never smoothed)
+    p.add_argument("--mc", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--mc-n-seed", type=int, default=60000)
+    p.add_argument("--mc-bins", type=int, default=60)
+    p.add_argument("--mc-seed", type=int, default=20260604)
     p.add_argument("--cache-dir", type=str,
                    default=os.path.join(os.path.dirname(__file__),
                                         ".cache_resolution_sweep"))
@@ -280,6 +364,8 @@ def main() -> int:
         m_ns=np.asarray([r["n"] for r in results["m_sweep"]]),
         m_rel_chi=np.asarray([r["rel_chi"] for r in results["m_sweep"]]),
         m_rel_m=np.asarray([r["rel_m"] for r in results["m_sweep"]]),
+        chi_time_s=np.asarray([r["time_s"] for r in results["chi_sweep"]]),
+        m_time_s=np.asarray([r["time_s"] for r in results["m_sweep"]]),
     )
 
     import matplotlib
@@ -313,8 +399,13 @@ def main() -> int:
                                 kind=args.render)
         ax3.semilogy(chi_fine, curve, color=c, lw=1.1,
                      label=f"$n_\\chi$={r['n']}")
+    if "mc" in results:
+        mc = results["mc"]
+        ax3.stairs(np.asarray(mc["density"]) * results["mc_scale"],
+                   np.asarray(mc["edges"]), color="k", lw=1.2, zorder=5,
+                   label=f"particle MC (n={int(mc['n_active'])}, raw hist)")
     ax3.set_xlabel(r"$\chi$"); ax3.set_ylabel(r"$dN/d\chi$")
-    ax3.set_title("dN/dχ reconstructions converging")
+    ax3.set_title("dN/dχ reconstructions (MC = benchmark)")
     ax3.legend(fontsize=7)
     lo, hi = ax3.get_ylim()
     ax3.set_ylim(max(lo, hi * 1e-9), hi)
