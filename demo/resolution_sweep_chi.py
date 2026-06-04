@@ -304,6 +304,59 @@ def summarize(results, args) -> str:
     return "\n".join(lines)
 
 
+def latex_table(results, args) -> str:
+    r"""Inner ``tabular`` for the paper's resolution/runtime table.
+
+    The paper wraps this in its own ``table*`` environment with caption and
+    label and pulls it in by ``\input`` — regenerating the sweep refreshes
+    the numbers without touching the manuscript.  Plain ``tabular`` +
+    ``\hline`` only (compiles under both RevTeX and the article-class
+    buildcheck).  The benchmark rows (rel-$L_1$ = 0 by construction) are
+    annotated rather than omitted.
+    """
+    def _rows(sweep):
+        rows = []
+        for r in sweep:
+            is_bench = r is sweep[-1]
+            rel_chi = "—" if is_bench else f"${r['rel_chi']:.3g}$"
+            rel_m = "—" if is_bench else f"${r['rel_m']:.3g}$"
+            note = r" (benchmark)" if is_bench else ""
+            rows.append(
+                f"  ${r['n']}${note} & {rel_chi} & {rel_m}"
+                f" & ${r['time_s']:.2f}$ \\\\"
+            )
+        return rows
+
+    lines = [
+        r"\begin{tabular}{lccc}",
+        r"\hline\hline",
+        r" & rel-$L_1$ $[dN/d\chi]$ & rel-$L_1$ $[dN/dm]$"
+        r" & $t_{\rm solve}$ [s] \\",
+        r"\hline",
+        rf"\multicolumn{{4}}{{l}}{{$n_\chi$ sweep at $n_m = {args.bench_n_m}$}} \\",
+    ]
+    lines += _rows(results["chi_sweep"])
+    lines += [
+        r"\hline",
+        rf"\multicolumn{{4}}{{l}}{{$n_m$ sweep at $n_\chi = {args.bench_n_chi}$}} \\",
+    ]
+    lines += _rows(results["m_sweep"])
+    lines += [r"\hline\hline", r"\end{tabular}"]
+    return "\n".join(lines)
+
+
+def _integer_log_ticks(ax, axis="x"):
+    """Plain integer tick labels (10, 20, 30, ...) on a log axis —
+    scientific notation like 2x10^1 wastes space at these ranges."""
+    import matplotlib.ticker as mticker
+
+    a = ax.xaxis if axis == "x" else ax.yaxis
+    a.set_major_formatter(mticker.ScalarFormatter())
+    a.set_minor_formatter(mticker.ScalarFormatter())
+    for lbl in ([] if axis == "y" else ax.get_xticklabels(minor=True)):
+        lbl.set_fontsize(8)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -331,9 +384,13 @@ def main() -> int:
     p.add_argument("--render", choices=("pchip-log", "hat"), default="pchip-log")
     # MC benchmark overlay (raw weighted histogram — the authoritative
     # reference on the reconstruction panel; never smoothed)
+    # MC is by far the cheapest piece of this sweep — make the benchmark
+    # superb by default (ROS 2026-06-04): enough seeds that the
+    # subdominant cascade peaks are visibly populated, no empty-bin gaps
+    # on the log axis.  Reduce only for sandbox smoke passes.
     p.add_argument("--mc", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--mc-n-seed", type=int, default=60000)
-    p.add_argument("--mc-bins", type=int, default=60)
+    p.add_argument("--mc-n-seed", type=int, default=600000)
+    p.add_argument("--mc-bins", type=int, default=100)
     p.add_argument("--mc-seed", type=int, default=20260604)
     p.add_argument("--cache-dir", type=str,
                    default=os.path.join(os.path.dirname(__file__),
@@ -356,6 +413,9 @@ def main() -> int:
     os.makedirs(args.outdir, exist_ok=True)
     with open(os.path.join(args.outdir, "resolution_sweep_summary.txt"), "w") as fh:
         fh.write(table + "\n")
+    # Paper table (inner tabular; the manuscript \input's this file).
+    with open(os.path.join(args.outdir, "resolution_sweep_table.tex"), "w") as fh:
+        fh.write(latex_table(results, args) + "\n")
     np.savez(
         os.path.join(args.outdir, "resolution_sweep.npz"),
         chi_ns=np.asarray([r["n"] for r in results["chi_sweep"]]),
@@ -372,9 +432,33 @@ def main() -> int:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    cs = results["chi_sweep"]
+    chi_fine = results["chi_fine"]
+
+    def _draw_recon(ax):
+        """Reconstruction panel: engine curves converging onto the MC."""
+        cmap = plt.cm.plasma(np.linspace(0.1, 0.85, len(cs)))
+        for r, c in zip(cs, cmap):
+            curve = render_marginal(r["chi"], r["dN_dchi"], chi_fine,
+                                    kind=args.render)
+            ax.semilogy(chi_fine, curve, color=c, lw=1.1,
+                        label=f"$n_\\chi$={r['n']}")
+        if "mc" in results:
+            mc = results["mc"]
+            ax.stairs(np.asarray(mc["density"]) * results["mc_scale"],
+                      np.asarray(mc["edges"]), color="k", lw=1.2, zorder=5,
+                      label=f"particle MC (n={int(mc['n_active'])}, raw hist)")
+        ax.set_xlabel(r"$\chi$"); ax.set_ylabel(r"$dN/d\chi$")
+        ax.legend(fontsize=7)
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(max(lo, hi * 1e-9), hi)
+
+    # ── Internal 3-panel diagnostic (convergence panels + reconstruction).
+    # The PAPER consumes the table (resolution_sweep_table.tex) in place of
+    # the two convergence panels, plus the standalone reconstruction
+    # figure below — keep this one for working/diagnostic use.
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(14, 4.2))
 
-    cs = results["chi_sweep"]
     ns = [r["n"] for r in cs[:-1]]
     ax1.loglog(ns, [r["rel_chi"] for r in cs[:-1]], "o-", label=r"$dN/d\chi$")
     ax1.loglog(ns, [r["rel_m"] for r in cs[:-1]], "s--", label=r"$dN/dm$")
@@ -383,6 +467,7 @@ def main() -> int:
     ax1.set_xlabel(r"$n_\chi$"); ax1.set_ylabel("rel-L1 vs benchmark")
     ax1.set_title(f"χ-resolution truncation (n_m={args.bench_n_m})")
     ax1.legend(fontsize=8)
+    _integer_log_ticks(ax1, "x")
 
     ms = results["m_sweep"]
     ns = [r["n"] for r in ms[:-1]]
@@ -391,30 +476,25 @@ def main() -> int:
     ax2.set_xlabel(r"$n_m$"); ax2.set_ylabel("rel-L1 vs benchmark")
     ax2.set_title(f"m-resolution truncation (n_χ={args.bench_n_chi})")
     ax2.legend(fontsize=8)
+    _integer_log_ticks(ax2, "x")
 
-    chi_fine = results["chi_fine"]
-    cmap = plt.cm.plasma(np.linspace(0.1, 0.85, len(cs)))
-    for r, c in zip(cs, cmap):
-        curve = render_marginal(r["chi"], r["dN_dchi"], chi_fine,
-                                kind=args.render)
-        ax3.semilogy(chi_fine, curve, color=c, lw=1.1,
-                     label=f"$n_\\chi$={r['n']}")
-    if "mc" in results:
-        mc = results["mc"]
-        ax3.stairs(np.asarray(mc["density"]) * results["mc_scale"],
-                   np.asarray(mc["edges"]), color="k", lw=1.2, zorder=5,
-                   label=f"particle MC (n={int(mc['n_active'])}, raw hist)")
-    ax3.set_xlabel(r"$\chi$"); ax3.set_ylabel(r"$dN/d\chi$")
+    _draw_recon(ax3)
     ax3.set_title("dN/dχ reconstructions (MC = benchmark)")
-    ax3.legend(fontsize=7)
-    lo, hi = ax3.get_ylim()
-    ax3.set_ylim(max(lo, hi * 1e-9), hi)
 
     fig.tight_layout()
     out = os.path.join(args.outdir, "resolution_sweep_chi.png")
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"\nwrote {out}")
+
+    # ── Standalone reconstruction panel — the paper figure. ───────────
+    fig2, axp = plt.subplots(figsize=(6.2, 4.4))
+    _draw_recon(axp)
+    fig2.tight_layout()
+    out2 = os.path.join(args.outdir, "resolution_sweep_recon.png")
+    fig2.savefig(out2, dpi=140)
+    plt.close(fig2)
+    print(f"wrote {out2}")
     return 0
 
 
