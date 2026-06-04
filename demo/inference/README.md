@@ -18,11 +18,19 @@ method note).
 > loading), and one-call `build_sampled_likelihood` (Stage-1 priors +
 > sorted-order `variables_index` + the fork's numpyro wrapper). S1–S8
 > gates in `tests/test_gwkokab_sampled_bridge.py`. NUTS at production
-> scale stays a workstation job, e.g.:
->
->     python - <<'EOF'
->     # build_sampled_likelihood(...)["log_likelihood_fn"] -> MCMC(NUTS(...))
->     EOF
+> scale stays a workstation job — run `run_sampled_wiring_nuts.py` below.
+
+* `run_sampled_wiring_nuts.py` — **THE workstation gate for the
+  production wiring**: 6-parameter Stage-1 NUTS recovery through
+  `build_sampled_likelihood`, with PASS/FAIL gates G1 (ESS), G2 (r_hat),
+  G3 (|z|<3 recovery), G4 (informativeness) and a marginals figure.
+
+      python -m pytest tests/test_gwkokab_sampled_bridge.py -q   # S1-S8 first
+      python demo/inference/run_sampled_wiring_nuts.py            # ~minutes
+      python demo/inference/run_sampled_wiring_nuts.py --smoke    # 1-min wiring check
+
+  Sandbox status 2026-06-04: S1–S8 8/8 green; `--smoke` verified through
+  G1 (catalog + logL + ESS table) before the 45 s cap cut NUTS warmup.
 
 ## Why this exists (strategy)
 
