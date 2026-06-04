@@ -4,6 +4,23 @@
 planning scaffold. Next session: user will point to the **gwkokab paper** to
 scaffold the results-section format.
 
+> **UPDATE 2026-06-04 (END OF SESSION — chi-spin work CLOSED, 4 rounds):**
+> Rounds 2–4 (on top of round 1 below): χ→1 tail artifact fixed
+> (`max_gap_factor` cap, MC-confirmed), MC raw-hist overlays everywhere
+> (no KDE), pchip-log vs hat rendering, continuous rel-L1 resolution
+> sweep emitting a machine-generated LaTeX table (relL1 + t_solve) +
+> standalone recon figure for the paper, mass-grid investigation
+> (gen-clustered log-m 1.3–1.9× better; geomspace stays default),
+> methods 2.B.3 full prose (ε/f_dep intros → calibration ¶ → deep-cascade
+> limitation + spindown next-paper flag), Results 3.A compressed to one
+> 4-paragraph section. Engine commits abbe247→ed195a7; paper repo
+> 6f7a022→cc9ed91 + HANDOFF eighth pass. ALL Cowork-local — push from
+> workstation, then `make figures-chi-spin` at paper res + recommit.
+> Memory: `project_clustered_chi_and_fisher_bridge_done`. NOTE: a
+> concurrent agent is fixing a circular import in NuclearMatter-Backend —
+> check for foreign commits before committing in shared repos
+> (`project_concurrent_agent_nuclearmatter_warning`).
+
 > **UPDATE 2026-06-04 (TECHNICAL ROUND #1 DONE — believable + interesting spin):**
 > Both spin deliverables landed and are sandbox-validated.
 >
