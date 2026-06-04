@@ -71,6 +71,36 @@ flag on the toy demonstrates the collapse deliberately.
 
       python demo/inference/toy_single_pulse_sampled_likelihood.py --mode check --narrow
 
+* `production_plpeak_sampled_recovery.py` — the production-scale test
+  (ROS spec 2026-06-04): GWTC-3-like **smoothed PL + 30 M⊙ pulse**
+  injection (small spin, mild cascade), **Mc^{15/6} selection** (swap
+  `pdet_fn` for gwkokab's neural/injection VT when trained-network /
+  injection files are available), genie measurements in
+  **(Mc, η, χ_eff) only** — the evaluator maps model samples to the
+  measured coordinates *inside* L_i, so sample mode needs **no
+  coordinate Jacobian** (sidesteps PLAN_measurement_model "THE CATCH").
+  Target ~100 detected events; 6 free params (α, λ_peak, μ_peak,
+  σ_peak, spin scale, log rate).
+
+  The PL+Peak natal enters WITHOUT engine surgery: fixed-mixture
+  proposal + θ-smooth `cfg.weight_array` IS pattern. **Proposal quality
+  is load-bearing**: a lazy log-uniform proposal collapsed every event's
+  ESS to ~2; the matched mixture (PL(α₀)+peak masses, truncnorm+uniform
+  spins) restores median ESS ~15 at 4k seeds (scales ~linearly with
+  `--n-seed`; high-Mc tail events are the stragglers). Known physics,
+  not a bug: α is weakly constrained from ABOVE under chirp-mass
+  selection (profile plateaus above truth — selection kills the low-Mc
+  events that measure the slope); μ_peak is sharply identified.
+  Promoting `natal_family="pl_peak"` into `sampled_wiring` is the
+  follow-up once this pattern has a green workstation NUTS run.
+
+      # sandbox smoke (~30 s each)
+      python demo/inference/production_plpeak_sampled_recovery.py --mode check
+      python demo/inference/production_plpeak_sampled_recovery.py --mode scan
+      # workstation production
+      python demo/inference/production_plpeak_sampled_recovery.py --mode nuts \
+          --n-seed 50000 --n-obs 100 --num-warmup 500 --num-samples 1000
+
 ## Conventions
 
 * Model samples are merger events `(m1, m2, chi1, chi2)` (heavier-first),
