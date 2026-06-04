@@ -56,6 +56,7 @@ def clustered_chi_nodes(
     peaks: tuple[tuple[float, float, float], ...] = _DEFAULT_CHI_PEAKS,
     floor_frac: float = 0.25,
     n_fine: int = 4001,
+    max_gap_factor: "float | None" = 2.0,
 ) -> Array:
     r"""Smooth density-mapped nonuniform χ nodes via inverse-CDF equidistribution.
 
@@ -103,6 +104,25 @@ def clustered_chi_nodes(
         usable backbone.  Must satisfy ``0 < floor_frac < 1``.
     n_fine
         Resolution of the internal fine grid used to build the cumulative.
+    max_gap_factor
+        Cap on the maximum node spacing, as a multiple of the uniform
+        spacing ``span / (n_chi − 1)``.  Enforced by raising the target
+        density to a minimum ``g_req = 1 / ((n_chi − 1) · gap_max)``
+        wherever it dips below, renormalising, and iterating to a fixed
+        point (then verified against the actual realised gaps, with the
+        requirement tightened if needed — deterministic, ≤ a few outer
+        rounds).
+
+        **Why this matters (the χ→1 tail artifact):** with no cap, the
+        steep post-cascade falloff sits inside one wide cell
+        (``[~0.85, chi_max]`` at the n_χ=32 default), and the bilinear
+        scatter cell-averages a density that falls several decades across
+        that cell onto the ``χ = chi_max`` node — a large *pointwise*
+        overprediction of χ≈1 outcomes (mass-conserving in the integral
+        sense, badly wrong as a density read).  Capping the gap at
+        ``2×`` uniform keeps every cell narrow enough that
+        cell-averaging stays a local error.  Pass ``None`` /
+        ``float('inf')`` to disable (reproduces the uncapped placement).
 
     Returns
     -------
@@ -134,17 +154,45 @@ def clustered_chi_nodes(
     # bumps (integrate to 1 − floor_frac).  Total integral = 1.
     g = floor_frac / span + (1.0 - floor_frac) * bump / bump_integral
 
-    # Cumulative via trapezoid; normalise to [0, 1].
-    G = np.concatenate(
-        [[0.0], np.cumsum(0.5 * (g[1:] + g[:-1]) * np.diff(chi_fine))]
-    )
-    G /= G[-1]
+    def _nodes_from_density(g_arr: np.ndarray) -> np.ndarray:
+        """Equidistribute n_chi nodes per the (normalised) density g_arr."""
+        G = np.concatenate(
+            [[0.0], np.cumsum(0.5 * (g_arr[1:] + g_arr[:-1]) * np.diff(chi_fine))]
+        )
+        G /= G[-1]
+        nodes = np.interp(np.linspace(0.0, 1.0, n_chi), G, chi_fine)
+        nodes[0] = chi_min
+        nodes[-1] = chi_max
+        return nodes
 
-    # Equidistribution: invert G at equally spaced cumulative targets.
-    targets = np.linspace(0.0, 1.0, n_chi)
-    nodes = np.interp(targets, G, chi_fine)
-    nodes[0] = chi_min
-    nodes[-1] = chi_max
+    nodes = _nodes_from_density(g)
+
+    # ── Max-gap cap (the χ→1 tail-artifact guard; see docstring) ──────
+    if max_gap_factor is not None and np.isfinite(max_gap_factor):
+        gap_max = max_gap_factor * span / (n_chi - 1)
+        g_req = 1.0 / ((n_chi - 1) * gap_max)
+        for _outer in range(8):
+            if np.max(np.diff(nodes)) <= gap_max * (1.0 + 1e-9):
+                break
+            # Raise the density floor to g_req and renormalise; iterate to
+            # a fixed point (renormalisation shrinks the floor a little,
+            # so a few inner rounds are needed).
+            for _inner in range(32):
+                g_new = np.maximum(g, g_req)
+                g_new = g_new / float(
+                    np.sum(0.5 * (g_new[1:] + g_new[:-1]) * np.diff(chi_fine))
+                )
+                if np.allclose(g_new, g, rtol=1e-12, atol=0.0):
+                    g = g_new
+                    break
+                g = g_new
+            nodes = _nodes_from_density(g)
+            # If the realised gaps still exceed the cap (equidistribution
+            # places nodes per *cumulative* density, so the local-density
+            # heuristic can undershoot), tighten the requirement.
+            if np.max(np.diff(nodes)) > gap_max * (1.0 + 1e-9):
+                g_req *= 1.25
+
     return jnp.asarray(nodes)
 
 
@@ -193,6 +241,7 @@ class BinaryGrid(eqx.Module):
         chi_max: float = 1.0 - 1e-3,
         peaks: tuple[tuple[float, float, float], ...] = _DEFAULT_CHI_PEAKS,
         floor_frac: float = 0.25,
+        max_gap_factor: "float | None" = 2.0,
     ) -> "BinaryGrid":
         """``(m, χ)`` grid with the χ axis clustered at the spin peaks.
 
@@ -218,6 +267,7 @@ class BinaryGrid(eqx.Module):
             chi_max=chi_max,
             peaks=peaks,
             floor_frac=floor_frac,
+            max_gap_factor=max_gap_factor,
         )
         return cls(m=m, chi=chi, log_m=jnp.log(m))
 

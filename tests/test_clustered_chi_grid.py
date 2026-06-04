@@ -83,6 +83,29 @@ def test_node_count_honoured():
         assert clustered_chi_nodes(n_chi=n).shape == (n,)
 
 
+def test_max_gap_cap_enforced():
+    """No cell wider than max_gap_factor × the uniform spacing — the guard
+    against the χ→1 tail artifact (wide tail cell cell-averages the steep
+    post-cascade falloff onto the χ=1 node)."""
+    span = CHI_MAX - CHI_MIN
+    for n in (12, 24, 32):
+        for fac in (1.5, 2.0, 3.0):
+            nodes = np.asarray(
+                clustered_chi_nodes(n_chi=n, max_gap_factor=fac)
+            )
+            assert np.max(np.diff(nodes)) <= fac * span / (n - 1) * (1 + 1e-6)
+
+
+def test_max_gap_cap_disabled_reproduces_uncapped():
+    a = np.asarray(clustered_chi_nodes(n_chi=32, max_gap_factor=None))
+    b = np.asarray(clustered_chi_nodes(n_chi=32, max_gap_factor=float("inf")))
+    assert np.allclose(a, b)
+    # and the uncapped grid genuinely violates the default cap (so the cap
+    # is doing real work at the default n_chi)
+    span = CHI_MAX - CHI_MIN
+    assert np.max(np.diff(a)) > 2.0 * span / 31
+
+
 # ---------------------------------------------------------------------------
 # Partition of unity of the production bilinear-hat scatter on the
 # nonuniform nodes — the mass-conservation guarantee the gain/F2 paths rely
