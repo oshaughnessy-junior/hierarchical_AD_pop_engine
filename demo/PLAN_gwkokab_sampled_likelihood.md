@@ -45,6 +45,20 @@ NUTS runs remain workstation jobs (sandbox 45 s cap).
 > (production config, not the toy's local MCConfig), per-event RIFT
 > interpolant loading, selection (pdet_fn) wiring.
 
+> **UPDATE 2026-06-04 (later): PRODUCTION-SCALE TEST SHIPPED (05f1c2d)**
+> on top of the wiring (71be29b) + its workstation NUTS gate (2b1c88e):
+> `demo/inference/production_plpeak_sampled_recovery.py` — GWTC-3-like
+> smoothed-PL + 30 M⊙ pulse injection, Mc^{15/6} selection, genie
+> (Mc, η, χ_eff)-only measurements (NO Jacobian needed in sample mode —
+> "THE CATCH" sidestepped), 6 free params. PL+Peak natal via
+> fixed-mixture proposal + θ-smooth `weight_array` (no engine surgery;
+> **proposal quality is load-bearing** — log-uniform collapsed all ESS
+> to ~2, matched mixture → median 15 @ 4k seeds). α weakly constrained
+> from above under Mc-selection (physics, not artifact); μ_peak sharp.
+> Workstation: `--mode nuts --n-seed 50000 --n-obs 100`. Follow-ups:
+> promote `natal_family="pl_peak"` into `sampled_wiring`; swap pdet_fn
+> to neural/injection VT when files exist; real-data RIFT interpolants.
+
 ## Motivation (why promote MC again)
 
 The implicit Picard solver is hitting structural limits on the spin axis:
