@@ -136,6 +136,18 @@ class CoagulationPopulation(Distribution):
             validate_args=validate_args,
         )
 
+    @property
+    def response(self):  # noqa: D401
+        """The underlying :class:`CoagulationResponse` (read-only accessor).
+
+        Exposes the engine response built by ``make_coagulation_dist_fn`` so
+        callers can inspect its configuration — e.g. ``pop.response.orientation``
+        to confirm the Fisher-κ / Isotropic model threaded through, or
+        ``pop.response.grid.chi`` to read the (clustered) χ nodes — without
+        reaching into the private field.
+        """
+        return self._response
+
     @constraints.dependent_property(is_discrete=False, event_dim=1)
     def support(self):  # noqa: D401
         return self._support
@@ -212,6 +224,9 @@ def make_coagulation_dist_fn(
     kde_adaptive: bool = False,
     solver: str = "mc_jax",
     epsilon: float = 1.0,
+    orientation: Any = None,
+    retention_kind: str = "sigmoid",
+    w_over_v_esc: float = 1.0,
 ) -> Callable[..., CoagulationPopulation]:
     r"""Build the ``dist_fn`` gwkokab calls as ``dist_fn(**params) -> Distribution``.
 
@@ -270,6 +285,32 @@ def make_coagulation_dist_fn(
     ``demo/HANDOFF_two_pulse_recovery.md``).  ``epsilon`` (coupling×time,
     absolute physical scale) is forwarded to the implicit solver and
     ignored by the MC backends.
+
+    Spin orientation (Fisher-κ)
+    ---------------------------
+    ``orientation`` selects the spin-orientation model marginalised over at
+    each merger event (``spin_orientation.Aligned`` / ``Isotropic`` /
+    ``Fisher``).  ``None`` (the default) keeps the bit-for-bit v1 Aligned
+    path.  Pass ``Fisher(kappa=…)`` or ``Isotropic()`` to engage the vector
+    Barausse-Rezzolla / Lousto-Zlochower remnant physics — the engine
+    promotes the scalar progenitor spins to vectors with tilts drawn from
+    ``P(θ̂; κ)``, runs the full vector remnant + kick, and marginalises back
+    to ``(|χ_rem|, v_kick)``.  This is what makes the cascade spin
+    distribution physical (and κ-tunable) rather than perfectly aligned.
+
+    The model is **fixed per run** (captured in the closure, same as
+    ``v_esc``), but the wiring is inference-ready: under
+    ``solver="implicit"`` the IFT ``@jax.custom_vjp`` already flows
+    ``∂/∂κ`` through the orientation marginal (and recovers a nonzero
+    ``∂/∂v_esc`` once a non-Aligned model + the smooth ``sigmoid``
+    retention are in play — Aligned/Heaviside gives identically zero).  To
+    make κ a *fit parameter* later, lift it into the ``dist_fn`` keyword
+    set and rebuild ``Fisher(kappa=…)`` inside the closure; no engine
+    change is needed.
+
+    ``retention_kind`` (default ``"sigmoid"``) and ``w_over_v_esc`` are
+    forwarded alongside ``orientation``; they configure the per-orientation
+    kick-retention and are ignored under Aligned.
     """
     if mc_jax_key is None:
         mc_jax_key = jax.random.PRNGKey(0)
@@ -350,6 +391,9 @@ def make_coagulation_dist_fn(
                 grid=grid,
                 solver=solver,
                 epsilon=epsilon,
+                orientation=orientation,
+                retention_kind=retention_kind,
+                w_over_v_esc=w_over_v_esc,
                 mc_v_esc=v_esc,
                 mc_n_seed=n_seed,
                 mc_depletion_fraction=depletion_fraction,
@@ -390,6 +434,9 @@ def make_coagulation_dist_fn(
                 grid=grid,
                 solver=solver,
                 epsilon=epsilon,
+                orientation=orientation,
+                retention_kind=retention_kind,
+                w_over_v_esc=w_over_v_esc,
                 mc_v_esc=v_esc,
                 mc_n_seed=n_seed,
                 mc_depletion_fraction=depletion_fraction,
