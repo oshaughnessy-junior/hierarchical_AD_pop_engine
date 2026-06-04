@@ -4,6 +4,35 @@
 planning scaffold. Next session: user will point to the **gwkokab paper** to
 scaffold the results-section format.
 
+> **UPDATE 2026-06-04 (LATE — workstation high-res rerun findings, ROS):**
+> (a) **MC size**: push the sweep benchmark BEYOND 1e6 seeds — the
+> secondary (2g+) peaks are still under-populated in the histogram.
+> Numpy MC is ~0.5 ms/seed single-core → 1e7 ≈ 90 min; use seed-split
+> chunked parallel runs with merged histograms (raw hists merge exactly;
+> seed via independent `default_rng` streams — see
+> `demo/forward_modeling_mc_parallel.py`) or the JAX MC. Bump
+> `RS_MC_N_SEED` once timed.
+> (b) **n_chi=64 RINGING at high spin**: the grid model oscillates trying
+> to represent the *completely empty* gap between the natal spins and the
+> 1g remnant peak. RISK: with hundreds of sources now, ringing could
+> imprint artificial features on recovered populations. First diagnostic:
+> re-render with `--render hat` — if node VALUES oscillate it's the
+> solver (bilinear deposit of a sub-cell-width peak + positivity-clipped
+> Picard around zero), not the pchip-log rendering. Candidate
+> mitigations, in order: clustered grid w/ FEWER nodes in the empty gap
+> (less ringing DOF), deposit-side mild diffusion/limiter (TVD-style,
+> mass-conserving), damping/tol tuning; physically, the next-paper
+> SPINDOWN mechanism fills the gap and likely removes the pathology at
+> the source.
+> (c) **Path forward — may need to promote MC again.** gwkokab's two
+> likelihood modes are both density-mode (`model.log_prob` at event PE
+> samples — verified in `inference/poissonlikelihood_utils.py`); a
+> SAMPLE-mode (per-event likelihood evaluators × samples from the model,
+> which MC produces naturally — no KDE) is NOT implemented. Logged as a
+> standalone development task for a separate agent on a gwkokab fork:
+> **`demo/PLAN_gwkokab_sampled_likelihood.md`** (math, code evidence, API
+> sketch, acceptance gates, thread-back plan).
+
 > **UPDATE 2026-06-04 (END OF SESSION — chi-spin work CLOSED, 4 rounds):**
 > Rounds 2–4 (on top of round 1 below): χ→1 tail artifact fixed
 > (`max_gap_factor` cap, MC-confirmed), MC raw-hist overlays everywhere
