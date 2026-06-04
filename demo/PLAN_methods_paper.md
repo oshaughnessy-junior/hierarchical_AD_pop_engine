@@ -24,6 +24,22 @@ scaffold the results-section format.
 > mass-conserving), damping/tol tuning; physically, the next-paper
 > SPINDOWN mechanism fills the gap and likely removes the pathology at
 > the source.
+> **STRATEGY DECISION (ROS 2026-06-04 night): no engine-side ringing fix
+> for now — see if we can go FULL MC after all.** The implicit method was
+> always the backstop recoverer, adopted only because we had no
+> continuous per-event likelihoods; with the gwkokab
+> `feature/sampled-poisson-likelihood` fork landed and the
+> `demo/inference/` toy GREEN (single pulse + genie-style event
+> likelihoods + MC merger traces + full numpyro NUTS recovery of
+> (μ, σ, logR) — sandbox-validated end-to-end), MC-as-recoverer is live.
+> Implicit stays as the cross-check/backstop. The decisive risk is
+> per-event ESS (model samples must land on every event): broad BBH
+> posteriors are fine (toy: min ESS 58 @ 445 live samples); narrow /
+> low-mass posteriors collapse (toy `--narrow`: ALL events ESS 1–6).
+> Mitigations when it bites: bigger n_seed, stratified/weighted natal
+> proposals (M3a/M3b), per-event proposal tempering.
+> MC-size note (a): launch-and-leave the big benchmark MC; follow up
+> next session.
 > (c) **Path forward — may need to promote MC again.** gwkokab's two
 > likelihood modes are both density-mode (`model.log_prob` at event PE
 > samples — verified in `inference/poissonlikelihood_utils.py`); a

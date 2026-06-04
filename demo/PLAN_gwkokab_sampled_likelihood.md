@@ -1,8 +1,35 @@
 # PLAN — gwkokab sample-based (likelihood-mode) inference for MC populations
 
 **Date:** 2026-06-04 (ROS direction, post chi-resolution rerun). **Status:**
-DEVELOPMENT TASK SPEC — intended for a **separate agent** to develop on a
-gwkokab fork, then thread back into the engine bridge. Not started.
+**FORK DELIVERABLE STARTED 2026-06-04** — items 1–4 (core fn, numpyro+flowMC
+wrappers, factory wiring, Gaussian + RIFT-interpolant adapters, TP0–TP4
+acceptance gates) landed on gwkokab branch
+`feature/sampled-poisson-likelihood`, commit `41b1c7e` (local-only in the
+Cowork sandbox — **push to the `junior` remote, not `origin/main`, from a
+networked clone**). 7/7 test-problem gates green in-VM under the RIFT import
+stub. Item 5 (engine-side thread-back: `particle_mc_jax` draws/weights as
+`sampler_fn` + per-event RIFT interpolant loading) remains. See
+`examples/sampled_likelihood_method.md` and `examples/sampled_likelihood_demo.py`
+in the fork.
+
+> **UPDATE 2026-06-04 (late): ENGINE-SIDE TOY GREEN — item 5 de-risked.**
+> `demo/inference/toy_single_pulse_sampled_likelihood.py` exercises the
+> FULL path end-to-end in-sandbox: single-pulse truth →
+> `particle_mc_jax_soft` merger traces (`mergers[:, :4]` =
+> (m1,m2,χ1,χ2) + `w_mergers·step_active` weights; dead NaN slots
+> sanitized via where-select; weight normalisation `Σw = e^{log_rate}`)
+> → genie-style Gaussian event likelihoods
+> (`gaussian_event_log_likelihoods`) → `sampled_poisson_likelihood_fn`
+> check + μ profile scan → `numpyro_sampled_poisson_likelihood` NUTS:
+> (μ, σ, logR) all recovered within ~1.5σ at toy scale (1.5k seeds,
+> 12 events). Per-event ESS healthy broad (min 58 @ 445 live), COLLAPSES
+> under `--narrow` (all events ESS 1–6) — the low-mass worry is real and
+> now demonstrable. Toy gotcha worth keeping: with a fixed-size catalog
+> the only self-consistent rate truth is log(n_obs/T_obs) — a wrong rate
+> truth shows up as a cleanly-converged-but-biased log_rate.
+> REMAINING for item 5 proper: bridge-level `sampler_fn` export
+> (production config, not the toy's local MCConfig), per-event RIFT
+> interpolant loading, selection (pdet_fn) wiring.
 
 ## Motivation (why promote MC again)
 
