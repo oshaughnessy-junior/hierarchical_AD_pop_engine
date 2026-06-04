@@ -7,10 +7,24 @@ acceptance gates) landed on gwkokab branch
 `feature/sampled-poisson-likelihood`, commit `41b1c7e` (local-only in the
 Cowork sandbox — **push to the `junior` remote, not `origin/main`, from a
 networked clone**). 7/7 test-problem gates green in-VM under the RIFT import
-stub. Item 5 (engine-side thread-back: `particle_mc_jax` draws/weights as
-`sampler_fn` + per-event RIFT interpolant loading) remains. See
-`examples/sampled_likelihood_method.md` and `examples/sampled_likelihood_demo.py`
-in the fork.
+stub. See `examples/sampled_likelihood_method.md` and
+`examples/sampled_likelihood_demo.py` in the fork.
+
+**ITEM 5 (thread-back) CLOSED 2026-06-04 (same day, later session):**
+`src/hierarchical_ad_pop_engine/inference/sampled_wiring.py` —
+`make_coagulation_sampler_fn` (particle_mc_jax/_soft actives+weights as
+`sampler_fn`, Σw = e^{log_rate}, NaN-slot hygiene + floored weights),
+`load_rift_event_log_likelihoods` (RIFT interpolant loading via the fork's
+adapter; builder-injected so the RIFT stack stays workstation-side) +
+`gaussian_event_log_likelihoods_from_posteriors` (genie-style fallback),
+`build_sampled_likelihood` (one-call wiring, Stage-1 priors/sorted-index
+contract) — the Results-C capable path. Gates S1–S8 in
+`tests/test_gwkokab_sampled_bridge.py`, 8/8 green in-VM. Realism evidence:
+`internal_tests/gw_banana_sampled_vs_density.py` (uncommitted, top-level) —
+banana-error GW catalogues, sampled vs density NUTS posteriors agree to
+dz≤0.09; density mode fails outright on events whose PE cloud exits the
+support while sampled mode degrades gracefully (low-ESS flag). Production
+NUTS runs remain workstation jobs (sandbox 45 s cap).
 
 > **UPDATE 2026-06-04 (late): ENGINE-SIDE TOY GREEN — item 5 de-risked.**
 > `demo/inference/toy_single_pulse_sampled_likelihood.py` exercises the

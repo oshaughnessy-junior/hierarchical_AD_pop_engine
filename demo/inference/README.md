@@ -9,6 +9,21 @@ no KDE. Requires the gwkokab fork branch
 spec and `examples/sampled_likelihood_method.md` in the fork for the
 method note).
 
+> **PRODUCTION WIRING (PLAN item 5, 2026-06-04):** the toy's
+> `make_sampler_fn` is promoted to
+> `src/hierarchical_ad_pop_engine/inference/sampled_wiring.py` —
+> `make_coagulation_sampler_fn` (constant/free split mirroring
+> `make_coagulation_dist_fn`), `load_rift_event_log_likelihoods` /
+> `gaussian_event_log_likelihoods_from_posteriors` (per-event likelihood
+> loading), and one-call `build_sampled_likelihood` (Stage-1 priors +
+> sorted-order `variables_index` + the fork's numpyro wrapper). S1–S8
+> gates in `tests/test_gwkokab_sampled_bridge.py`. NUTS at production
+> scale stays a workstation job, e.g.:
+>
+>     python - <<'EOF'
+>     # build_sampled_likelihood(...)["log_likelihood_fn"] -> MCMC(NUTS(...))
+>     EOF
+
 ## Why this exists (strategy)
 
 The implicit Picard solver was always the *backstop* recoverer — adopted
