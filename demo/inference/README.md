@@ -101,6 +101,24 @@ flag on the toy demonstrates the collapse deliberately.
       python demo/inference/production_plpeak_sampled_recovery.py --mode nuts \
           --n-seed 50000 --n-obs 100 --num-warmup 500 --num-samples 1000
 
+* `compare_recovery_two_methods.py` — the paper's Fig-5 upgrade: TWO
+  equivalent inference calculations on ONE single-pulse catalog,
+  posteriors overlaid (MC sample-mode in blue; implicit density-mode as
+  black shading + contours; truth red). The implicit arm runs at the
+  H2-calibrated ε* (geometric bisection to `f_natal_depleted == F_DEP`;
+  sandbox-verified: ε* = 2.139 → f_dep = 0.1000 exactly). Arms are
+  npz-cached and assemble incrementally via `--arm plot`.
+
+  Sandbox status 2026-06-04: **MC arm green end-to-end** (reduced knobs);
+  **implicit arm wiring verified through ε-calibration + model build**,
+  but its NUTS compile (IFT/GMRES backward through the Picard
+  `while_loop`, vmapped over PE samples) exceeds the 45 s command cap —
+  run it on the workstation:
+
+      python demo/inference/compare_recovery_two_methods.py --arm both \
+          --n-seed 20000 --n-obs 60 --n-pe 512 \
+          --num-warmup 500 --num-samples 1000
+
 ## Conventions
 
 * Model samples are merger events `(m1, m2, chi1, chi2)` (heavier-first),
