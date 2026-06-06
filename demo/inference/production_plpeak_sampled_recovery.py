@@ -314,7 +314,8 @@ def loglik(sampler_fn, Ls, **theta):
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=("check", "scan", "nuts", "all"),
+    p.add_argument("--mode", choices=("check", "scan", "nuts", "all",
+                                      "plot-only"),
                    default="check")
     p.add_argument("--n-seed", type=int, default=4000)
     p.add_argument("--n-obs", type=int, default=40)
@@ -413,28 +414,94 @@ def main() -> int:
         mcmc = MCMC(NUTS(model), num_warmup=args.num_warmup,
                     num_samples=args.num_samples, progress_bar=True)
         mcmc.run(jax.random.PRNGKey(5), jnp.asarray(T_OBS))
-        post = mcmc.get_samples()
+        post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
         print("\nNUTS recovery (truth in brackets):")
         for k in names:
-            v = np.asarray(post[k])
+            v = post[k]
             print(f"  {k:12s}: {v.mean():.3f} +/- {v.std():.3f}   "
                   f"[{theta_true[k]:.3f}]")
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(2, 3, figsize=(11, 6))
-        for ax, k in zip(axes.ravel(), names):
-            ax.hist(np.asarray(post[k]), bins=30, density=True, alpha=0.7)
-            ax.axvline(theta_true[k], ls=":", color="k")
-            ax.set_xlabel(k)
-        fig.tight_layout()
+        # ALWAYS persist the posterior — figures are then re-stylable
+        # forever via --mode plot-only (lesson of the 2026-06-06 run,
+        # which kept only the PNG).
         os.makedirs(args.outdir, exist_ok=True)
-        out = os.path.join(args.outdir, "plpeak_nuts_posteriors.png")
-        fig.savefig(out, dpi=140)
-        plt.close(fig)
-        print(f"wrote {out}")
+        np.savez(os.path.join(args.outdir, "plpeak_post.npz"),
+                 **post, **{f"truth_{k}": theta_true[k] for k in names},
+                 n_obs=args.n_obs, n_seed=args.n_seed)
+        _make_recovery_figures(post, theta_true, args.outdir)
+
+    if args.mode == "plot-only":
+        path = os.path.join(args.outdir, "plpeak_post.npz")
+        if not os.path.exists(path):
+            print(f"no cached posterior at {path} — run --mode nuts first")
+            return 1
+        with np.load(path) as z:
+            names = sorted(k for k in z.files if not k.startswith("truth_")
+                           and k not in ("n_obs", "n_seed"))
+            post = {k: z[k] for k in names}
+            theta_cached = {k: float(z[f"truth_{k}"]) for k in names}
+        _make_recovery_figures(post, theta_cached, args.outdir)
 
     return 0
+
+
+_CORNER_LABELS = {
+    "alpha": r"$\alpha$",
+    "lambda_peak": r"$\lambda_{\rm peak}$",
+    "mu_peak": r"$\mu_{\rm peak}\ [M_\odot]$",
+    "sigma_peak": r"$\sigma_{\rm peak}\ [M_\odot]$",
+    "spin_scale": r"$\sigma_\chi$",
+    "log_rate": r"$\log R$",
+}
+_CORNER_ORDER = ("alpha", "lambda_peak", "mu_peak", "sigma_peak",
+                 "spin_scale", "log_rate")
+
+
+def _make_recovery_figures(post, theta_true, outdir):
+    """Marginal strip + pretty corner from a posterior dict."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(outdir, exist_ok=True)
+    names = [k for k in _CORNER_ORDER if k in post]
+    # marginal strip (the quick-look figure)
+    fig, axes = plt.subplots(2, 3, figsize=(11, 6))
+    for ax, k in zip(axes.ravel(), names):
+        ax.hist(post[k], bins=30, density=True, alpha=0.7)
+        ax.axvline(theta_true[k], ls=":", color="k")
+        ax.set_xlabel(_CORNER_LABELS.get(k, k))
+    fig.tight_layout()
+    out = os.path.join(outdir, "plpeak_nuts_posteriors.png")
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+    # pretty corner (the paper figure)
+    try:
+        import corner
+    except ImportError:
+        print("corner not installed — skipping plpeak_corner.png")
+        return
+    data = np.stack([post[k] for k in names], axis=1)
+    fig = corner.corner(
+        data,
+        labels=[_CORNER_LABELS.get(k, k) for k in names],
+        truths=[theta_true[k] for k in names],
+        truth_color="C3",
+        quantiles=(0.16, 0.5, 0.84),
+        show_titles=True,
+        title_fmt=".2f",
+        title_kwargs=dict(fontsize=9),
+        label_kwargs=dict(fontsize=11),
+        smooth=0.9,
+        plot_datapoints=False,
+        fill_contours=True,
+        levels=(0.39, 0.86),  # 1- and 2-sigma in 2D
+        color="C0",
+    )
+    out = os.path.join(outdir, "plpeak_corner.png")
+    fig.savefig(out, dpi=160)
+    print(f"wrote {out}")
 
 
 if __name__ == "__main__":
