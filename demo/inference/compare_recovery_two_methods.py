@@ -86,8 +86,17 @@ def _variables():
 
 
 def _run_nuts(model, run_args, num_warmup, num_samples, key):
-    from numpyro.infer import MCMC, NUTS
-    mcmc = MCMC(NUTS(model), num_warmup=num_warmup,
+    from numpyro.infer import MCMC, NUTS, init_to_median
+    # init_to_median (not the default init_to_uniform): the single-pulse
+    # population gives a near-zero per-event ESS whenever mu_natal is drawn
+    # far from the events, so a uniform init can land NUTS in a region where
+    # the likelihood is numerically degenerate -> step size collapses to
+    # ~1e-9 and warmup never recovers.  Seeding from the best of several
+    # prior draws starts the chain where the population actually overlaps the
+    # catalog (per-event ESS at truth is healthy, min ~80 at n_seed=2e4, so
+    # this is purely a warmup-initialisation fix, not a statistics change).
+    mcmc = MCMC(NUTS(model, init_strategy=init_to_median),
+                num_warmup=num_warmup,
                 num_samples=num_samples, progress_bar=True)
     mcmc.run(key, *run_args)
     return {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
