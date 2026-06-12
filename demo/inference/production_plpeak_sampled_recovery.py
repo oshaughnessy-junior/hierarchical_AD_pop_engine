@@ -312,6 +312,8 @@ def loglik(sampler_fn, Ls, **theta):
 
 
 def main() -> int:
+    global TRUTH, ALPHA_TRUE, LAMBDA_TRUE, MU_PEAK_TRUE, SIGMA_PEAK_TRUE
+    global SPIN_SCALE_TRUE, F_DEP, MC_REF, V_ESC
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--mode", choices=("check", "scan", "nuts", "all",
@@ -326,7 +328,44 @@ def main() -> int:
     p.add_argument("--outdir", type=str,
                    default=os.path.join(os.path.dirname(__file__),
                                         "figures_plpeak"))
+    # Injection knobs (defaults reproduce the committed GWTC-3-like run).
+    # Override to inject a different population, e.g. a deeper hierarchical
+    # cascade (--f-dep 0.5) with a flatter, detectable power law
+    # (--alpha-true 2.5) and a more sensitive selection (--mc-ref 20).
+    p.add_argument("--alpha-true", type=float, default=ALPHA_TRUE)
+    p.add_argument("--lambda-true", type=float, default=LAMBDA_TRUE)
+    p.add_argument("--mu-peak-true", type=float, default=MU_PEAK_TRUE)
+    p.add_argument("--sigma-peak-true", type=float, default=SIGMA_PEAK_TRUE)
+    p.add_argument("--spin-scale-true", type=float, default=SPIN_SCALE_TRUE)
+    p.add_argument("--f-dep", type=float, default=F_DEP,
+                   help="depletion fraction = cascade depth (0.1 shallow .. 0.85 deep)")
+    p.add_argument("--mc-ref", type=float, default=MC_REF,
+                   help="selection scale: pdet=min((Mc/mc_ref)^2.5,1); lower=more sensitive")
+    p.add_argument("--v-esc", type=float, default=V_ESC)
+    p.add_argument("--init-median", action="store_true",
+                   help="init NUTS with init_to_median (robust warmup for "
+                        "deeper-cascade populations)")
+    p.add_argument("--max-tree-depth", type=int, default=0,
+                   help="cap NUTS tree depth (e.g. 7) to bound per-iteration "
+                        "cost on rough/deep-cascade likelihoods; 0 = default(10)")
+    p.add_argument("--target-accept", type=float, default=0.0,
+                   help="NUTS target acceptance (e.g. 0.7); 0 = default(0.8). "
+                        "Lower lets a larger step skim a rough potential.")
     args = p.parse_args()
+
+    # Apply injection overrides BEFORE building the sampler/selection (these
+    # module globals are read at call time by make_sampler_fn / pdet_fn).
+    ALPHA_TRUE, LAMBDA_TRUE = args.alpha_true, args.lambda_true
+    MU_PEAK_TRUE, SIGMA_PEAK_TRUE = args.mu_peak_true, args.sigma_peak_true
+    SPIN_SCALE_TRUE = args.spin_scale_true
+    F_DEP, MC_REF, V_ESC = args.f_dep, args.mc_ref, args.v_esc
+    TRUTH = dict(alpha=ALPHA_TRUE, lambda_peak=LAMBDA_TRUE,
+                 mu_peak=MU_PEAK_TRUE, sigma_peak=SIGMA_PEAK_TRUE,
+                 spin_scale=SPIN_SCALE_TRUE)
+    print(f"injection: alpha={ALPHA_TRUE} lambda_peak={LAMBDA_TRUE} "
+          f"mu_peak={MU_PEAK_TRUE} sigma_peak={SIGMA_PEAK_TRUE} "
+          f"spin_scale={SPIN_SCALE_TRUE} | F_DEP={F_DEP} MC_REF={MC_REF} "
+          f"V_ESC={V_ESC}")
 
     sampler_fn = make_sampler_fn(args.n_seed)
     Ls, truths, observed, logr_true, mean_pdet = draw_catalog(
@@ -411,7 +450,15 @@ def main() -> int:
             {k: i for i, k in enumerate(names)},
             Ls, pdet_fn, None,
         )
-        mcmc = MCMC(NUTS(model), num_warmup=args.num_warmup,
+        nuts_kw = {}
+        if args.init_median:
+            from numpyro.infer import init_to_median
+            nuts_kw["init_strategy"] = init_to_median
+        if args.max_tree_depth:
+            nuts_kw["max_tree_depth"] = args.max_tree_depth
+        if args.target_accept:
+            nuts_kw["target_accept_prob"] = args.target_accept
+        mcmc = MCMC(NUTS(model, **nuts_kw), num_warmup=args.num_warmup,
                     num_samples=args.num_samples, progress_bar=True)
         mcmc.run(jax.random.PRNGKey(5), jnp.asarray(T_OBS))
         post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
@@ -426,7 +473,8 @@ def main() -> int:
         os.makedirs(args.outdir, exist_ok=True)
         np.savez(os.path.join(args.outdir, "plpeak_post.npz"),
                  **post, **{f"truth_{k}": theta_true[k] for k in names},
-                 n_obs=args.n_obs, n_seed=args.n_seed)
+                 n_obs=args.n_obs, n_seed=args.n_seed,
+                 f_dep=F_DEP, mc_ref=MC_REF, v_esc=V_ESC)
         _make_recovery_figures(post, theta_true, args.outdir)
 
     if args.mode == "plot-only":
