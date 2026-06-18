@@ -15,9 +15,11 @@ parameter logic inspectable, not to replace a population fit:
     chi_out = chi_Regge(M) + (chi_birth - chi_Regge(M)) exp(-Lambda_eff)
 
 with ``Lambda_eff`` suppressed by a mass-dependent violent-interaction channel.
-The default settings are tuned to produce qualitatively GWTC-like G3/G4/G5
+The default settings are tuned to produce qualitatively GWTC-like higher-mass
 features: a low-spin island near 25--35 Msun, a moderate/high-spin band near
-45--60 Msun, and a high-spin tail around 70--100 Msun.
+45--60 Msun, and a high-spin tail around 70--100 Msun.  We use ``S1, S2, ...``
+for single-BH/remnant generations to avoid confusion with the paper's
+``G1, ..., G5`` binary mixture components.
 
 Run:
 
@@ -70,7 +72,8 @@ class AxionCascadeConfig:
     natal_spin_scale: float = 0.08
 
     # Pairing K ~ (m1+m2)^a q^b.  The mass and q bias favor the high-mass,
-    # near-equal branch once it exists, which makes the G3/G4/G5 ladder visible.
+    # near-equal branch once it exists, which makes the high-mass S3/S4/S5
+    # single-remnant ladder visible.
     kernel_a: float = 2.2
     kernel_b: float = 2.8
 
@@ -346,7 +349,7 @@ def plot(populations: dict[int, dict[str, np.ndarray]], cfg: AxionCascadeConfig)
                 dndm / dndm.max(),
                 color=colors[gen - 1],
                 lw=2.0,
-                label=f"G{gen}",
+                label=f"S{gen}",
             )
         if dndchi.max() > 0:
             ax_spin.plot(
@@ -354,7 +357,7 @@ def plot(populations: dict[int, dict[str, np.ndarray]], cfg: AxionCascadeConfig)
                 dndchi / dndchi.max(),
                 color=colors[gen - 1],
                 lw=2.0,
-                label=f"G{gen}",
+                label=f"S{gen}",
             )
 
         # Downsample for an interpretable scatter.  Use quantiles to avoid one
@@ -383,7 +386,7 @@ def plot(populations: dict[int, dict[str, np.ndarray]], cfg: AxionCascadeConfig)
             mec="white",
             mew=0.6,
             capsize=2.5,
-            label=f"G{gen} median",
+            label=f"S{gen} median",
         )
 
     m_grid = np.geomspace(5.0, 125.0, 500)
@@ -397,7 +400,11 @@ def plot(populations: dict[int, dict[str, np.ndarray]], cfg: AxionCascadeConfig)
     )
 
     # Eyeball target bands from the tmp_Zee paper discussion.
-    for lo, hi, label in [(25, 35, "G3-like"), (45, 60, "G4-like"), (70, 105, "G5-like")]:
+    for lo, hi, label in [
+        (25, 35, "paper G3-like"),
+        (45, 60, "paper G4-like"),
+        (70, 105, "paper G5-like"),
+    ]:
         ax_scatter.axvspan(lo, hi, color="0.7", alpha=0.13, lw=0)
         ax_scatter.text(
             np.sqrt(lo * hi),
@@ -456,7 +463,7 @@ def save_artifact(populations, events, cfg: AxionCascadeConfig) -> Path:
     payload = {"events": events}
     for gen, pop in populations.items():
         for key, value in pop.items():
-            payload[f"G{gen}_{key}"] = value
+            payload[f"S{gen}_{key}"] = value
     payload["config_keys"] = np.array(list(cfg.__dict__.keys()))
     payload["config_values"] = np.array([str(v) for v in cfg.__dict__.values()])
     np.savez(out, **payload)
@@ -470,7 +477,7 @@ def print_summary(populations, cfg: AxionCascadeConfig) -> None:
     print(f"  residence = {cfg.residence_yr:.3g} yr")
     print(f"  disruption mass = {cfg.m_disrupt:.1f} Msun")
     print()
-    print("Generation summaries:")
+    print("Single-BH/remnant generation summaries:")
     print("  gen   med(m)   q16-q84(m)      med(chi)  q16-q84(chi)   med(Lambda)  med(p_quiet)")
     for gen in range(1, cfg.k_max + 1):
         pop = populations[gen]
@@ -479,7 +486,7 @@ def print_summary(populations, cfg: AxionCascadeConfig) -> None:
         lam = np.median(pop["lambda"])
         pq = np.median(pop["p_quiet"])
         print(
-            f"  G{gen:<2d}  {mq[1]:7.2f}  [{mq[0]:6.2f},{mq[2]:6.2f}]"
+            f"  S{gen:<2d}  {mq[1]:7.2f}  [{mq[0]:6.2f},{mq[2]:6.2f}]"
             f"    {cq[1]:7.3f}  [{cq[0]:6.3f},{cq[2]:6.3f}]"
             f"      {lam:8.3g}      {pq:7.3f}"
         )

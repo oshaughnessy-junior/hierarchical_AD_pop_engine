@@ -7,16 +7,21 @@ candidate two-body event by
 
     c_jl N_j N_l K(m1, m2) / n_proposal .
 
-The output compares three mass-plane shapes:
+The output compares two mass-plane shapes:
 
 1. no-axion weighted tracer recurrence with the high-mass locality kernel;
-2. no-axion implicit Picard forward rate with the separable power-law kernel;
-3. axion-filter weighted tracer recurrence with the high-mass locality kernel.
+2. axion-filter weighted tracer recurrence with the high-mass locality kernel.
 
 All panels are peak-normalized in ``d^2R / dlnm1 dlnm2`` so this is a shape
 check only.  The channel table printed to stdout is the important bookkeeping
 audit: if high-generation channels explode there, the figure is telling us the
 model, not only the plot, is too aggressive.
+
+Notation
+--------
+We use ``S1, S2, ...`` for single-BH/remnant generations in this script.  This
+deliberately avoids the paper's ``G1, ..., G5`` notation, which labels binary
+mixture components and their associated remnant outcomes.
 
 Run:
 
@@ -106,10 +111,13 @@ def high_mass_locality_kernel(
 ) -> np.ndarray:
     """Pairing kernel with a high-mass comparable-mass preference.
 
-    Low masses use the familiar ``(m1+m2)^a q^b_low``.  Above ``m_turn``,
+    Low masses use the familiar ``(m1+m2)^a q^b_low``.  The default ``b_low``
+    is already stronger than the original toy model so low-mass unequal-mass
+    encounters are suppressed.  This keeps S1+S1 and S1+S2 growth possible but
+    disfavors very unequal pairings.  Above ``m_turn``,
     the kernel multiplies in a log-mass locality gate that narrows toward
-    ``sigma_high``.  This keeps G1+G1 and G1+G2 growth possible but suppresses
-    high-mass mixed-generation encounters unless the two masses are comparable.
+    ``sigma_high`` and suppresses high-mass mixed-generation encounters unless
+    the two masses are comparable.
     """
     m1 = np.asarray(m1, dtype=np.float64)
     m2 = np.asarray(m2, dtype=np.float64)
@@ -223,7 +231,7 @@ def simulate_weighted_tracer(
         N_gen = float(np.sum(w_pool))
         N[gen] = N_gen
         if (not np.isfinite(N_gen)) or N_gen <= 0:
-            raise RuntimeError(f"Generation G{gen} has zero retained weight.")
+            raise RuntimeError(f"Single-BH generation S{gen} has zero retained weight.")
         idx = rng.choice(m_pool.size, size=cfg.n_seed, replace=True, p=w_pool / N_gen)
         m_gen = m_pool[idx]
         chi_birth_gen = chi_birth_pool[idx]
@@ -295,7 +303,7 @@ def implicit_rate_plane(cfg: AxionCascadeConfig, log_edges, *, implicit_epsilon:
     }
 
 
-def plot_comparison(noax_mc, axion_mc, imp_H, cfg, log_edges):
+def plot_comparison(noax_mc, axion_mc, cfg, log_edges):
     edges = np.exp(log_edges)
     centers = np.sqrt(edges[:-1] * edges[1:])
     X, Y = np.meshgrid(edges, edges, indexing="ij")
@@ -314,11 +322,10 @@ def plot_comparison(noax_mc, axion_mc, imp_H, cfg, log_edges):
     )
     maps = [
         ("weighted tracer MC, no axion", H_noax),
-        ("implicit Picard baseline, no axion", imp_H),
         ("weighted tracer MC, axion spins", H_ax),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.2, 4.5), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9.0, 4.5), constrained_layout=True)
     from matplotlib.colors import LogNorm
 
     for ax, (title, H) in zip(axes, maps):
@@ -351,13 +358,13 @@ def plot_comparison(noax_mc, axion_mc, imp_H, cfg, log_edges):
                 ev = axion_mc["events"]
             else:
                 ev = noax_mc["events"]
-            if title.startswith("implicit") or not np.any(mask):
+            if not np.any(mask):
                 continue
             w = ev[mask, 5]
             med1 = weighted_quantile(ev[mask, 0], w, 0.5)
             med2 = weighted_quantile(ev[mask, 1], w, 0.5)
             ax.plot(med1, med2, "o", ms=4, color=color, mec="white", mew=0.5)
-            ax.text(med1 * 1.04, med2 * 1.03, f"G{gen}", color=color, weight="bold", fontsize=8)
+            ax.text(med1 * 1.04, med2 * 1.03, f"S{gen}", color=color, weight="bold", fontsize=8)
         fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.02, label="peak-normalized")
     axes[0].set_ylabel(r"$m_2\,[M_\odot]$")
 
@@ -373,7 +380,10 @@ def print_channel_table(label, channels):
     total = float(np.sum(channels[:, 3]))
     for gen, j, l, rate, retained in channels:
         frac = rate / total if total > 0 else 0.0
-        print(f"  G{int(gen):<2d}  {int(j):d}  {int(l):d}  {rate:10.3e}  {retained:10.3e}  {frac:10.3e}")
+        print(
+            f"  S{int(gen):<2d}  S{int(j):d} S{int(l):d}"
+            f"  {rate:10.3e}  {retained:10.3e}  {frac:10.3e}"
+        )
     print(f"  total event rate weight = {total:.3e}")
     print()
 
@@ -384,11 +394,11 @@ def parse_args():
     parser.add_argument("--n-seed", type=int, default=25_000)
     parser.add_argument("--n-pairs-per-channel", type=int, default=35_000)
     parser.add_argument("--kernel-a", type=float, default=2.2)
-    parser.add_argument("--kernel-b", type=float, default=2.8)
+    parser.add_argument("--kernel-b", type=float, default=4.2)
     parser.add_argument("--m-max", type=float, default=140.0)
     parser.add_argument("--m-local-turn", type=float, default=42.0)
     parser.add_argument("--local-turn-width", type=float, default=7.0)
-    parser.add_argument("--sigma-q-low", type=float, default=1.2)
+    parser.add_argument("--sigma-q-low", type=float, default=0.9)
     parser.add_argument("--sigma-q-high", type=float, default=0.28)
     parser.add_argument("--locality-strength", type=float, default=14.0)
     parser.add_argument(
@@ -396,12 +406,6 @@ def parse_args():
         type=float,
         default=3.0e-4,
         help="Effective interaction four-volume multiplying each channel rate.",
-    )
-    parser.add_argument(
-        "--implicit-epsilon",
-        type=float,
-        default=None,
-        help="Picard interaction strength. Defaults to --cascade-epsilon.",
     )
     return parser.parse_args()
 
@@ -438,11 +442,7 @@ def main():
         cascade_epsilon=args.cascade_epsilon,
         kernel_params=locality_params,
     )
-    implicit_epsilon = args.cascade_epsilon if args.implicit_epsilon is None else args.implicit_epsilon
-    imp_H, imp_diag = implicit_rate_plane(
-        cfg, log_edges, implicit_epsilon=implicit_epsilon
-    )
-    fig_path = plot_comparison(noax, axion, imp_H, cfg, log_edges)
+    fig_path = plot_comparison(noax, axion, cfg, log_edges)
 
     np.savez(
         ART_DIR / "axion_rate_plane_comparison.npz",
@@ -450,15 +450,12 @@ def main():
         axion_events=axion["events"],
         noax_channels=noax["channels"],
         axion_channels=axion["channels"],
-        implicit_H=imp_H,
         log_edges=log_edges,
         cascade_epsilon=np.asarray(args.cascade_epsilon),
-        implicit_epsilon=np.asarray(implicit_epsilon),
         locality_keys=np.asarray(list(locality_params.keys())),
         locality_values=np.asarray(list(locality_params.values()), dtype=np.float64),
     )
     print(f"cascade_epsilon = {args.cascade_epsilon:.3e}")
-    print(f"implicit_epsilon = {implicit_epsilon:.3e}")
     print("locality kernel:")
     for key, value in locality_params.items():
         print(f"  {key}: {value}")
@@ -466,10 +463,6 @@ def main():
 
     print_channel_table("No-axion weighted tracer channel rates", noax["channels"])
     print_channel_table("Axion-spin weighted tracer channel rates", axion["channels"])
-    print("Implicit Picard diagnostics:")
-    for key, value in imp_diag.items():
-        print(f"  {key}: {value}")
-    print()
     print(f"wrote {fig_path}")
     print(f"wrote {ART_DIR / 'axion_rate_plane_comparison.npz'}")
 
