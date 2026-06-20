@@ -83,7 +83,17 @@ T_OBS = 1.0
 MC_REF = 35.0                     # pdet = min((Mc/MC_REF)^{15/6}, 1)
 SAMPLER_KEY = jax.random.PRNGKey(11)   # cascade key (fixed; deterministic)
 PROPOSAL_KEY = jax.random.PRNGKey(17)  # natal proposal draws (fixed)
+SPIN_ORIENT_KEY = jax.random.PRNGKey(23)  # isotropic spin tilts (fixed)
 CATALOG_SEED = 20260605
+
+# Spin orientation for the OBSERVABLE chi_eff. The cascade tracks spin
+# MAGNITUDES (1g small ~sigma_chi, 2g+ ~0.7); the detector-frame chi_eff needs
+# orientations. ISOTROPIC_SPIN=True draws isotropic tilts (cos t ~ U[-1,1]) per
+# component and forms the SIGNED aligned spin a_i*cos t_i, so chi_eff can be
+# negative and its DISPERSION widens where the high-spin 2g+ population lives
+# (the dynamical-channel hierarchical signature). Default False preserves the
+# magnitude-only behaviour of the synthetic JOB A/E runs.
+ISOTROPIC_SPIN = False
 
 # Fixed cfg constants for the IS denominator (any broad valid values).
 CFG_MU0, CFG_SIGMA0 = 20.0, 25.0
@@ -272,6 +282,14 @@ def make_sampler_fn(n_seed: int):
         weight_array = jnp.exp(log_p_target - log_p_cfg)
         out = particle_mc_jax_soft(_cfg(weight_array), SAMPLER_KEY)
         samples = out["mergers"][:, :4]
+        if ISOTROPIC_SPIN:
+            # signed aligned spin a_i*cos(tilt_i), tilt isotropic (cos~U[-1,1]);
+            # cols 2,3 hold spin MAGNITUDES out of the cascade -> make them signed.
+            n = samples.shape[0]
+            cost = jax.random.uniform(SPIN_ORIENT_KEY, (n, 2),
+                                      minval=-1.0, maxval=1.0)
+            samples = samples.at[:, 2].multiply(cost[:, 0])
+            samples = samples.at[:, 3].multiply(cost[:, 1])
         w_eff = out["w_mergers"] * out["step_active"]
         benign = jnp.asarray([10.0, 8.0, 0.0, 0.0])
         samples = jnp.where(jnp.isfinite(samples), samples, benign[None, :])
