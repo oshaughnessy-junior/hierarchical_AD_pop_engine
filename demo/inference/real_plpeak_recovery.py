@@ -43,7 +43,21 @@ def main():
                         "resumes from newest checkpoint on restart)")
     p.add_argument("--chunk", type=int, default=50,
                    help="samples per checkpoint chunk (smaller = more eviction-resilient)")
+    p.add_argument("--isotropic-spin", action="store_true",
+                   help="oriented spins: isotropic tilts -> signed chi_eff "
+                        "(production_plpeak.ISOTROPIC_SPIN)")
+    p.add_argument("--f-dep", type=float, default=None,
+                   help="fix the cascade depletion fraction (profile point); "
+                        "default keeps the module value")
     args = p.parse_args()
+
+    # set the cascade knobs on the imported module BEFORE building the sampler
+    if args.isotropic_spin:
+        M.ISOTROPIC_SPIN = True
+        print("SPIN: isotropic orientation (signed chi_eff)")
+    if args.f_dep is not None:
+        M.F_DEP = float(args.f_dep)
+        print(f"CASCADE: F_DEP = {M.F_DEP}")
 
     if args.real_pdet:
         from mass_pdet_interp import make_real_pdet_fn
@@ -89,7 +103,7 @@ def main():
     kw = dict(max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
     if args.init_median: kw["init_strategy"] = init_to_median
     if args.checkpoint_dir:
-        from nuts_checkpoint import run_nuts_with_checkpoints
+        from gwkokab.inference import run_nuts_with_checkpoints
         print(f"CHECKPOINT-SAFE NUTS: dir={args.checkpoint_dir} chunk={args.chunk}")
         post = run_nuts_with_checkpoints(
             model, (jnp.asarray(M.T_OBS),), num_warmup=args.num_warmup,

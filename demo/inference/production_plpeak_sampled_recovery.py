@@ -218,15 +218,33 @@ def mc_eta_chieff(samples):
 
 
 class GenieMcEtaChieffLikelihood:
-    """Per-event Gaussian log-likelihood in (Mc, η, χ_eff)."""
+    """Per-event Gaussian log-likelihood in (Mc, η, χ_eff).
 
-    def __init__(self, center, sigma):
-        self.center = jnp.asarray(center)   # (3,)
-        self.sigma = jnp.asarray(sigma)     # (3,)
+    Diagonal (``sigma``) by default; pass ``cov`` (3×3) for a full multivariate
+    normal that uses the off-diagonal Mc–η–χ_eff correlations of the NAL fit.
+    The per-event normalisation (incl. log-det) is θ-independent, hence
+    irrelevant to the population posterior, but kept for cleanliness.
+    """
+
+    def __init__(self, center, sigma=None, cov=None):
+        self.center = jnp.asarray(center)        # (3,)
+        if cov is not None:
+            cov = jnp.asarray(cov)               # (3,3)
+            cov = 0.5 * (cov + cov.T) + 1e-12 * jnp.eye(cov.shape[0])  # PSD-safe
+            self.prec = jnp.linalg.inv(cov)
+            _, self.logdet = jnp.linalg.slogdet(cov)
+            self.sigma = None
+        else:
+            self.sigma = jnp.asarray(sigma)      # (3,)
+            self.prec = None
 
     def __call__(self, samples):
-        z = (mc_eta_chieff(samples) - self.center[None, :]) / self.sigma[None, :]
-        return -0.5 * jnp.sum(z ** 2, axis=1) - jnp.sum(
+        z = mc_eta_chieff(samples) - self.center[None, :]    # (n,3)
+        if self.prec is not None:
+            q = jnp.einsum("ni,ij,nj->n", z, self.prec, z)   # Mahalanobis²
+            return -0.5 * q - 0.5 * self.logdet - 1.5 * jnp.log(2.0 * jnp.pi)
+        zz = z / self.sigma[None, :]
+        return -0.5 * jnp.sum(zz ** 2, axis=1) - jnp.sum(
             jnp.log(self.sigma)) - 1.5 * jnp.log(2.0 * jnp.pi)
 
 
