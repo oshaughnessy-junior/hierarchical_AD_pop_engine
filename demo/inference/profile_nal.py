@@ -27,6 +27,7 @@ KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", 
 RUNS_DEFAULT = [
     (0.10, "figures_nal_f010"), (0.30, "figures_nal_f030"), (0.50, "figures_nal_f050b"),
     (0.60, "figures_nal_f060"), (0.70, "figures_nal_f070"), (0.90, "figures_nal_f090"),
+    (1.20, "figures_nal_f120"),
 ]
 EDGES = np.array([4, 8, 12, 18, 25, 32, 40, 55, 80])
 
