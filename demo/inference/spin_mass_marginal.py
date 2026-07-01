@@ -17,13 +17,25 @@ M = pl.M
 M.ISOTROPIC_SPIN = False
 KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
 ROOT = "/home/richard.oshaughnessy/coag_container"
-RUNS = {0.60: "figures_nal_f060", 0.70: "figures_nal_f070", 0.90: "figures_nal_f090", 1.20: "figures_nal_f120"}
+RUNS = {0.60: "figures_nal_f060", 0.70: "figures_nal_f070", 0.80: "figures_nal_f080",
+        0.90: "figures_nal_f090", 1.00: "figures_nal_f100", 1.20: "figures_nal_f120"}
 
 
 def wquant(x, w, qs):
     o = np.argsort(x); x, w = x[o], w[o]
     c = np.cumsum(w) - 0.5 * w; c /= w.sum()
     return np.interp(qs, c, x)
+
+
+def kernel_quantiles(x, y, w, grid, bw, qs, min_eff=40.0):
+    """Smooth conditional quantiles q(y|x) via a Gaussian kernel in x."""
+    out = np.full((len(grid), len(qs)), np.nan)
+    for i, g in enumerate(grid):
+        kw = w * np.exp(-0.5 * ((x - g) / bw) ** 2)
+        eff = kw.sum() ** 2 / np.sum(kw ** 2)
+        if kw.sum() > 1e-12 and eff > min_eff:
+            out[i] = wquant(y, kw, qs)
+    return out
 
 
 def population(th, fdep, comb, nA, rng):
@@ -82,32 +94,27 @@ def main():
         tag = "mmax"
     m1 = np.concatenate(M1); a = np.concatenate(A); e = np.concatenate(E); w = np.concatenate(W)
 
-    edges = np.linspace(5, 100, 26); cen = 0.5 * (edges[:-1] + edges[1:])
-    aq = np.full((len(cen), 3), np.nan); eq = np.full((len(cen), 3), np.nan)
-    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
-        m = (m1 >= lo) & (m1 < hi)
-        if w[m].sum() > 1e-9:
-            aq[i] = wquant(a[m], w[m], [0.05, 0.5, 0.95]); eq[i] = wquant(e[m], w[m], [0.05, 0.5, 0.95])
-    # fixed f_dep=0.6 posterior-mean reference median
+    grid = np.linspace(6, 99, 120); bw = 6.0
+    aq = kernel_quantiles(m1, a, w, grid, bw, [0.05, 0.5, 0.95])
+    eq = kernel_quantiles(m1, e, w, grid, bw, [0.05, 0.5, 0.95])
+    # fixed f_dep=0.6 posterior-mean reference median (kernel-smoothed)
     pref = np.load(os.path.join(ROOT, "figures_nal_f060", "two_channel_pl_post.npz"))
     thr = {k: float(pref[k].mean()) for k in KS}; M.F_DEP = 0.6; cr, nAr = pl.make_combined_pl(args.n_seed, args.n_b)
     m1r, ar, er, wr = population(thr, 0.6, cr, nAr, rng)
-    amr = np.array([wquant(ar[(m1r >= lo) & (m1r < hi)], wr[(m1r >= lo) & (m1r < hi)], [0.5])[0]
-                    if wr[(m1r >= lo) & (m1r < hi)].sum() > 1e-9 else np.nan for lo, hi in zip(edges[:-1], edges[1:])])
-    emr = np.array([wquant(er[(m1r >= lo) & (m1r < hi)], wr[(m1r >= lo) & (m1r < hi)], [0.5])[0]
-                    if wr[(m1r >= lo) & (m1r < hi)].sum() > 1e-9 else np.nan for lo, hi in zip(edges[:-1], edges[1:])])
+    amr = kernel_quantiles(m1r, ar, wr, grid, bw, [0.5])[:, 0]
+    emr = kernel_quantiles(m1r, er, wr, grid, bw, [0.5])[:, 0]
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
-    ax[0].fill_between(cen, aq[:, 0], aq[:, 2], color="C0", alpha=0.25, label="marginalized 90%")
-    ax[0].plot(cen, aq[:, 1], "C0", lw=2.2, label="marginalized median")
-    ax[0].plot(cen, amr, "k--", lw=1.2, alpha=0.7, label=r"fixed $F_{\rm dep}=0.6$ median")
+    ax[0].fill_between(grid, aq[:, 0], aq[:, 2], color="C0", alpha=0.25, label="marginalized 90%")
+    ax[0].plot(grid, aq[:, 1], "C0", lw=2.2, label="marginalized median")
+    ax[0].plot(grid, amr, "k--", lw=1.2, alpha=0.7, label=r"fixed $F_{\rm dep}=0.6$ median")
     ax[0].axhline(0.69, color="grey", ls=":", lw=1.0)
     ax[0].set_xlim(5, 100); ax[0].set_ylim(0, 1); ax[0].set_xlabel(r"$m_1\ [M_\odot]$")
     ax[0].set_ylabel(r"$\chi$ (primary spin magnitude)"); ax[0].set_title("Spin magnitude vs mass"); ax[0].legend(fontsize=8)
-    ax[1].fill_between(cen, eq[:, 0], eq[:, 2], color="C1", alpha=0.25, label="marginalized 90%")
-    ax[1].plot(cen, eq[:, 1], "C1", lw=2.2, label="marginalized median")
-    ax[1].plot(cen, emr, "k--", lw=1.2, alpha=0.7, label=r"fixed $F_{\rm dep}=0.6$ median")
+    ax[1].fill_between(grid, eq[:, 0], eq[:, 2], color="C1", alpha=0.25, label="marginalized 90%")
+    ax[1].plot(grid, eq[:, 1], "C1", lw=2.2, label="marginalized median")
+    ax[1].plot(grid, emr, "k--", lw=1.2, alpha=0.7, label=r"fixed $F_{\rm dep}=0.6$ median")
     ax[1].axhline(0, color="grey", lw=0.6, ls="--")
     ax[1].set_xlim(5, 100); ax[1].set_ylim(-1, 1); ax[1].set_xlabel(r"$m_1\ [M_\odot]$")
     ax[1].set_ylabel(r"$\chi_{\rm eff}$"); ax[1].set_title("Effective spin vs mass"); ax[1].legend(fontsize=8)

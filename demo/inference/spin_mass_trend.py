@@ -26,6 +26,20 @@ def wquant(x, w, qs):
     return np.interp(qs, c, x)
 
 
+def kernel_quantiles(x, y, w, grid, bw, qs, min_eff=40.0):
+    """Smooth conditional quantiles q(y | x) via a Gaussian kernel in x
+    (Nadaraya-Watson-style): at each grid point weight every sample by
+    w * exp(-0.5*((x-g)/bw)^2) and take the weighted quantile. Removes hard-bin
+    edges and averages MC noise continuously; bw sets the smoothness."""
+    out = np.full((len(grid), len(qs)), np.nan)
+    for i, g in enumerate(grid):
+        kw = w * np.exp(-0.5 * ((x - g) / bw) ** 2)
+        eff = kw.sum() ** 2 / np.sum(kw ** 2)          # Kish effective sample size
+        if kw.sum() > 1e-12 and eff > min_eff:
+            out[i] = wquant(y, kw, qs)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f060/two_channel_pl_post.npz")
@@ -50,32 +64,27 @@ def main():
     chieff = (m0 * np.abs(c0) * cos0 + m1c * np.abs(c1) * cos1) / (m0 + m1c)
     ok = np.isfinite(m1) & (w > 0)
 
-    edges = np.linspace(5, 100, 26); cen = 0.5 * (edges[:-1] + edges[1:])
-    aq = np.full((len(cen), 3), np.nan); eq = np.full((len(cen), 3), np.nan)
-    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
-        m = ok & (m1 >= lo) & (m1 < hi)
-        if w[m].sum() > 1e-9:
-            aq[i] = wquant(a_prim[m], w[m], [0.05, 0.5, 0.95])
-            eq[i] = wquant(chieff[m], w[m], [0.05, 0.5, 0.95])
+    grid = np.linspace(6, 99, 120); bw = 6.0
+    aq = kernel_quantiles(m1[ok], a_prim[ok], w[ok], grid, bw, [0.05, 0.5, 0.95])
+    eq = kernel_quantiles(m1[ok], chieff[ok], w[ok], grid, bw, [0.05, 0.5, 0.95])
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
-    ax[0].fill_between(cen, aq[:, 0], aq[:, 2], color="C0", alpha=0.25, label="model 90%")
-    ax[0].plot(cen, aq[:, 1], "C0", lw=2.2, label="model median")
+    ax[0].fill_between(grid, aq[:, 0], aq[:, 2], color="C0", alpha=0.25, label="model 90%")
+    ax[0].plot(grid, aq[:, 1], "C0", lw=2.2, label="model median")
     ax[0].axhline(0.69, color="grey", ls=":", lw=1.2); ax[0].text(88, 0.71, r"$\chi_{\rm 2g}\!\approx\!0.7$", fontsize=8, color="grey")
     ax[0].set_xlim(5, 100); ax[0].set_ylim(0, 1); ax[0].set_xlabel(r"$m_1\ [M_\odot]$")
     ax[0].set_ylabel(r"$\chi$ (primary spin magnitude)"); ax[0].set_title("Spin magnitude vs mass"); ax[0].legend(fontsize=9)
-    ax[1].fill_between(cen, eq[:, 0], eq[:, 2], color="C1", alpha=0.25, label="model 90%")
-    ax[1].plot(cen, eq[:, 1], "C1", lw=2.2, label="model median")
+    ax[1].fill_between(grid, eq[:, 0], eq[:, 2], color="C1", alpha=0.25, label="model 90%")
+    ax[1].plot(grid, eq[:, 1], "C1", lw=2.2, label="model median")
     ax[1].axhline(0, color="grey", lw=0.6, ls="--")
     ax[1].set_xlim(5, 100); ax[1].set_ylim(-1, 1); ax[1].set_xlabel(r"$m_1\ [M_\odot]$")
     ax[1].set_ylabel(r"$\chi_{\rm eff}$"); ax[1].set_title("Effective spin vs mass"); ax[1].legend(fontsize=9)
-    fig.suptitle(r"Recovered coagulation population: spin trends vs mass ($F_{\rm dep}=0.6$ NAL fit)", fontsize=12)
+    fig.suptitle(r"Recovered coagulation population: spin trends vs mass ($F_{\rm dep}=0.6$ NAL fit; kernel-smoothed)", fontsize=12)
     fig.tight_layout(); fig.savefig(args.out, dpi=140, bbox_inches="tight"); print("wrote", args.out)
-    # numeric trend summary
     for lab, q in [("chi|m1", aq), ("chi_eff|m1", eq)]:
-        lo = np.nanmean(q[cen < 15, 1]); hi = np.nanmean(q[cen > 60, 1])
-        loW = np.nanmean(q[cen < 15, 2] - q[cen < 15, 0]); hiW = np.nanmean(q[cen > 60, 2] - q[cen > 60, 0])
+        lo = np.nanmean(q[grid < 15, 1]); hi = np.nanmean(q[grid > 60, 1])
+        loW = np.nanmean(q[grid < 15, 2] - q[grid < 15, 0]); hiW = np.nanmean(q[grid > 60, 2] - q[grid > 60, 0])
         print(f"  {lab}: median low-mass={lo:+.2f} high-mass={hi:+.2f} | 90%width low={loW:.2f} high={hiW:.2f}")
 
 
