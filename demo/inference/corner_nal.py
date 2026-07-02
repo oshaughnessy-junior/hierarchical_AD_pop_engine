@@ -13,13 +13,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f060/two_channel_pl_post.npz")
     p.add_argument("--out", default="/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/gwk-hierarchical-initial/paper/figures/real_o3o4_corner_nal.png")
+    p.add_argument("--fdep", type=float, default=0.6, help="cascade brightness for the title (must match --post)")
     args = p.parse_args()
     z = np.load(args.post)
     data = np.column_stack([z[k] for k in KS])
     fig = corner.corner(data, labels=LAB, quantiles=[0.16, 0.5, 0.84], show_titles=True,
                         title_fmt=".2f", title_kwargs={"fontsize": 8}, label_kwargs={"fontsize": 10},
                         smooth=1.0, plot_datapoints=True, data_kwargs={"alpha": 0.3})
-    fig.suptitle(r"Free-$m_{\max}$ two-channel NAL fit ($F_{\rm dep}=0.6$, 238 events)", fontsize=13, y=1.0)
+    fig.suptitle(r"Free-$m_{\max}$ two-channel NAL fit ($F_{\rm dep}=%.1f$, 238 events)" % args.fdep, fontsize=13, y=1.0)
     fig.savefig(args.out, dpi=130, bbox_inches="tight")
     print("wrote", args.out)
 
