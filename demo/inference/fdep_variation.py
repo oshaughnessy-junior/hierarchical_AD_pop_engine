@@ -7,7 +7,7 @@ the second-generation (chi~0.7) spin population.
   python fdep_variation.py
 """
 import argparse, importlib.util, os, glob, numpy as np, h5py
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
 from scipy.stats import gaussian_kde
 
 _HERE = os.path.dirname(__file__)
@@ -37,6 +37,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
+    p.add_argument("--n-draw", type=int, default=24, help="posterior draws pooled per F_DEP (each a distinct params+key realization; decorrelates high-mass tail)")
     args = p.parse_args()
     rng = np.random.default_rng(4); pdet = make_real_pdet_fn()
     m1g = np.linspace(3, 100, 120); grid = np.linspace(6, 99, 120)
@@ -46,21 +47,36 @@ def main():
     ax[0].fill_between(gx, glo, ghi, color="grey", alpha=0.25, label="GWTC-5.0 90%")
     ax[0].plot(gx, gr, "k", lw=1.2, label="GWTC-5.0 median")
     cols = plt.cm.viridis(np.linspace(0.1, 0.85, len(SHOW)))
-    for (fdep, d), col in zip(SHOW, cols):
+    base_key = jax.random.PRNGKey(0)
+    for fi, ((fdep, d), col) in enumerate(zip(SHOW, cols)):
         if not os.path.exists(os.path.join(ROOT, d, "two_channel_pl_post.npz")):
             continue
         post = np.load(os.path.join(ROOT, d, "two_channel_pl_post.npz"))
-        th = {k: float(post[k].mean()) for k in KS}
-        M.F_DEP = fdep; comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
-        s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw)); pd = np.asarray(pdet(s))
-        m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
-        prim = m0 >= m1c; m1 = np.where(prim, m0, m1c); a_prim = np.abs(np.where(prim, c0, c1))
-        ok = np.isfinite(m1) & (w > 0)
-        dR = gaussian_kde(m1[ok], weights=w[ok], bw_method=0.08)(m1g)   # intrinsic (match GWTC-5)
+        M.F_DEP = fdep
+        n = len(post["m_max_A"]); didx = np.linspace(0, n - 1, min(args.n_draw, n)).astype(int)
+        m1L, aL, wL = [], [], []
+        for dj, di in enumerate(didx):
+            # fresh natal PROPOSAL seeds AND pairing key per draw, then rebuild the
+            # sampler: the heavy-tail seeds are otherwise ONE fixed finite set shared
+            # by every draw (make_proposal uses a fixed PROPOSAL_KEY), which pins the
+            # high-mass lumps -- reweighting by params or rotating only the MC key
+            # cannot move them. Resampling the proposal decorrelates the rare tail.
+            # Cheap: the compiled MC keys on array SHAPES, not values -> no recompile.
+            M.PROPOSAL_KEY = jax.random.fold_in(jax.random.fold_in(base_key, fi), int(dj))
+            M.SAMPLER_KEY = jax.random.fold_in(jax.random.fold_in(base_key, 100 + fi), int(dj))
+            comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
+            th = {k: float(post[k][di]) for k in KS}
+            s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
+            m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
+            prim = m0 >= m1c; m1i = np.where(prim, m0, m1c); ai = np.abs(np.where(prim, c0, c1))
+            ok = np.isfinite(m1i) & (w > 0)
+            m1L.append(m1i[ok]); aL.append(ai[ok]); wL.append(w[ok] / len(didx))
+        m1 = np.concatenate(m1L); a_prim = np.concatenate(aL); w = np.concatenate(wL)
+        dR = gaussian_kde(m1, weights=w, bw_method=0.08)(m1g)   # intrinsic (match GWTC-5)
         sel = (gx >= 5) & (gx <= 80); selm = (m1g >= 5) & (m1g <= 80)
         dR *= np.trapezoid(gr[sel], gx[sel]) / np.trapezoid(dR[selm], m1g[selm])
         ax[0].plot(m1g, dR, color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
-        aq = kernel_quantiles(m1[ok], a_prim[ok], w[ok], grid, 6.0, [0.5])
+        aq = kernel_quantiles(m1, a_prim, w, grid, 6.0, [0.5])
         ax[1].plot(grid, aq[:, 0], color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
     ax[0].set_yscale("log"); ax[0].set_xlim(4, 90); ax[0].set_ylim(ghi.max() * 3e-4, ghi.max() * 3)
     ax[0].set_xlabel(r"$m_1\ [M_\odot]$"); ax[0].set_ylabel(r"$dR/dm_1$ (arb. norm.)")

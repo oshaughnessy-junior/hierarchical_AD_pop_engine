@@ -8,7 +8,7 @@ uncertainties integrated out.
   python spin_mass_marginal.py --mode mmax
 """
 import argparse, importlib.util, os, numpy as np
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
 
 _HERE = os.path.dirname(__file__)
 PL = importlib.util.spec_from_file_location("pl", os.path.join(_HERE, "two_channel_pl_demo.py"))
@@ -38,18 +38,25 @@ def kernel_quantiles(x, y, w, grid, bw, qs, min_eff=40.0):
     return out
 
 
-def population(th, fdep, comb, nA, rng):
-    s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
-    m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
-    isA = np.zeros(len(s), bool); isA[:nA] = True
-    prim = m0 >= m1c
-    m1 = np.where(prim, m0, m1c)
-    a_prim = np.abs(np.where(prim, c0, c1))
-    ct = rng.uniform(-1, 1, (len(s), 2))
-    cos0 = np.where(isA, ct[:, 0], 1.0); cos1 = np.where(isA, ct[:, 1], 1.0)
-    chieff = (m0 * np.abs(c0) * cos0 + m1c * np.abs(c1) * cos1) / (m0 + m1c)
-    ok = np.isfinite(m1) & (w > 0)
-    return m1[ok], a_prim[ok], chieff[ok], w[ok]
+def population(th, comb, nA, rng, keys):
+    """Pool one MC realization per key (rotating the module-global SAMPLER_KEY,
+    read at call time) so the high-mass tail is resolved; reusing a single fixed
+    key leaves the Monte-Carlo noise correlated across draws."""
+    M1, A, E, W = [], [], [], []
+    for key in keys:
+        M.SAMPLER_KEY = key
+        s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
+        m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
+        isA = np.zeros(len(s), bool); isA[:nA] = True
+        prim = m0 >= m1c
+        m1 = np.where(prim, m0, m1c)
+        a_prim = np.abs(np.where(prim, c0, c1))
+        ct = rng.uniform(-1, 1, (len(s), 2))
+        cos0 = np.where(isA, ct[:, 0], 1.0); cos1 = np.where(isA, ct[:, 1], 1.0)
+        chieff = (m0 * np.abs(c0) * cos0 + m1c * np.abs(c1) * cos1) / (m0 + m1c)
+        ok = np.isfinite(m1) & (w > 0)
+        M1.append(m1[ok]); A.append(a_prim[ok]); E.append(chieff[ok]); W.append(w[ok])
+    return np.concatenate(M1), np.concatenate(A), np.concatenate(E), np.concatenate(W)
 
 
 def main():
@@ -58,23 +65,26 @@ def main():
     p.add_argument("--mmax-fdep", type=float, default=0.60, help="F_DEP for the m_max marginalization")
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
-    p.add_argument("--n-draw", type=int, default=30, help="posterior draws for m_max marginalization")
+    p.add_argument("--n-draw", type=int, default=40, help="posterior draws for m_max marginalization")
+    p.add_argument("--n-reps", type=int, default=10, help="MC realizations pooled per param point (decorrelate high-mass tail)")
     p.add_argument("--out", default=None)
     args = p.parse_args()
     rng = np.random.default_rng(7)
+    BASE = jax.random.PRNGKey(0)
     summ = np.load(os.path.join(ROOT, "figures_nal_profile", "profile_nal_summary.npz"))
     Wf = {round(float(f), 2): float(np.exp(l - summ["logL"].max())) for f, l in zip(summ["f_dep"], summ["logL"])}
 
     M1, A, E, W = [], [], [], []
     if args.mode == "fdep":
-        for fdep, d in RUNS.items():
+        for fi, (fdep, d) in enumerate(RUNS.items()):
             wfd = Wf.get(round(fdep, 2), 0.0)
             if wfd < 1e-3:
                 continue
             post = np.load(os.path.join(ROOT, d, "two_channel_pl_post.npz"))
             th = {k: float(post[k].mean()) for k in KS}
             M.F_DEP = fdep; comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
-            m1, a, e, w = population(th, fdep, comb, nA, rng)
+            keys = jax.random.split(jax.random.fold_in(BASE, fi), args.n_reps)
+            m1, a, e, w = population(th, comb, nA, rng, keys)
             M1.append(m1); A.append(a); E.append(e); W.append(w / w.sum() * wfd)  # profile x rate
             print(f"  pooled f_dep={fdep} (weight {wfd:.3f}), {len(m1)} samples")
         title = r"marginalized over $F_{\rm dep}$ (profile-likelihood weighted)"
@@ -84,9 +94,10 @@ def main():
         post = np.load(os.path.join(ROOT, RUNS[round(fdep, 2)], "two_channel_pl_post.npz"))
         n = len(post["m_max_A"]); idx = np.linspace(0, n - 1, min(args.n_draw, n)).astype(int)
         M.F_DEP = fdep; comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
-        for i in idx:
+        for j, i in enumerate(idx):
             th = {k: float(post[k][i]) for k in KS}
-            m1, a, e, w = population(th, fdep, comb, nA, rng)
+            keys = [jax.random.fold_in(BASE, 1000 + j)]   # one realization per draw, decorrelated
+            m1, a, e, w = population(th, comb, nA, rng, keys)
             M1.append(m1); A.append(a); E.append(e); W.append(w / w.sum() / len(idx))  # equal-weight draws
         print(f"  m_max marginalized at f_dep={fdep} over {len(idx)} posterior draws "
               f"(m_max range {post['m_max_A'][idx].min():.0f}-{post['m_max_A'][idx].max():.0f})")
@@ -100,7 +111,7 @@ def main():
     # fixed f_dep=0.6 posterior-mean reference median (kernel-smoothed)
     pref = np.load(os.path.join(ROOT, "figures_nal_f060", "two_channel_pl_post.npz"))
     thr = {k: float(pref[k].mean()) for k in KS}; M.F_DEP = 0.6; cr, nAr = pl.make_combined_pl(args.n_seed, args.n_b)
-    m1r, ar, er, wr = population(thr, 0.6, cr, nAr, rng)
+    m1r, ar, er, wr = population(thr, cr, nAr, rng, jax.random.split(jax.random.fold_in(BASE, 777), args.n_reps))
     amr = kernel_quantiles(m1r, ar, wr, grid, bw, [0.5])[:, 0]
     emr = kernel_quantiles(m1r, er, wr, grid, bw, [0.5])[:, 0]
 

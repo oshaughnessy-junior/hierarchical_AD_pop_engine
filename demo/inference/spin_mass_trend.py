@@ -9,7 +9,7 @@ isotropic spin (2g cascade remnants, chi~0.7); intermediate = a mix.
   python spin_mass_trend.py   # f_dep=0.6 NAL fit
 """
 import argparse, importlib.util, os, numpy as np
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
 
 _HERE = os.path.dirname(__file__)
 PL = importlib.util.spec_from_file_location("pl", os.path.join(_HERE, "two_channel_pl_demo.py"))
@@ -46,27 +46,35 @@ def main():
     p.add_argument("--f-dep", type=float, default=0.60)
     p.add_argument("--n-seed", type=int, default=6000)
     p.add_argument("--n-b", type=int, default=5000)
+    p.add_argument("--n-reps", type=int, default=10, help="independent MC realizations pooled (decorrelate high-mass tail)")
     p.add_argument("--out", default="/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/gwk-hierarchical-initial/paper/figures/real_spin_vs_mass.png")
     args = p.parse_args()
     M.F_DEP = args.f_dep
     comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
     post = np.load(args.post)
     th = {k: float(post[k].mean()) for k in KS}
-    s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
-    m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
-    isA = np.zeros(len(s), bool); isA[:nA] = True
-    prim = m0 >= m1c
-    m1 = np.where(prim, m0, m1c)
-    a_prim = np.abs(np.where(prim, c0, c1))               # primary spin magnitude
     rng = np.random.default_rng(5)
-    ct = rng.uniform(-1, 1, (len(s), 2))
-    cos0 = np.where(isA, ct[:, 0], 1.0); cos1 = np.where(isA, ct[:, 1], 1.0)   # B aligned
-    chieff = (m0 * np.abs(c0) * cos0 + m1c * np.abs(c1) * cos1) / (m0 + m1c)
-    ok = np.isfinite(m1) & (w > 0)
+    # pool independent MC realizations (rotate the module-global SAMPLER_KEY, read
+    # at call time) so the high-mass conditional quantiles are not a single noisy draw
+    M1L, AL, EL, WL = [], [], [], []
+    for key in jax.random.split(jax.random.PRNGKey(0), args.n_reps):
+        M.SAMPLER_KEY = key
+        s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
+        m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
+        isA = np.zeros(len(s), bool); isA[:nA] = True
+        prim = m0 >= m1c
+        m1i = np.where(prim, m0, m1c)
+        a_primi = np.abs(np.where(prim, c0, c1))               # primary spin magnitude
+        ct = rng.uniform(-1, 1, (len(s), 2))
+        cos0 = np.where(isA, ct[:, 0], 1.0); cos1 = np.where(isA, ct[:, 1], 1.0)   # B aligned
+        chieffi = (m0 * np.abs(c0) * cos0 + m1c * np.abs(c1) * cos1) / (m0 + m1c)
+        ok = np.isfinite(m1i) & (w > 0)
+        M1L.append(m1i[ok]); AL.append(a_primi[ok]); EL.append(chieffi[ok]); WL.append(w[ok])
+    m1 = np.concatenate(M1L); a_prim = np.concatenate(AL); chieff = np.concatenate(EL); w = np.concatenate(WL)
 
     grid = np.linspace(6, 99, 120); bw = 6.0
-    aq = kernel_quantiles(m1[ok], a_prim[ok], w[ok], grid, bw, [0.05, 0.5, 0.95])
-    eq = kernel_quantiles(m1[ok], chieff[ok], w[ok], grid, bw, [0.05, 0.5, 0.95])
+    aq = kernel_quantiles(m1, a_prim, w, grid, bw, [0.05, 0.5, 0.95])
+    eq = kernel_quantiles(m1, chieff, w, grid, bw, [0.05, 0.5, 0.95])
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))

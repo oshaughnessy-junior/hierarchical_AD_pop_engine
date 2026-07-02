@@ -13,7 +13,7 @@ Recovered intrinsic coagulation population vs the GWTC-5.0 inferred population:
   python gwtc5_overlay_nal.py   # defaults to figures_nal_f060, f_dep=0.6
 """
 import argparse, importlib.util, os, glob, numpy as np, h5py
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
 from scipy.stats import gaussian_kde
 
 _HERE = os.path.dirname(__file__)
@@ -38,7 +38,8 @@ def main():
     p.add_argument("--f-dep", type=float, default=0.60)
     p.add_argument("--n-seed", type=int, default=8000)
     p.add_argument("--n-b", type=int, default=6000)
-    p.add_argument("--n-draw", type=int, default=25)
+    p.add_argument("--n-draw", type=int, default=64)
+    p.add_argument("--mc-key", type=int, default=0)
     p.add_argument("--out", default="/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/gwk-hierarchical-initial/paper/figures/real_gwtc5_overlay_nal.png")
     args = p.parse_args()
     M.F_DEP = args.f_dep
@@ -52,8 +53,17 @@ def main():
     m1g = np.linspace(3, 100, 120); ceg = np.linspace(-1, 1, 80)
     ag = np.linspace(0, 1, 60); ctg = np.linspace(-1, 1, 60)
     rng = np.random.default_rng(3)
+    base_key = jax.random.PRNGKey(int(args.mc_key))
     dR_t, dR_A, dR_B, pce, pa, pct = [], [], [], [], [], []
-    for i in idx:
+    for j, i in enumerate(idx):
+        # independent MC realization per draw, rotating BOTH keys: the pairing
+        # SAMPLER_KEY (Monte-Carlo noise) and the natal PROPOSAL_KEY (the heavy-tail
+        # seed set). make_proposal otherwise reuses one fixed seed set for every
+        # draw, which pins the rare high-mass lumps; resampling it decorrelates the
+        # tail. Rebuild is cheap -- the compiled MC keys on array shapes, not values.
+        M.PROPOSAL_KEY = jax.random.fold_in(base_key, j)
+        M.SAMPLER_KEY = jax.random.fold_in(base_key, 10000 + j)
+        comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
         th = {k: float(post[k][i]) for k in KS}
         s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))     # rate weights
         isA = np.zeros(len(s), bool); isA[:nA] = True

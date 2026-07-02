@@ -14,7 +14,7 @@ m_max and the other parameters).
   python marginal_ppd.py            # both figures
 """
 import argparse, importlib.util, os, glob, numpy as np, h5py
-import jax.numpy as jnp
+import jax, jax.numpy as jnp
 from scipy.stats import gaussian_kde
 
 _HERE = os.path.dirname(__file__)
@@ -73,14 +73,21 @@ def build_pool(n_seed, n_b, n_draw, rng):
     Wf = {round(float(f), 2): float(np.exp(l - summ["logL"].max())) for f, l in zip(summ["f_dep"], summ["logL"])}
     M1, M2, CE, CH, CT, WI, PD = [], [], [], [], [], [], []
     pdet = make_real_pdet_fn()
+    base_key = jax.random.PRNGKey(0); ctr = 0   # rotate the MC key per draw (decorrelate realizations)
     for fdep, d in RUNS.items():
         wfd = Wf.get(round(fdep, 2), 0.0)
         if wfd < 1e-3 or not os.path.exists(os.path.join(ROOT, d, "two_channel_pl_post.npz")):
             continue
         post = np.load(os.path.join(ROOT, d, "two_channel_pl_post.npz"))
         n = len(post["m_max_A"]); idx = np.linspace(0, n - 1, min(n_draw, n)).astype(int)
-        M.F_DEP = fdep; comb, nA = pl.make_combined_pl(n_seed, n_b)
+        M.F_DEP = fdep
         for i in idx:
+            # rotate BOTH the pairing key and the natal PROPOSAL_KEY (heavy-tail
+            # seed set), rebuilding the sampler, so the rare high-mass tail is not
+            # pinned to one fixed seed set shared across draws (cheap: no recompile).
+            M.PROPOSAL_KEY = jax.random.fold_in(base_key, ctr)
+            M.SAMPLER_KEY = jax.random.fold_in(base_key, 100000 + ctr); ctr += 1
+            comb, nA = pl.make_combined_pl(n_seed, n_b)
             th = {k: float(post[k][i]) for k in KS}
             s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
             m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
@@ -104,7 +111,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
-    p.add_argument("--n-draw", type=int, default=12)
+    p.add_argument("--n-draw", type=int, default=32)
     args = p.parse_args()
     rng = np.random.default_rng(11)
     m1, m2, ce, ch, ct, wi, pd = build_pool(args.n_seed, args.n_b, args.n_draw, rng)
