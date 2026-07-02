@@ -1107,8 +1107,12 @@ def _plot_2d(ax, x, y, dens_eng, dens_mc, *, log_x=False, label_x="", label_y=""
     vmin = vmax * 1e-3
     norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
     # pcolormesh: x rows = m₁ grid (along axis 0), y cols = derived axis.
+    # Clip empty / non-finite cells to vmin so they render as the colormap floor
+    # (dark) rather than white -- removes the "white stripe" artifact where the
+    # discrete cascade leaves (m1, q) cells unpopulated.
+    dens_plot = np.where(np.isfinite(dens_eng) & (dens_eng > 0), dens_eng, vmin)
     pcm = ax.pcolormesh(
-        x, y, dens_eng.T,
+        x, y, dens_plot.T,
         norm=norm, cmap="viridis", shading="auto", rasterized=True,
     )
     # Overlay MC as contours at the engine's iso-density levels.
