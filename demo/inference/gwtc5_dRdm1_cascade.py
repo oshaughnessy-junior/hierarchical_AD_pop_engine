@@ -68,11 +68,14 @@ def make_sampler_A_with_gens(n_seed):
 
     log_p_cfg = M._natal_log_pdf_jax(m_prop, chi_prop, _cfg(None))
 
-    def sampler(alpha, m_max, spin_scale, log_rate):
+    def sampler(alpha, m_max, spin_scale, log_rate, key):
+        # `key` varies per draw so the MC realizations are INDEPENDENT and their
+        # noise averages down; the production sampler reuses a single fixed key,
+        # which leaves the high-mass tail noise correlated across draws.
         log_p_target = (pl._log_p_mass_pl_cutoff(m_prop, alpha, m_max)
                         + M.log_p_spin(chi_prop, spin_scale))
         weight_array = jnp.exp(log_p_target - log_p_cfg)
-        out = M.particle_mc_jax_soft(_cfg(weight_array), M.SAMPLER_KEY)
+        out = M.particle_mc_jax_soft(_cfg(weight_array), key)
         mrg = np.asarray(out["mergers"])           # (n_steps, 8): m1 m2 c1 c2 g1 g2 ret m_rem
         w = np.asarray(out["w_mergers"]) * np.asarray(out["step_active"])
         w = w / max(w.sum(), 1e-300) * float(np.exp(log_rate))
@@ -95,27 +98,22 @@ def wkde(x, w, grid, bw=0.10):
     return gaussian_kde(x[ok], weights=w[ok], bw_method=bw)(grid) * w[ok].sum()
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f060/two_channel_pl_post.npz")
-    p.add_argument("--f-dep", type=float, default=0.60)
-    p.add_argument("--n-seed", type=int, default=8000)
-    p.add_argument("--n-b", type=int, default=6000)
-    p.add_argument("--n-draw", type=int, default=25)
-    p.add_argument("--out", default=os.path.join(_HERE, "figures_nal_f060", "real_gwtc5_dRdm1_cascade.png"))
-    args = p.parse_args()
-    M.F_DEP = args.f_dep
-
+def compute_curves(args):
+    """Per-draw dR/dm1 curves (UNnormalized), each an independent MC realization
+    (key folded on the draw index + --mc-key), so pooling many of these across
+    jobs beats down the high-mass sampling noise."""
     sampA = make_sampler_A_with_gens(args.n_seed)
     sampB = pl.tc.make_channelB_sampler(args.n_b)
     post = np.load(args.post)
     idx = np.linspace(0, len(post["alpha_A"]) - 1, min(args.n_draw, len(post["alpha_A"]))).astype(int)
+    base_key = jax.random.PRNGKey(int(args.mc_key))
 
     m1g = np.linspace(3, 100, 120)
     tot, prim, natal, chB = [], [], [], []
-    for i in idx:
+    for j, i in enumerate(idx):
         th = {k: float(post[k][i]) for k in KS}
-        mrg, wA = sampA(th["alpha_A"], th["m_max_A"], th["spin_chi"], th["log_R_A"])
+        key = jax.random.fold_in(base_key, int(j))
+        mrg, wA = sampA(th["alpha_A"], th["m_max_A"], th["spin_chi"], th["log_R_A"], key)
         m1, m2, g1, g2 = mrg[:, 0], mrg[:, 1], mrg[:, 4], mrg[:, 5]
         prim_mask = (g1 <= 1.5) & (g2 <= 1.5)                 # both natal (g==1)
         tot.append(wkde(m1, wA, m1g))                          # all channel-A mergers
@@ -126,8 +124,10 @@ def main():
         sB, lwB = sampB(th["mu_B"], th["sig_B"], th["mu_chiB"], th["sig_chiB"], th["log_R_B"])
         sB = np.asarray(sB); wB = np.exp(np.asarray(lwB)); mB = np.maximum(sB[:, 0], sB[:, 1])
         chB.append(wkde(mB, wB, m1g))
-    tot, prim, natal, chB = map(np.array, (tot, prim, natal, chB))
+    return (m1g,) + tuple(np.array(z) for z in (tot, prim, natal, chB))
 
+
+def render(m1g, tot, prim, natal, chB, out, fdep, n_pool):
     # normalize model TOTAL (A+B) to the GWTC-5 integrated rate over [5,80]; one
     # shared scale for all curves.
     base = os.path.expanduser("~/coag_container/vt_data/gwtc5_pop/popsummary_files")
@@ -136,8 +136,7 @@ def main():
     sel = (x_m >= 5) & (x_m <= 80); gw_int = np.trapezoid(mmd[sel], x_m[sel])
     tot_med = np.median(tot + chB, 0); ms = (m1g >= 5) & (m1g <= 80)
     sc = gw_int / np.trapezoid(tot_med[ms], m1g[ms])
-    for z in (tot, prim, natal, chB):
-        z *= sc
+    tot, prim, natal, chB = (z * sc for z in (tot, prim, natal, chB))
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, a0 = plt.subplots(figsize=(6.4, 5.0))
@@ -149,9 +148,43 @@ def main():
     a0.plot(m1g, np.median(chB, 0), "C2:", lw=1.4, label="aligned B (1G)")
     a0.set_yscale("log"); a0.set_xlim(4, 90); a0.set_ylim(tt.max() * 3e-4, tt.max() * 3)
     a0.set_xlabel(r"$m_1\ [M_\odot]$"); a0.set_ylabel(r"$dR/dm_1$ (rate, arb. norm.)")
-    a0.set_title(r"Cascade decomposition of $dR/dm_1$ ($F_{\rm dep}=%.2f$)" % args.f_dep)
+    a0.set_title(r"Cascade decomposition of $dR/dm_1$ ($F_{\rm dep}=%.2f$, %d MC real.)" % (fdep, n_pool))
     a0.legend(fontsize=8, loc="upper right")
-    fig.tight_layout(); fig.savefig(args.out, dpi=140, bbox_inches="tight"); print("wrote", args.out)
+    fig.tight_layout(); fig.savefig(out, dpi=140, bbox_inches="tight"); print("wrote", out)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f060/two_channel_pl_post.npz")
+    p.add_argument("--f-dep", type=float, default=0.60)
+    p.add_argument("--n-seed", type=int, default=8000)
+    p.add_argument("--n-b", type=int, default=6000)
+    p.add_argument("--n-draw", type=int, default=25)
+    p.add_argument("--mc-key", type=int, default=0, help="base PRNG key; use distinct values for independent parallel jobs")
+    p.add_argument("--save-npz", default=None, help="persist raw per-draw curves for later pooling")
+    p.add_argument("--pool", nargs="*", default=None, help="render from a set of saved npz (averages/pools all their draws)")
+    p.add_argument("--out", default=os.path.join(_HERE, "figures_nal_f060", "real_gwtc5_dRdm1_cascade.png"))
+    args = p.parse_args()
+    M.F_DEP = args.f_dep
+
+    if args.pool:
+        cur = {k: [] for k in ("tot", "prim", "natal", "chB")}
+        m1g = None
+        for f in args.pool:
+            z = np.load(f); m1g = z["m1g"]
+            for k in cur:
+                cur[k].append(z[k])
+        pooled = {k: np.concatenate(v, 0) for k, v in cur.items()}
+        n_pool = pooled["tot"].shape[0]
+        render(m1g, pooled["tot"], pooled["prim"], pooled["natal"], pooled["chB"],
+               args.out, args.f_dep, n_pool)
+        return 0
+
+    m1g, tot, prim, natal, chB = compute_curves(args)
+    if args.save_npz:
+        np.savez(args.save_npz, m1g=m1g, tot=tot, prim=prim, natal=natal, chB=chB)
+        print("saved", args.save_npz, "with", tot.shape[0], "draws")
+    render(m1g, tot, prim, natal, chB, args.out, args.f_dep, tot.shape[0])
 
 
 if __name__ == "__main__":
