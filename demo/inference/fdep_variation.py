@@ -28,7 +28,9 @@ def gwmass():
     path = glob.glob(f"{base}/**/*default_mmax*popsummary_result.h5", recursive=True)[0]
     with h5py.File(path, "r") as h:
         g = h["posterior/rates_on_grids/mass_1"]
-        return np.asarray(g["positions"]).squeeze(), np.nanmedian(np.asarray(g["rates"]), axis=0)
+        x = np.asarray(g["positions"]).squeeze(); r = np.asarray(g["rates"])
+    lo, med, hi = np.nanpercentile(r, [5, 50, 95], axis=0)
+    return x, lo, med, hi
 
 
 def main():
@@ -40,8 +42,9 @@ def main():
     m1g = np.linspace(3, 100, 120); grid = np.linspace(6, 99, 120)
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
-    gx, gr = gwmass()
-    ax[0].fill_between(gx, gr, color="grey", alpha=0.25, label="GWTC-5.0")
+    gx, glo, gr, ghi = gwmass()
+    ax[0].fill_between(gx, glo, ghi, color="grey", alpha=0.25, label="GWTC-5.0 90%")
+    ax[0].plot(gx, gr, "k", lw=1.2, label="GWTC-5.0 median")
     cols = plt.cm.viridis(np.linspace(0.1, 0.85, len(SHOW)))
     for (fdep, d), col in zip(SHOW, cols):
         if not os.path.exists(os.path.join(ROOT, d, "two_channel_pl_post.npz")):
@@ -59,7 +62,7 @@ def main():
         ax[0].plot(m1g, dR, color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
         aq = kernel_quantiles(m1[ok], a_prim[ok], w[ok], grid, 6.0, [0.5])
         ax[1].plot(grid, aq[:, 0], color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
-    ax[0].set_yscale("log"); ax[0].set_xlim(4, 90); ax[0].set_ylim(gr.max() * 3e-4, gr.max() * 3)
+    ax[0].set_yscale("log"); ax[0].set_xlim(4, 90); ax[0].set_ylim(ghi.max() * 3e-4, ghi.max() * 3)
     ax[0].set_xlabel(r"$m_1\ [M_\odot]$"); ax[0].set_ylabel(r"$dR/dm_1$ (arb. norm.)")
     ax[0].set_title("Mass function vs cascade brightness"); ax[0].legend(fontsize=8)
     ax[1].axhline(0.69, color="grey", ls=":", lw=1.0)

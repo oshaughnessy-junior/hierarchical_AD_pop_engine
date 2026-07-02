@@ -40,13 +40,38 @@ def gw(param):
     with h5py.File(path, "r") as h:
         g = h[f"posterior/rates_on_grids/{param}"]
         x = np.asarray(g["positions"]).squeeze(); r = np.asarray(g["rates"])
-    return x, np.nanmedian(r, axis=0)
+    lo, med, hi = np.nanpercentile(r, [5, 50, 95], axis=0)
+    return x, lo, med, hi
+
+
+def gw_dm2(m2grid, rng, ndraw=400, nsamp=20000):
+    """Reconstruct the GWTC-5.0 secondary-mass rate dR/dm2 (median + 90%) from its
+    published mass_1 and mass_ratio marginals, assuming p(m1,q)=p(m1)p(q). This
+    is approximate (ignores the m1-q correlation) but adequate for comparing the
+    high-mass falloff; noted as such in the text."""
+    base = os.path.expanduser("~/coag_container/vt_data/gwtc5_pop/popsummary_files")
+    path = glob.glob(f"{base}/**/*default_mmax*popsummary_result.h5", recursive=True)[0]
+    with h5py.File(path, "r") as h:
+        x1 = np.asarray(h["posterior/rates_on_grids/mass_1/positions"]).squeeze()
+        r1 = np.asarray(h["posterior/rates_on_grids/mass_1/rates"])
+        xq = np.asarray(h["posterior/rates_on_grids/mass_ratio/positions"]).squeeze()
+        rq = np.asarray(h["posterior/rates_on_grids/mass_ratio/rates"])
+    def isample(x, pdf, n):
+        pdf = np.clip(pdf, 0, None); cdf = np.cumsum(pdf); cdf /= cdf[-1]
+        return np.interp(rng.random(n), cdf, x)
+    draws = rng.choice(len(r1), size=min(ndraw, len(r1)), replace=False)
+    dm2 = np.empty((len(draws), len(m2grid)))
+    dm = m2grid[1] - m2grid[0]; edges = np.concatenate([m2grid - dm / 2, [m2grid[-1] + dm / 2]])
+    for j, d in enumerate(draws):
+        m1s = isample(x1, r1[d], nsamp); qs = np.clip(isample(xq, rq[d], nsamp), 1e-3, 1.0)
+        h2, _ = np.histogram(qs * m1s, edges, density=True); dm2[j] = h2
+    return np.nanpercentile(dm2, [5, 50, 95], axis=0)
 
 
 def build_pool(n_seed, n_b, n_draw, rng):
     summ = np.load(os.path.join(ROOT, "figures_nal_profile", "profile_nal_summary.npz"))
     Wf = {round(float(f), 2): float(np.exp(l - summ["logL"].max())) for f, l in zip(summ["f_dep"], summ["logL"])}
-    M1, CE, CH, CT, WI, PD = [], [], [], [], [], []
+    M1, M2, CE, CH, CT, WI, PD = [], [], [], [], [], [], []
     pdet = make_real_pdet_fn()
     for fdep, d in RUNS.items():
         wfd = Wf.get(round(fdep, 2), 0.0)
@@ -60,7 +85,7 @@ def build_pool(n_seed, n_b, n_draw, rng):
             s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
             m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
             isA = np.zeros(len(s), bool); isA[:nA] = True
-            prim = m0 >= m1c; m1 = np.where(prim, m0, m1c)
+            prim = m0 >= m1c; m1 = np.where(prim, m0, m1c); m2 = np.where(prim, m1c, m0)
             a_prim = np.abs(np.where(prim, c0, c1))
             ct = rng.uniform(-1, 1, (len(s), 2))
             cos0 = np.where(isA, ct[:, 0], 1.0); cos1 = np.where(isA, ct[:, 1], 1.0)
@@ -69,9 +94,9 @@ def build_pool(n_seed, n_b, n_draw, rng):
             pd = np.asarray(pdet(s))
             ok = np.isfinite(m1) & (w > 0)
             wi = w[ok] / w[ok].sum() * wfd / len(idx)
-            M1.append(m1[ok]); CE.append(chieff[ok]); CH.append(a_prim[ok]); CT.append(cprim[ok]); WI.append(wi); PD.append(pd[ok])
+            M1.append(m1[ok]); M2.append(m2[ok]); CE.append(chieff[ok]); CH.append(a_prim[ok]); CT.append(cprim[ok]); WI.append(wi); PD.append(pd[ok])
         print(f"  pooled f_dep={fdep} (weight {wfd:.3f})")
-    return (np.concatenate(M1), np.concatenate(CE), np.concatenate(CH),
+    return (np.concatenate(M1), np.concatenate(M2), np.concatenate(CE), np.concatenate(CH),
             np.concatenate(CT), np.concatenate(WI), np.concatenate(PD))
 
 
@@ -82,7 +107,7 @@ def main():
     p.add_argument("--n-draw", type=int, default=12)
     args = p.parse_args()
     rng = np.random.default_rng(11)
-    m1, ce, ch, ct, wi, pd = build_pool(args.n_seed, args.n_b, args.n_draw, rng)
+    m1, m2, ce, ch, ct, wi, pd = build_pool(args.n_seed, args.n_b, args.n_draw, rng)
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 
     # ---- Figure 1: spin PPDs conditioned on mass regions ----
@@ -100,7 +125,7 @@ def main():
         ax[2].plot(ctg, kde_region(ct, ctg, m, 0.10), col, lw=2, label=lab)
     # GWTC-5.0 marginal overlays (grey)
     for axx, param, grid in [(ax[0], "chi_eff", ceg), (ax[1], "a_1", chg), (ax[2], "cos_tilt_1", ctg)]:
-        gx, gr = gw(param); gr = np.interp(grid, gx, gr); nn = np.trapezoid(gr, grid)
+        gx, _, gmed, _ = gw(param); gr = np.interp(grid, gx, gmed); nn = np.trapezoid(gr, grid)
         if nn > 0: axx.fill_between(grid, gr / nn, color="grey", alpha=0.25, label="GWTC-5.0 (marginal)")
     ax[0].set_xlabel(r"$\chi_{\rm eff}$"); ax[0].set_title("Effective spin by mass region")
     ax[1].set_xlabel(r"$\chi$ (primary magnitude)"); ax[1].set_title("Spin magnitude by mass region")
@@ -109,18 +134,33 @@ def main():
     fig.suptitle("Model spin PPDs conditioned on primary-mass region (marginalized over $F_{\\rm dep}$, $m_{\\max}$) vs GWTC-5.0 marginal", fontsize=12)
     fig.tight_layout(); f1 = os.path.join(OUT, "real_spin_ppd_massregions.png"); fig.savefig(f1, dpi=140, bbox_inches="tight"); print("wrote", f1)
 
-    # ---- Figure 2: intrinsic dR/dm1 marginalized vs GWTC-5.0 (both intrinsic) ----
-    m1g = np.linspace(3, 100, 120)
-    dR = gaussian_kde(m1, weights=wi, bw_method=0.08)(m1g)   # intrinsic (rate-weighted, NO pdet)
-    gx, gr = gw("mass_1")                                     # GWTC-5.0 intrinsic dR/dm1
-    sel = (gx >= 5) & (gx <= 80); selm = (m1g >= 5) & (m1g <= 80)
-    dR *= np.trapezoid(gr[sel], gx[sel]) / np.trapezoid(dR[selm], m1g[selm])
-    fig2, a2 = plt.subplots(figsize=(7, 5))
-    a2.fill_between(gx, gr, color="grey", alpha=0.3, label="GWTC-5.0 (median)")
-    a2.plot(m1g, dR, "C0", lw=2.2, label=r"model (marginalized $F_{\rm dep},m_{\max}$)")
-    a2.set_yscale("log"); a2.set_xlim(4, 90); a2.set_ylim(gr.max() * 3e-4, gr.max() * 3)
-    a2.set_xlabel(r"$m_1\ [M_\odot]$"); a2.set_ylabel(r"$dR/dm_1$ (intrinsic, arb. norm.)")
-    a2.set_title(r"Intrinsic mass function, marginalized over $F_{\rm dep}$ and $m_{\max}$"); a2.legend()
+    # ---- Figure 2: intrinsic dR/dm1 AND dR/dm2 marginalized vs GWTC-5.0 ----
+    mg = np.linspace(3, 100, 120)
+    def norm_to(model_curve, gx, gmed):
+        sel = (gx >= 5) & (gx <= 80); selm = (mg >= 5) & (mg <= 80)
+        return model_curve * np.trapezoid(gmed[sel], gx[sel]) / np.trapezoid(model_curve[selm], mg[selm])
+    dR1 = norm_to(gaussian_kde(m1, weights=wi, bw_method=0.08)(mg), *gw("mass_1")[::2])
+    dR2 = gaussian_kde(m2, weights=wi, bw_method=0.08)(mg)
+    gx1, glo1, gmed1, ghi1 = gw("mass_1")
+    g2lo, g2med, g2hi = gw_dm2(mg, rng)
+    dR2 = dR2 * np.trapezoid(g2med[(mg >= 5) & (mg <= 80)], mg[(mg >= 5) & (mg <= 80)]) / np.trapezoid(dR2[(mg >= 5) & (mg <= 80)], mg[(mg >= 5) & (mg <= 80)])
+
+    def logslope(g, y, a=30, b=55):
+        m = (g >= a) & (g <= b) & (y > 0)
+        return np.polyfit(g[m], np.log(y[m]), 1)[0] if m.sum() > 3 else np.nan
+    print(f"  high-mass (30-55 Msun) log-slope: model dR/dm1={logslope(mg, dR1):+.3f}  dR/dm2={logslope(mg, dR2):+.3f}")
+    print(f"                                    GWTC-5 dR/dm1={logslope(gx1, gmed1):+.3f}  dR/dm2={logslope(mg, g2med):+.3f}")
+
+    fig2, ax2 = plt.subplots(1, 2, figsize=(12, 4.8))
+    ax2[0].fill_between(gx1, glo1, ghi1, color="grey", alpha=0.3, label="GWTC-5.0 90%"); ax2[0].plot(gx1, gmed1, "k", lw=1.5, label="GWTC-5.0 median")
+    ax2[0].plot(mg, dR1, "C0", lw=2.2, label=r"model")
+    ax2[1].fill_between(mg, g2lo, g2hi, color="grey", alpha=0.3, label="GWTC-5.0 90%"); ax2[1].plot(mg, g2med, "k", lw=1.5, label="GWTC-5.0 median")
+    ax2[1].plot(mg, dR2, "C0", lw=2.2, label=r"model")
+    for a, lab, ymax in [(ax2[0], r"$dR/dm_1$", gmed1.max()), (ax2[1], r"$dR/dm_2$", g2med.max())]:
+        a.set_yscale("log"); a.set_xlim(4, 90); a.set_ylim(ymax * 3e-4, ymax * 3)
+        a.set_xlabel(r"$m\ [M_\odot]$"); a.set_ylabel(lab + " (intrinsic, arb. norm.)"); a.legend(fontsize=8)
+    ax2[0].set_title(r"Primary mass $m_1$"); ax2[1].set_title(r"Secondary mass $m_2$ (GWTC-5 reconstructed)")
+    fig2.suptitle(r"Intrinsic mass functions marginalized over $F_{\rm dep}$, $m_{\max}$ vs GWTC-5.0 (median + 90\%)", fontsize=12)
     fig2.tight_layout(); f2 = os.path.join(OUT, "real_dRdm1_marginal.png"); fig2.savefig(f2, dpi=140, bbox_inches="tight"); print("wrote", f2)
 
 
