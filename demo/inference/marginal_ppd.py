@@ -165,7 +165,7 @@ def main():
     ax2[1].plot(mg, dR2, "C0", lw=2.2, label=r"model")
     for a, lab, ymax in [(ax2[0], r"$dR/dm_1$", gmed1.max()), (ax2[1], r"$dR/dm_2$", g2med.max())]:
         a.set_yscale("log"); a.set_xlim(4, 90); a.set_ylim(ymax * 3e-4, ymax * 3)
-        a.set_xlabel(r"$m\ [M_\odot]$"); a.set_ylabel(lab + " (intrinsic, arb. norm.)"); a.legend(fontsize=8)
+        a.set_xlabel(r"$m\ [M_\odot]$"); a.set_ylabel(lab + r" $[{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-1}]$"); a.legend(fontsize=8)
     ax2[0].set_title(r"Primary mass $m_1$"); ax2[1].set_title(r"Secondary mass $m_2$ (GWTC-5 reconstructed)")
     fig2.suptitle(r"Intrinsic mass functions marginalized over $F_{\rm dep}$, $m_{\max}$ vs GWTC-5.0 (median + 90\%)", fontsize=12)
     fig2.tight_layout(); f2 = os.path.join(OUT, "real_dRdm1_marginal.png"); fig2.savefig(f2, dpi=140, bbox_inches="tight"); print("wrote", f2)

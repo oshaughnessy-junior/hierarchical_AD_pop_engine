@@ -147,7 +147,7 @@ def render(m1g, tot, prim, natal, chB, out, fdep, n_pool):
     a0.plot(m1g, np.median(prim, 0), "C3--", lw=1.8, label=r"$1\mathrm{G}\times1\mathrm{G}$ (primordial)")
     a0.plot(m1g, np.median(chB, 0), "C2:", lw=1.4, label="aligned B (1G)")
     a0.set_yscale("log"); a0.set_xlim(4, 90); a0.set_ylim(tt.max() * 3e-4, tt.max() * 3)
-    a0.set_xlabel(r"$m_1\ [M_\odot]$"); a0.set_ylabel(r"$dR/dm_1$ (rate, arb. norm.)")
+    a0.set_xlabel(r"$m_1\ [M_\odot]$"); a0.set_ylabel(r"$dR/dm_1$ $[{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-1}]$")
     a0.set_title(r"Cascade decomposition of $dR/dm_1$ ($F_{\rm dep}=%.2f$, %d MC real.)" % (fdep, n_pool))
     a0.legend(fontsize=8, loc="upper right")
     fig.tight_layout(); fig.savefig(out, dpi=140, bbox_inches="tight"); print("wrote", out)

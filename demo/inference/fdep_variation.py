@@ -79,7 +79,7 @@ def main():
         aq = kernel_quantiles(m1, a_prim, w, grid, 6.0, [0.5])
         ax[1].plot(grid, aq[:, 0], color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
     ax[0].set_yscale("log"); ax[0].set_xlim(4, 90); ax[0].set_ylim(ghi.max() * 3e-4, ghi.max() * 3)
-    ax[0].set_xlabel(r"$m_1\ [M_\odot]$"); ax[0].set_ylabel(r"$dR/dm_1$ (arb. norm.)")
+    ax[0].set_xlabel(r"$m_1\ [M_\odot]$"); ax[0].set_ylabel(r"$dR/dm_1$ $[{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-1}]$")
     ax[0].set_title("Mass function vs cascade brightness"); ax[0].legend(fontsize=8)
     ax[1].axhline(0.69, color="grey", ls=":", lw=1.0)
     ax[1].set_xlim(5, 100); ax[1].set_ylim(0, 1); ax[1].set_xlabel(r"$m_1\ [M_\odot]$")

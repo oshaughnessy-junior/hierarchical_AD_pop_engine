@@ -19,6 +19,19 @@ ROOT = "/home/richard.oshaughnessy/coag_container"
 OUT = "/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/gwk-hierarchical-initial/paper/figures"
 
 
+def gw_mass1_median():
+    """GWTC-5.0 intrinsic primary-mass rate dR/dm_1 (posterior median) in real
+    Gpc^-3 yr^-1 Msun^-1, on its published grid. Used to set the ABSOLUTE rate
+    scale of the 2D density -- identical anchor to marginal_ppd.py's norm_to()."""
+    import glob, h5py
+    base = os.path.expanduser("~/coag_container/vt_data/gwtc5_pop/popsummary_files")
+    path = glob.glob(f"{base}/**/*default_mmax*popsummary_result.h5", recursive=True)[0]
+    with h5py.File(path, "r") as h:
+        g = h["posterior/rates_on_grids/mass_1"]
+        x = np.asarray(g["positions"]).squeeze(); r = np.asarray(g["rates"])
+    return x, np.nanpercentile(r, 50, axis=0)
+
+
 def sample_f090(n_seed=3000, n_b=2500, n_draw=12):
     """Return (m1, m2, w) pooled over f_dep=0.9 posterior draws (no F_dep marg).
     The heavy engine import is LAZY here so plotting from the cache is instant."""
@@ -62,13 +75,34 @@ def main():
     # rate-weighted KDE in log10 mass, evaluated on a LINEAR (m1,m2) grid, then
     # converted to the density per (m1,m2). GWTC-5 Fig.1 style: linear axes, blue
     # lower triangle (m2<=m1), rate density colorbar.
-    kde = gaussian_kde(np.vstack([np.log10(m1), np.log10(m2)]), weights=w, bw_method=0.11)
-    gm = np.linspace(3.0, 95.0, 260)
-    M1g, M2g = np.meshgrid(gm, gm)                 # X = m1, Y = m2
+    # weighted -> equal-weight resample keeps the KDE fast (and scipy-version
+    # independent); the rate scale is restored by the absolute calibration below.
+    ok = np.isfinite(m1) & np.isfinite(m2) & (w > 0) & (m1 > 0) & (m2 > 0)
+    m1, m2, w = m1[ok], m2[ok], w[ok]
+    rng = np.random.default_rng(0)
+    N = min(20000, m1.size); ridx = rng.choice(m1.size, N, p=w / w.sum())
+    kde = gaussian_kde(np.vstack([np.log10(m1[ridx]), np.log10(m2[ridx])]), bw_method=0.11)
+    gm = np.linspace(3.0, 95.0, 200)
+    M1g, M2g = np.meshgrid(gm, gm)                 # X = m1 (axis 1), Y = m2 (axis 0)
     plog = kde(np.vstack([np.log10(M1g).ravel(), np.log10(M2g).ravel()])).reshape(M1g.shape)
     dR = plog / (M1g * M2g * np.log(10.0) ** 2)    # density per (m1, m2)
     dR = np.where(M2g <= M1g, dR, np.nan)          # physical region m2 <= m1
-    # mask the PE-sparse corner (very low density) like GWTC's hatching
+
+    # ABSOLUTE-RATE CALIBRATION (real Gpc^-3 yr^-1 Msun^-2, no arbitrary norm):
+    # the model weights carry only a relative rate scale (the internal log_R is fit
+    # against a dimensionless pdet, not a VT), so -- exactly as marginal_ppd.py does
+    # for the 1D marginals -- we set the absolute scale by matching the model's own
+    # m1-marginal to the GWTC-5.0 intrinsic dR/dm1 integrated rate over [5,80] Msun.
+    # Integrating the calibrated 2D over m2 then reproduces that real dR/dm1, so the
+    # 2D density is in genuine Gpc^-3 yr^-1 Msun^-2.
+    dRdm1_model = np.trapezoid(np.where(np.isfinite(dR), dR, 0.0), gm, axis=0)  # int over m2
+    gx1, gmed1 = gw_mass1_median()
+    sg = (gx1 >= 5) & (gx1 <= 80); sm = (gm >= 5) & (gm <= 80)
+    sc = np.trapezoid(gmed1[sg], gx1[sg]) / np.trapezoid(dRdm1_model[sm], gm[sm])
+    dR = dR * sc
+    print(f"[abs-rate] GWTC-5 anchor sc={sc:.3e}; "
+          f"model R([5,80], dm1)={np.trapezoid(dRdm1_model[sm], gm[sm])*sc:.3g} Gpc^-3 yr^-1")
+
     vmax = np.nanmax(dR); vmin = vmax * 1e-3
 
     fig, ax = plt.subplots(figsize=(6.6, 5.7))
@@ -82,7 +116,7 @@ def main():
     ax.set_xlabel(r"$m_1\ [M_\odot]$"); ax.set_ylabel(r"$m_2\ [M_\odot]$")
     ax.set_title(r"Coagulation merger-rate density $dR/dm_1\,dm_2$, $f_{\rm dep}=0.9$")
     cb = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.03)
-    cb.set_label(r"$dR/dm_1\,dm_2$ (arb.\ norm.)")
+    cb.set_label(r"$dR/dm_1\,dm_2\ \ [{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-2}]$")
     fig.tight_layout()
     out = os.path.join(OUT, "real_dRdm1dm2_f090.png")
     for f in (out, out.replace(".png", ".pdf")):

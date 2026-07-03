@@ -94,7 +94,7 @@ def main():
     a0.plot(m1g, np.median(dR_A, 0), "C3--", lw=1.6, label="cascade (A)")
     a0.plot(m1g, np.median(dR_B, 0), "C2:", lw=1.8, label="aligned (B)")
     a0.set_yscale("log"); a0.set_xlim(4, 90); a0.set_ylim(np.median(dR_t, 0).max() * 3e-4, np.median(dR_t, 0).max() * 3)
-    a0.set_xlabel(r"$m_1\ [M_\odot]$"); a0.set_ylabel(r"$dR/dm_1$ (rate, arb. norm.)")
+    a0.set_xlabel(r"$m_1\ [M_\odot]$"); a0.set_ylabel(r"$dR/dm_1$ $[{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-1}]$")
     a0.set_title("Mass function (log scale) + channel decomposition"); a0.legend(fontsize=8)
     # (2) chi_eff
     def overlay(axx, gx, gband, modg, modband, xl, ttl):
