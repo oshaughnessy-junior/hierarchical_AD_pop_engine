@@ -42,6 +42,21 @@ for p in (str(_DEMO), str(_REPO), str(_REPO / "src")):
 import demo_gwkokab_fit_stage1 as demo  # noqa: E402
 import fit_stage1_gwkokab as fit  # noqa: E402
 from mock_catalog import scatter_to_posteriors  # noqa: E402
+from hierarchical_ad_pop_engine.grids import BinaryGrid  # noqa: E402
+from hierarchical_ad_pop_engine.spin_orientation import Isotropic, Fisher  # noqa: E402
+
+# COAG_LEAN_GAIN: disable the F2 gain-side chi-out cache (orientation_precompute
+# R_CHI_OUT_DEFAULT) in BOTH the forward solve and the implicit-function-theorem
+# BACKWARD pass. Without this the backward re-runs _f2_combined_scan and OOMs the
+# isotropic gradient (the F2 cache ~ n_chi^4); the lean per-iter orientation scan
+# is bit-equivalent. Essential for isotropic implicit SVI/NUTS. See the fmobs
+# "efficient high-resolution settings" docstring.
+import os as _os  # noqa: E402
+if _os.environ.get("COAG_LEAN_GAIN"):
+    import hierarchical_ad_pop_engine.orientation_precompute as _op  # noqa: E402
+    import hierarchical_ad_pop_engine.response.implicit as _imp  # noqa: E402
+    _op.R_CHI_OUT_DEFAULT = None
+    _imp.R_CHI_OUT_DEFAULT = None
 
 from hierarchical_ad_pop_engine.inference.gwkokab_bridge import (  # noqa: E402
     coagulation_poisson_mean_estimator,
@@ -57,19 +72,45 @@ PARAM_NAMES = fit.PARAM_NAMES
 _CI = (5.0, 95.0)  # 90% credible interval
 
 
+def _build_orientation(spec, n_theta=None, n_dphi=None):
+    # Reduced orientation quadrature keeps the reverse-mode gradient (which
+    # stacks the per-quadrature-point residuals) inside GPU memory; the natal
+    # parameters the fit recovers are insensitive to the orientation-quad
+    # resolution, so a coarse quad is fine for FITTING (full quad is only needed
+    # for the fractal forward figures).
+    extra = {}
+    if n_theta is not None:
+        extra["n_theta"] = int(n_theta)
+    if n_dphi is not None:
+        extra["n_dphi"] = int(n_dphi)
+    s = str(spec).strip().lower()
+    if s in ("aligned", "a"):
+        return None  # None -> engine Aligned default (v1 scalar path)
+    if s in ("isotropic", "iso", "i"):
+        return Isotropic.default(**extra)
+    if s.startswith("fisher:"):
+        return Fisher.default(kappa=float(s.split(":", 1)[1]), **extra)
+    raise ValueError(f"bad --orientation {spec!r}")
+
+
 def _setup(args):
     fixed = demo.FIXED
-    fit_grid = demo._grid_for_fit()
+    n_m = args.n_m_fit or demo.N_M_FIT
+    n_chi = args.n_chi_fit or demo.N_CHI_FIT
+    fit_grid = BinaryGrid.default(m_min=fixed["m_min"], m_max=fixed["m_max"],
+                                  n_m=n_m, n_chi=n_chi)
     demo.build_truth_model_and_calibrate_rate(args.n_obs, grid=fit_grid)
     demo.THETA_STAR["natal_spin_loc"] = 0.05
     theta_star = dict(demo.THETA_STAR)
+    orientation = _build_orientation(args.orientation, args.n_theta_fit, args.n_dphi_fit)
 
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat = jax.random.split(key, 2)
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc)
+        depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc,
+        solver=args.solver, orientation=orientation)
 
     # self-consistent log_rate calibration against the fit's own μ metric
     probe = dist_fn(**{**theta_star, "log_rate": 0.0})
@@ -82,8 +123,14 @@ def _setup(args):
     m_hi = fixed["m_max"] * 2.5
     true_pts = fit.sample_from_model(truth_model, args.n_obs, k_true,
                                      m_lo=fixed["m_min"], m_hi=m_hi)
-    events = scatter_to_posteriors(true_pts, args.n_samples, k_scat, m_hi=m_hi)
-    ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
+    if args.delta:
+        # exact-injection (delta PE): one delta sample per event, flat weights
+        # — the density-mode cross-check catalogue.
+        events = jnp.asarray(true_pts)[:, None, :]
+        ln_offsets = jnp.zeros((args.n_obs, 1))
+    else:
+        events = scatter_to_posteriors(true_pts, args.n_samples, k_scat, m_hi=m_hi)
+        ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
 
     # the REAL gwkokab numpyro model (priors + analytical-Poisson factor)
     variables, variables_index = build_stage1_variables()
@@ -186,6 +233,24 @@ def main():
     ap.add_argument("--nuts-samples", type=int, default=300)
     ap.add_argument("--nuts-tree-depth", type=int, default=6)
     ap.add_argument("--seed", type=int, default=20260530)
+    ap.add_argument("--orientation", type=str, default="aligned",
+                    help="aligned | isotropic | fisher:<kappa>")
+    ap.add_argument("--solver", type=str, default="mc_jax",
+                    choices=("mc_jax", "implicit"))
+    ap.add_argument("--n-chi-fit", type=int, default=None,
+                    help="override the fit-grid n_chi (default demo.N_CHI_FIT)")
+    ap.add_argument("--n-m-fit", type=int, default=None,
+                    help="override the fit-grid n_m (default demo.N_M_FIT)")
+    ap.add_argument("--n-theta-fit", type=int, default=2,
+                    help="isotropic/Fisher orientation-quad n_theta for the fit "
+                         "(reduced default keeps the AD gradient in GPU memory)")
+    ap.add_argument("--n-dphi-fit", type=int, default=4,
+                    help="isotropic/Fisher orientation-quad n_dphi for the fit")
+    ap.add_argument("--delta", action="store_true",
+                    help="exact-injection (delta-PE) catalogue: 1 sample/event, "
+                         "no measurement scatter — the density-mode cross-check")
+    ap.add_argument("--out-tag", type=str, default="",
+                    help="suffix appended to output figure names")
     args = ap.parse_args()
 
     print(f"[cfg] n_obs={args.n_obs} n_samples={args.n_samples} "
@@ -222,7 +287,7 @@ def main():
         k_post, svi_res.params, sample_shape=(args.svi_draws,))
     _report("SVI", svi_post)
     _pairs_figure(svi_post, theta_star,
-                  _DEMO / "figures" / "stage1_posterior_svi.png")
+                  _DEMO / "figures" / f"stage1_posterior_svi{args.out_tag}.png")
 
     # --- NUTS (optional) -----------------------------------------------------
     if args.nuts:
@@ -240,7 +305,7 @@ def main():
         # r-hat-ish: just report; single chain
         _report("NUTS", nuts_post)
         _pairs_figure(nuts_post, theta_star,
-                      _DEMO / "figures" / "stage1_posterior_nuts.png")
+                      _DEMO / "figures" / f"stage1_posterior_nuts{args.out_tag}.png")
 
     print("\n=== DONE ===")
 
