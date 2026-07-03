@@ -61,6 +61,20 @@ from hierarchical_ad_pop_engine.response.implicit import (
     _dm_log_weights,
 )
 
+# ``COAG_LEAN_GAIN`` disables the F2 gain-side χ-out cache (~``n_χ⁴``; OOMs at the
+# ``n_χ = 128`` this sweep now reaches) in favour of the memory-lean per-Picard-
+# iteration orientation scan (bit-equivalent).  Same switch as
+# ``forward_modeling_observables.py`` — see that docstring for the recipe.  Note
+# the wall-time column this sweep reports is therefore prefactor-dependent (lean
+# is slower per iter than F2 at low n_χ); the scaling ``(n_m n_χ)²`` per iter is
+# what is robust.  Off by default.
+if os.environ.get("COAG_LEAN_GAIN"):
+    import hierarchical_ad_pop_engine.orientation_precompute as _op  # noqa: E402
+    import hierarchical_ad_pop_engine.response.implicit as _imp  # noqa: E402
+
+    _op.R_CHI_OUT_DEFAULT = None
+    _imp.R_CHI_OUT_DEFAULT = None
+
 
 # ---------------------------------------------------------------------------
 # Continuous recovery + metric.

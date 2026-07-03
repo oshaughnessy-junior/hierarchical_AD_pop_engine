@@ -68,6 +68,20 @@ from hierarchical_ad_pop_engine.response.implicit import (
     _dm_log_weights,
 )
 
+# ``COAG_LEAN_GAIN`` (any truthy value) disables the F2 gain-side χ-out cache
+# (``orientation_precompute.R_CHI_OUT_DEFAULT``), which scales ~``n_χ⁴`` and OOMs
+# at the ``n_χ ≥ 64`` this κ-sweep now runs at; the gain side falls back to the
+# memory-lean per-Picard-iteration orientation scan (F2 is documented
+# bit-equivalent).  Same switch as ``forward_modeling_observables.py`` — see that
+# script's "efficient high-resolution settings" docstring for the full recipe.
+# Off by default so low-n_χ callers keep the F2 speed-up.
+if os.environ.get("COAG_LEAN_GAIN"):
+    import hierarchical_ad_pop_engine.orientation_precompute as _op  # noqa: E402
+    import hierarchical_ad_pop_engine.response.implicit as _imp  # noqa: E402
+
+    _op.R_CHI_OUT_DEFAULT = None
+    _imp.R_CHI_OUT_DEFAULT = None
+
 
 # ---------------------------------------------------------------------------
 # Orientation helpers.
@@ -235,6 +249,10 @@ def main() -> int:
     p.add_argument("--max-iter", type=int, default=80)
     p.add_argument("--max-gap-factor", type=float, default=2.0)
     p.add_argument("--render", choices=("pchip-log", "hat"), default="pchip-log")
+    p.add_argument("--panels", choices=("both", "right", "left"), default="both",
+                   help="which panel(s) to render: 'right' = the Fisher-kappa "
+                        "sweep alone (a standalone PRD figure); 'both' keeps the "
+                        "clustered-vs-uniform placement panel on the left.")
     p.add_argument("--mc", action=argparse.BooleanOptionalAction, default=True,
                    help="overlay the particle-MC raw histograms (authoritative)")
     p.add_argument("--mc-n-seed", type=int, default=60000)
@@ -255,14 +273,21 @@ def main() -> int:
     chi_fine = np.linspace(1e-3, 1.0 - 1e-3, 2001)
 
     # ── Engine solves (cached) ──────────────────────────────────────────
-    eng_clu_iso = engine_chi_marginal("clustered", 0.0, args)
-    eng_uni_iso = engine_chi_marginal("uniform", 0.0, args)
     sweep = {k: engine_chi_marginal("clustered", k, args) for k in kappas}
+    if args.panels in ("both", "left"):
+        # left panel: clustered-vs-uniform placement at the isotropic point.
+        eng_clu_iso = engine_chi_marginal("clustered", 0.0, args)
+        eng_uni_iso = engine_chi_marginal("uniform", 0.0, args)
+    else:
+        # right-only: reuse the isotropic sweep solve; skip the extra pair.
+        eng_clu_iso = sweep.get(0.0)
+        eng_uni_iso = None
 
     # ── MC runs (cached; depletion tracks each engine solve) ───────────
     mc_runs = {}
     if args.mc:
-        mc_runs[0.0] = mc_chi_hist(0.0, eng_clu_iso["f_dep"], args)
+        if eng_clu_iso is not None:
+            mc_runs[0.0] = mc_chi_hist(0.0, eng_clu_iso["f_dep"], args)
         for k in kappas:
             if k not in mc_runs:
                 mc_runs[k] = mc_chi_hist(k, sweep[k]["f_dep"], args)
@@ -284,44 +309,55 @@ def main() -> int:
         ax.stairs(mc["density"] * scale, mc["edges"], color=color, lw=1.1,
                   alpha=0.85, label=label, zorder=1)
 
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.4))
-
-    # Left: clustered vs uniform vs MC (isotropic config).
-    for eng, color, lab in (
-        (eng_uni_iso, "0.6", f"uniform χ (n_χ={args.n_chi})"),
-        (eng_clu_iso, "C3", f"clustered χ (n_χ={args.n_chi})"),
-    ):
-        curve = render_curve(eng["chi"], eng["dN_dchi"], chi_fine, args.render)
-        axL.plot(chi_fine, curve, "-", color=color, lw=1.4, label=lab, zorder=2)
-        axL.plot(eng["chi"], eng["dN_dchi"], "o", color=color, ms=3, zorder=3)
-    if args.mc:
-        scale = _integral(eng_clu_iso["chi"], eng_clu_iso["dN_dchi"])
-        _mc_step(axL, mc_runs[0.0], scale, "k",
-                 f"particle MC (n={int(mc_runs[0.0]['n_active'])}, raw hist)")
-    axL.set_title("Believable: clustered χ vs uniform vs MC (isotropic)")
-    axL.set_xlabel(r"$\chi$"); axL.set_ylabel(r"$dN/d\chi$")
-    axL.set_yscale("log"); axL.legend(fontsize=8, loc="upper right")
-    axL.axvline(0.6865, ls=":", color="k", lw=0.8)
-
-    # Right: κ sweep on the clustered grid, MC overlay per κ.
-    cmap = plt.cm.viridis(np.linspace(0.15, 0.9, len(kappas)))
-    for k, c in zip(kappas, cmap):
-        eng = sweep[k]
-        lab = ("Isotropic (κ→0)" if k == 0.0
-               else ("Aligned (κ→∞)" if np.isinf(k) else f"Fisher κ={k:g}"))
-        curve = render_curve(eng["chi"], eng["dN_dchi"], chi_fine, args.render)
-        axR.plot(chi_fine, curve, "-", color=c, lw=1.4, label=lab, zorder=2)
-        axR.plot(eng["chi"], eng["dN_dchi"], "o", color=c, ms=2.5, zorder=3)
+    def _plot_left(axL):
+        # clustered vs uniform vs MC (isotropic config).
+        for eng, color, lab in (
+            (eng_uni_iso, "0.6", f"uniform χ (n_χ={args.n_chi})"),
+            (eng_clu_iso, "C3", f"clustered χ (n_χ={args.n_chi})"),
+        ):
+            curve = render_curve(eng["chi"], eng["dN_dchi"], chi_fine, args.render)
+            axL.plot(chi_fine, curve, "-", color=color, lw=1.4, label=lab, zorder=2)
+            axL.plot(eng["chi"], eng["dN_dchi"], "o", color=color, ms=3, zorder=3)
         if args.mc:
-            scale = _integral(eng["chi"], eng["dN_dchi"])
-            _mc_step(axR, mc_runs[k], scale, c)
-    axR.set_title("Interesting: Fisher-κ sweep vs MC (steps = MC)")
-    axR.set_xlabel(r"$\chi$"); axR.set_ylabel(r"$dN/d\chi$")
-    axR.set_yscale("log"); axR.legend(fontsize=8)
-    axR.axvline(0.6865, ls=":", color="k", lw=0.8)
+            scale = _integral(eng_clu_iso["chi"], eng_clu_iso["dN_dchi"])
+            _mc_step(axL, mc_runs[0.0], scale, "k",
+                     f"particle MC (n={int(mc_runs[0.0]['n_active'])}, raw hist)")
+        axL.set_title("Clustered χ vs uniform vs MC (isotropic)")
+        axL.set_xlabel(r"$\chi$"); axL.set_ylabel(r"$dN/d\chi$")
+        axL.set_yscale("log"); axL.legend(fontsize=8, loc="upper right")
+        axL.axvline(0.6865, ls=":", color="k", lw=0.8)
+
+    def _plot_right(axR):
+        # κ sweep on the clustered grid, MC overlay per κ.
+        cmap = plt.cm.viridis(np.linspace(0.15, 0.9, len(kappas)))
+        for k, c in zip(kappas, cmap):
+            eng = sweep[k]
+            lab = ("Isotropic (κ→0)" if k == 0.0
+                   else ("Aligned (κ→∞)" if np.isinf(k) else f"Fisher κ={k:g}"))
+            curve = render_curve(eng["chi"], eng["dN_dchi"], chi_fine, args.render)
+            axR.plot(chi_fine, curve, "-", color=c, lw=1.4, label=lab, zorder=2)
+            axR.plot(eng["chi"], eng["dN_dchi"], "o", color=c, ms=2.5, zorder=3)
+            if args.mc:
+                scale = _integral(eng["chi"], eng["dN_dchi"])
+                _mc_step(axR, mc_runs[k], scale, c)
+        axR.set_title(rf"Fisher-$\kappa$ orientation sweep vs particle MC "
+                      rf"($n_\chi={args.n_chi}$; steps = MC)")
+        axR.set_xlabel(r"$\chi$"); axR.set_ylabel(r"$dN/d\chi$")
+        axR.set_yscale("log"); axR.legend(fontsize=8)
+        axR.axvline(0.6865, ls=":", color="k", lw=0.8)
+
+    if args.panels == "both":
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+        _plot_left(axL); _plot_right(axR); axes = (axL, axR)
+    elif args.panels == "right":
+        fig, axR = plt.subplots(1, 1, figsize=(6.2, 4.6))
+        _plot_right(axR); axes = (axR,)
+    else:
+        fig, axL = plt.subplots(1, 1, figsize=(6.2, 4.6))
+        _plot_left(axL); axes = (axL,)
 
     # Common y floor: don't let log-rendering artifacts dominate the view.
-    for ax in (axL, axR):
+    for ax in axes:
         lo, hi = ax.get_ylim()
         ax.set_ylim(max(lo, hi * 1e-9), hi)
 
