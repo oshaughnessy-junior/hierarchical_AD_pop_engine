@@ -117,6 +117,13 @@ def build_logL(events, ln_offsets, dist_fn, estimator, *, T_obs, n_quad):
     return logL
 
 
+# When set (via --fix-kernel-a), pin kernel_a to this value in the reparam so the
+# MAP/profile holds it fixed: kernel_a is degenerate with log_rate, and floating
+# it drags lambda into the degeneracy valley, so the publication corner fixes it.
+# u[7] then becomes inert (logL no longer depends on it).
+_FIX_KERNEL_A = None
+
+
 # --- 10-param reparametrisation: unconstrained u -> physical θ ---------------
 # Disjoint mass windows (μ₁∈(5,20), μ₂∈(20,50)) break the label switch.
 def _to_physical(u):
@@ -127,7 +134,7 @@ def _to_physical(u):
     lam = 0.05 + 0.90 * jax.nn.sigmoid(u[4])           # (0.05, 0.95)
     spin_loc = 0.3 * jax.nn.sigmoid(u[5])              # (0, 0.3)
     spin_scale = jnp.clip(jnp.exp(u[6]), 0.01, 0.5)    # > 0
-    kernel_a = u[7]                                    # free
+    kernel_a = u[7] if _FIX_KERNEL_A is None else jnp.asarray(_FIX_KERNEL_A)  # fixed if --fix-kernel-a
     kernel_b = u[8]                                    # free
     log_rate = u[9]                                    # free
     return jnp.stack([mu1, sigma1, mu2, sigma2, lam,
@@ -248,6 +255,10 @@ def main():
                          "pins kernel_b — pair with --solver implicit.")
     ap.add_argument("--n-m", type=int, default=None)
     ap.add_argument("--n-chi", type=int, default=None)
+    ap.add_argument("--fix-kernel-a", action="store_true",
+                    help="pin kernel_a at its physical value (truth) — the "
+                         "publication-corner setting; it is degenerate with "
+                         "log_rate and floating it biases lambda.")
     ap.add_argument("--sigma-log-m", type=float, default=0.0,
                     help="mock measurement scatter on mass. DEFAULT 0 (exact "
                          "injection). NON-ZERO IS A TRAP for this harness: "
@@ -268,6 +279,10 @@ def main():
     args = ap.parse_args()
 
     fixed = demo.FIXED
+    if args.fix_kernel_a:
+        global _FIX_KERNEL_A
+        _FIX_KERNEL_A = float(fixed["kernel_a"])
+        print(f"[cfg] kernel_a FIXED at {_FIX_KERNEL_A} (u[7] inert; 9 free params)")
     print(f"[cfg] TWO-PULSE  n_obs={args.n_obs} n_samples={args.n_samples} "
           f"n_seed={args.n_seed} k_max={args.k_max}")
     if max(args.sigma_log_m, args.sigma_chi) > 0.0:
