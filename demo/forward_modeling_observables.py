@@ -107,6 +107,27 @@ from hierarchical_ad_pop_engine.spin_orientation import (  # noqa: E402
 
 from red_team import backup_particle_mc as B1  # noqa: E402
 
+import os  # noqa: E402
+
+# Memory: the F2 gain-side χ-out surrogate (orientation_precompute
+# ``R_CHI_OUT_DEFAULT``) materialises a ``(N_χ, N_m, N_χ, N_m, N_χ)`` cache and
+# an even larger basis-contraction intermediate, both scaling ~ n_χ³–n_χ⁴.  At
+# the high n_χ this figure needs for the fractal spin marginal (64/128) that
+# OOMs any node — a single 154 GB allocation was observed at 24×64.  Setting
+# ``COAG_LEAN_GAIN`` (any truthy value) disables F2 so the gain side runs the
+# memory-lean per-Picard-iter orientation scan in
+# ``response/coagulation.py:_step_one_generation_marginalised`` (one
+# ``(N_m·N_χ)²`` tensor alive at a time; same physics — F2 is documented as
+# bit-equivalent to the scan path — just slower per iter).  Off by default so
+# low-n_χ callers keep the F2 speed-up.  See ``orientation_precompute.py``
+# ``R_CHI_OUT_DEFAULT`` docstring ("Set to None/0 to skip F2").
+if os.environ.get("COAG_LEAN_GAIN"):
+    import hierarchical_ad_pop_engine.orientation_precompute as _op  # noqa: E402
+    import hierarchical_ad_pop_engine.response.implicit as _imp  # noqa: E402
+
+    _op.R_CHI_OUT_DEFAULT = None
+    _imp.R_CHI_OUT_DEFAULT = None
+
 
 # ---------------------------------------------------------------------------
 # --orientation CLI parsing.
@@ -1533,7 +1554,14 @@ def main() -> int:
         # See [[project-misalignment-session-b-done]] for the lower-
         # level ``_solve``-surface verification.
         v_esc_grad = None
-        if not isinstance(orientation, Aligned):
+        # The ∂(total_rate)/∂(v_esc) check below is reverse-mode AD through the
+        # implicit solve.  Under a non-Aligned orientation the backward pass
+        # stacks the per-orientation-quadrature residuals of the gain scan → a
+        # (N_m·N_χ)²·n_quad tensor (2.4 GB at 24×64×128), several copies, which
+        # OOMs at the high n_χ this figure needs.  It is a diagnostic, not a
+        # plotted observable, so skip it in the memory-lean high-n_χ mode
+        # (COAG_LEAN_GAIN); the forward figure is unaffected.
+        if not isinstance(orientation, Aligned) and not os.environ.get("COAG_LEAN_GAIN"):
             grad_response = build_response(
                 theta, n_m, n_chi, args.epsilon,
                 orientation=orientation,
