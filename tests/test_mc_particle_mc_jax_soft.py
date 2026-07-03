@@ -299,13 +299,25 @@ def test_grad_through_kernel_b_flows_without_straight_through():
 
 
 # ---------------------------------------------------------------------------
-# S8: non-Aligned orientation raises.
+# S8: non-Aligned orientation now runs (J2b vector-remnant path).
 # ---------------------------------------------------------------------------
-def test_non_aligned_orientation_raises():
-    from hierarchical_ad_pop_engine.spin_orientation import Isotropic
-    cfg = MCConfig(
-        n_seed=N_SEED, depletion_fraction=DEPL,
-        orientation=Isotropic.default(), **THETA,
-    )
-    with pytest.raises(NotImplementedError, match="Aligned"):
-        particle_mc_jax_soft(cfg, jax.random.PRNGKey(2026))
+def test_non_aligned_orientation_runs():
+    """J2b: Isotropic / Fisher route through the per-event vector path.
+
+    Previously ``particle_mc_jax_soft`` raised ``NotImplementedError`` on
+    any non-Aligned orientation (the J2 guard).  J2b lands the soft-gated
+    vector-remnant physics, so it must now RUN and report the model name.
+    """
+    from hierarchical_ad_pop_engine.spin_orientation import Isotropic, Fisher
+    for orient, name in [(Isotropic.default(), "Isotropic"),
+                         (Fisher.default(5.0), "Fisher")]:
+        cfg = MCConfig(
+            n_seed=N_SEED, depletion_fraction=DEPL,
+            orientation=orient, **THETA,
+        )
+        out = particle_mc_jax_soft(cfg, jax.random.PRNGKey(2026))
+        assert out["stats"]["orientation"] == name
+        assert jnp.isfinite(out["stats"]["W_total"])
+        # Retained heavy-slot spins are |chi| in [0, 1] under non-Aligned.
+        chi = out["chi_active"]
+        assert jnp.all(chi >= -1e-9)

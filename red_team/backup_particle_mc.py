@@ -1273,12 +1273,19 @@ def particle_mc_jax_soft(
         Occupancy below this counts as "merged away" for pair-eligibility
         and the ``active_mask`` boolean.
     """
-    if not _orientation_is_aligned(cfg.orientation):
-        raise NotImplementedError(
-            "particle_mc_jax_soft currently supports only Aligned "
-            "orientation; non-Aligned per-event vector physics is the "
-            "J2b follow-up (see demo/PLAN_jax_mc.md § J2)."
-        )
+    # J2b — the soft-gate path now supports non-Aligned per-event vector
+    # physics (Isotropic / Fisher-κ).  Aligned keeps the bit-for-bit
+    # scalar block; any other model routes the remnant triple through the
+    # ``*_at_orientation`` primitives with a soft-sigmoid retention so
+    # κ / v_esc gradients flow.  See demo/PLAN_j2b_vector_mc.md.
+    aligned_path = _orientation_is_aligned(cfg.orientation)
+    # Per-step orientation RNG, independent of the selection RNG (which is
+    # ``key_loop`` below).  Keeps the Aligned path bit-for-bit — the
+    # orientation stream is never split off ``key`` when Aligned.
+    orientation_key = jax.random.PRNGKey(int(cfg.orientation_key_seed))
+    # Fixed retention softness scale (km/s).  Mirrors the implicit path's
+    # ``retention_kind="sigmoid"`` convention.
+    retain_tau = 50.0
 
     key_natal, key_loop = jax.random.split(key)
     m0, chi0, w0 = sample_natals_jax(
@@ -1348,16 +1355,51 @@ def particle_mc_jax_soft(
         w_event = K_ij / K_max
         delta_raw = w_event * jnp.minimum(o_i, o_j)
 
-        # Aligned remnant physics — pair-selection order (matches numpy /
-        # B.1 bit-for-bit; heavier-first is applied only to the record).
-        m_new = _M_rem_jax(m_i, m_j, chi_i, chi_j)
-        chi_new = _chi_rem_jax(m_i, m_j, chi_i, chi_j)
-        v_kick_evt = _v_kick_aligned_jax(m_i, m_j, chi_i, chi_j)
-        retain = _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
+        # Remnant physics — pair-selection order (matches numpy / B.1
+        # bit-for-bit; heavier-first is applied only to the record).
+        if aligned_path:
+            # v1 scalar Aligned path — bit-for-bit unchanged.  Heavy slot
+            # stores SIGNED χ.  Hard Heaviside retention.
+            m_new = _M_rem_jax(m_i, m_j, chi_i, chi_j)
+            chi_new = _chi_rem_jax(m_i, m_j, chi_i, chi_j)
+            v_kick_evt = _v_kick_aligned_jax(m_i, m_j, chi_i, chi_j)
+            retain_bool = (
+                _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
+            )
+            # ``retain`` is the continuous quantity the occupancy flow uses;
+            # under Aligned it is the hard bool cast to float (bit-for-bit).
+            retain = retain_bool.astype(m_arr.dtype)
+        else:
+            # J2b non-Aligned vector path.  Sample ONE orientation for this
+            # step's pair (φ_1 = 0, φ_2 = Δφ; azimuthal-symmetry collapse).
+            # ``key_o`` is folded off the independent orientation stream so
+            # the selection RNG (and hence the Aligned numerics) is untouched.
+            key_o = jax.random.fold_in(orientation_key, k)
+            th1, ph1, th2, ph2 = cfg.orientation.sample(key_o, 1)
+            ct1 = jnp.cos(th1[0])
+            ct2 = jnp.cos(th2[0])
+            dphi = ph2[0] - ph1[0]
+            # Parallel projection χ_z = χ·cos θ feeds M_rem's chi_eff.
+            chi_z_i = chi_i * ct1
+            chi_z_j = chi_j * ct2
+            m_new = _M_rem_jax(m_i, m_j, chi_z_i, chi_z_j)
+            # Heavy slot stores |χ_rem| (orientation carries the tilt).
+            chi_new = _chi_rem_at_orientation_jax(
+                m_i, m_j, chi_i, chi_j, ct1, ct2, dphi
+            )
+            v_kick_evt = _v_kick_at_orientation_jax(
+                m_i, m_j, chi_i, chi_j, ct1, ct2, dphi
+            )
+            # Soft-sigmoid retention so κ / v_esc gradients flow.  Division-
+            # free argument (no v_kick/clip ratio) → finite budget-clip
+            # BACKWARD (NaN-in-backward guard).
+            retain = jax.nn.sigmoid((v_esc - v_kick_evt) / retain_tau)
+            retain_bool = retain > 0.5
 
         # Net occupancy removed by a FULL-δ step is ``mult · δ`` with
-        # ``mult = 1`` if retained (2 consumed − 1 born) else ``2``.
-        mult = jnp.where(retain, 1.0, 2.0)
+        # ``mult = 1`` if retained (2 consumed − 1 born) else ``2``.  Under
+        # the soft path ``retain`` is continuous ⇒ ``mult = 2 − retain``.
+        mult = 2.0 - retain
 
         # Depletion-budget cap — division-free, gradient-SAFE.  Cap δ so
         # this step's net removal cannot overshoot the remaining budget:
@@ -1388,7 +1430,9 @@ def particle_mc_jax_soft(
         # the static write index, so no write-pointer.  Occupancy δ if
         # retained, else 0 (the slot stays empty and contributes nothing).
         tail = n_init + k
-        tail_occ = jnp.where(retain, delta, 0.0)
+        # Continuous retention: the born remnant carries ``retain·δ`` of
+        # occupancy (Aligned: retain ∈ {0,1} ⇒ bit-for-bit the old bool).
+        tail_occ = retain * delta
         new_m_arr = m_arr.at[tail].set(m_new)
         new_chi_arr = chi_arr.at[tail].set(chi_new)
         new_w_arr = w_arr.at[tail].set(0.5 * (w_i + w_j))
@@ -1408,8 +1452,10 @@ def particle_mc_jax_soft(
         chi2_rec = jnp.where(heavier_is_i, chi_j, chi_i)
         g1_rec = jnp.where(heavier_is_i, g_i, g_j).astype(m_arr.dtype)
         g2_rec = jnp.where(heavier_is_i, g_j, g_i).astype(m_arr.dtype)
+        # Under Aligned ``retain`` is {0,1} ⇒ this column is bit-for-bit.
+        # Under the soft path it is the continuous retention probability.
         retain_rec = retain.astype(m_arr.dtype)
-        m_rem_rec = jnp.where(retain, m_new, jnp.nan)
+        m_rem_rec = jnp.where(retain_bool, m_new, jnp.nan)
         rec_event = jnp.stack(
             [m1_rec, m2_rec, chi1_rec, chi2_rec, g1_rec, g2_rec,
              retain_rec, m_rem_rec]
@@ -1452,7 +1498,10 @@ def particle_mc_jax_soft(
             net_removed=net_removed_f,
             depletion=net_removed_f / max(n_init, 1),
             sum_w_mergers=jnp.sum(w_mergers_arr),
-            orientation="Aligned",
+            orientation=(
+                "Aligned" if aligned_path
+                else type(cfg.orientation).__name__
+            ),
         ),
     )
     return out_dict

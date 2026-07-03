@@ -349,14 +349,20 @@ def build_mc_jax_response(
             "demo/PLAN_jax_mc.md."
         )
 
-    # Reject non-Aligned at factory time — particle_mc_jax already does
-    # this inside, but failing here gives a cleaner error stack.
+    # Reject non-Aligned at factory time for the B.1 bernoulli gate only —
+    # ``particle_mc_jax`` still lacks the per-event vector path.  The B.2
+    # soft gate (``particle_mc_jax_soft``) gained non-Aligned Isotropic /
+    # Fisher-κ vector physics in J2b, so it is allowed through.
     orientation = response.orientation
-    if orientation is not None and not isinstance(orientation, Aligned):
+    if (
+        gate != "soft"
+        and orientation is not None
+        and not isinstance(orientation, Aligned)
+    ):
         raise NotImplementedError(
-            "MCResponseJax currently supports only Aligned orientation; "
-            "non-Aligned per-event vector physics is the J2b follow-up "
-            "(see demo/PLAN_jax_mc.md § J2)."
+            "MCResponseJax gate='bernoulli' supports only Aligned "
+            "orientation; non-Aligned per-event vector physics is landed "
+            "for gate='soft' (J2b).  Pass gate='soft' or Aligned()."
         )
 
     natal_mass = response.natal_mass_params
