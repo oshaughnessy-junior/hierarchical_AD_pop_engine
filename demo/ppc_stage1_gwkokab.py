@@ -113,6 +113,11 @@ def main():
     ap.add_argument("--n-theta-fit", type=int, default=2)
     ap.add_argument("--n-dphi-fit", type=int, default=4)
     ap.add_argument("--out-tag", type=str, default="")
+    ap.add_argument("--load-posterior", type=str, default=None,
+                    help="npz of saved posterior draws (stage1_post_svi*.npz from "
+                         "posterior_stage1_gwkokab.py) to forward-model; skips the "
+                         "PPC's own SVI so the PPD uses the SAME (validated) "
+                         "posterior as the corner")
     args = ap.parse_args()
     print(f"[cfg] n_obs={args.n_obs} n_seed={args.n_seed} k_max={args.k_max} "
           f"n_draws={args.n_draws} n_pred={args.n_pred} det={args.detection}")
@@ -156,44 +161,52 @@ def main():
     obs_pts = np.asarray(obs_true)
     print(f"[cat] events {tuple(events.shape)}; log_rate*={theta_star['log_rate']:.3f}")
 
-    # --- posterior via robust SVI -------------------------------------------
-    import optax
-    from numpyro.infer import SVI, Trace_ELBO
-    from numpyro.infer.autoguide import AutoNormal
-    from numpyro.optim import optax_to_numpyro
+    # --- posterior: reuse the corner's validated draws, or fit our own -------
+    if args.load_posterior:
+        zz = np.load(args.load_posterior, allow_pickle=True)
+        stack = np.stack([np.asarray(zz[p]).ravel() for p in PARAM_NAMES], axis=1)
+        stack = stack[np.all(np.isfinite(stack), axis=1)]
+        print(f"[post] loaded {len(stack)} posterior draws from {args.load_posterior}")
+    else:
+        import optax
+        from numpyro.infer import SVI, Trace_ELBO
+        from numpyro.infer.autoguide import AutoNormal
+        from numpyro.optim import optax_to_numpyro
 
-    variables, variables_index = build_stage1_variables()
-    priors = build_stage1_priors(variables)
-    log_lik_fn = build_coagulation_likelihood(
-        dist_fn=dist_fn, priors=priors, variables=variables,
-        variables_index=variables_index,
-        poisson_mean_estimator=coagulation_poisson_mean_estimator)
-    pmean = {"T_obs": 1.0, "n_quad": args.n_quad}
+        variables, variables_index = build_stage1_variables()
+        priors = build_stage1_priors(variables)
+        log_lik_fn = build_coagulation_likelihood(
+            dist_fn=dist_fn, priors=priors, variables=variables,
+            variables_index=variables_index,
+            poisson_mean_estimator=coagulation_poisson_mean_estimator)
+        pmean = {"T_obs": 1.0, "n_quad": args.n_quad}
 
-    def model():
-        log_lik_fn(events, ln_offsets, pmean)
+        def model():
+            log_lik_fn(events, ln_offsets, pmean)
 
-    print(f"[SVI] {args.svi_steps} steps")
-    guide = AutoNormal(model, init_scale=0.1)
-    optim = optax_to_numpyro(optax.chain(optax.clip_by_global_norm(10.0),
-                                         optax.adam(args.svi_lr)))
-    svi = SVI(model, guide, optim, Trace_ELBO())
-    svi_res = svi.run(k_svi, args.svi_steps, progress_bar=False)
-    post = guide.sample_posterior(k_post, svi_res.params,
-                                  sample_shape=(max(args.n_draws * 4, 400),))
-    # thin to n_draws, keeping finite draws only
-    stack = np.stack([np.asarray(post[p]).ravel() for p in PARAM_NAMES], axis=1)
-    stack = stack[np.all(np.isfinite(stack), axis=1)]
-    if len(stack) == 0:
-        raise SystemExit(
-            "[abort] SVI produced no finite draws — the soft-gate cascade "
-            "NaN'd in the backward pass at this config. Retry with a different "
-            "--seed, lower --svi-lr, or gate=bernoulli (n_seed=300 is the "
-            "known-stable point).")
+        print(f"[SVI] {args.svi_steps} steps")
+        guide = AutoNormal(model, init_scale=0.1)
+        optim = optax_to_numpyro(optax.chain(optax.clip_by_global_norm(10.0),
+                                             optax.adam(args.svi_lr)))
+        svi = SVI(model, guide, optim, Trace_ELBO())
+        svi_res = svi.run(k_svi, args.svi_steps, progress_bar=False)
+        post = guide.sample_posterior(k_post, svi_res.params,
+                                      sample_shape=(max(args.n_draws * 4, 400),))
+        stack = np.stack([np.asarray(post[p]).ravel() for p in PARAM_NAMES], axis=1)
+        stack = stack[np.all(np.isfinite(stack), axis=1)]
+        if len(stack) == 0:
+            raise SystemExit(
+                "[abort] SVI produced no finite draws — the soft-gate cascade "
+                "NaN'd in the backward pass at this config. Retry with a different "
+                "--seed, lower --svi-lr, or gate=bernoulli (n_seed=300 is the "
+                "known-stable point).")
     idx = np.linspace(0, len(stack) - 1, args.n_draws).astype(int)
     draws = stack[idx]
     median_theta = {p: float(np.median(stack[:, i])) for i, p in enumerate(PARAM_NAMES)}
     print(f"[post] {len(stack)} finite draws; forward-modelling {len(draws)}")
+    print("[post] recovered median:",
+          {p: round(median_theta[p], 3) for p in PARAM_NAMES},
+          "| truth:", {p: round(float(theta_star[p]), 3) for p in PARAM_NAMES})
 
     # --- forward-model each posterior draw → predicted component m, χ --------
     m_bins = np.geomspace(fixed["m_min"], 0.7 * m_hi, 41)  # log-spaced for log-x
@@ -239,11 +252,27 @@ def main():
         if d % 10 == 0:
             print(f"   draw {d}/{len(draws)}", flush=True)
 
+    # Central line = MEAN over draws = the pooled / mixture posterior-predictive
+    # density (equal N per draw, so mean-of-densities == pooled density). The
+    # per-bin MEDIAN we used before spuriously SUPPRESSES the peak: when the
+    # pulse centroid varies across posterior draws, at the peak bin most draws
+    # are slightly off-peak, so the median sits far below the true peak even
+    # though every single draw — and the median model — is a sharp pulse. The
+    # 5/95 band still reports the per-draw envelope.
     def band(a):
-        return np.percentile(a, [5, 50, 95], axis=0)
+        return np.percentile(a, [5, 95], axis=0)
 
-    m_lo_, m_med, m_hi_ = band(m_dens)
-    c_lo_, c_med, c_hi_ = band(chi_dens)
+    m_lo_, m_hi_ = band(m_dens)
+    c_lo_, c_hi_ = band(chi_dens)
+    # Central line = the density of the MEDIAN model at large N (the recovered
+    # density itself), pooled over a few realizations for smoothness. This is
+    # unambiguously "the recovered density" — not the per-bin median over draws
+    # (which suppresses a location-varying peak) nor the mixture (which is
+    # broadened by posterior spread).
+    med_vec = jnp.asarray([median_theta[p] for p in PARAM_NAMES])
+    _mk = jax.random.split(jax.random.fold_in(k_pred, 424242), 6)
+    m_med = np.mean([np.asarray(forward_one(med_vec, kk)[0]) for kk in _mk], axis=0)
+    c_med = np.mean([np.asarray(forward_one(med_vec, kk)[1]) for kk in _mk], axis=0)
     obs_m = np.concatenate([obs_pts[:, 0], obs_pts[:, 1]])
     obs_chi = np.concatenate([obs_pts[:, 2], obs_pts[:, 3]])
 
