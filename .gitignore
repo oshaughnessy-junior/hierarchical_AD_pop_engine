@@ -9,3 +9,7 @@ demo/figures/
 demo/figures_*/
 demo/inference/figures_*/
 demo/inference/full_real_catalog.npz
+.claude/
+demo/artifacts/
+demo/artifacts_*/
+demo/**/*.npz
