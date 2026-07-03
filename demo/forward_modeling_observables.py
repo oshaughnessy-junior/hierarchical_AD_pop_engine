@@ -642,7 +642,18 @@ def engine_observables(
     # without producing visible step artefacts in the plots.
     m_min = float(theta["m_min"])
     m_max = float(theta["m_max"])
-    q_bin_edges = jnp.linspace(0.05, 1.0, 51)         # 50 bins on (0.05, 1.0]
+    # Match the plot q-discretization to the SIMULATION discretization: the mass
+    # grid is geomspace, so every achievable mass ratio q = m_j/m_i equals
+    # exp(-k * dln) for integer k (dln = log-mass node spacing). Bin uniformly in
+    # log-q at that spacing -- one bin centred on each achievable ratio -- so no
+    # bin is artificially empty. This is the real fix for the (m1,q) banding
+    # (supersedes the earlier dark-floor cosmetic).
+    _mg = np.asarray(grid.m)
+    _dln = float(np.log(_mg[-1] / _mg[0]) / (_mg.size - 1))
+    _kmax = int(np.ceil(np.log(1.0 / 0.049) / _dln))     # extend down to q ~ 0.05
+    _kedges = np.arange(_kmax + 0.5, -1.0, -1.0)          # descending k -> ascending q
+    _qe = np.exp(-_dln * _kedges); _qe[-1] = min(_qe[-1], 1.0)
+    q_bin_edges = jnp.asarray(_qe)                        # log-uniform, grid-matched
     chi_eff_bin_edges = jnp.linspace(0.0, 1.0, 61)    # 60 bins on [0, 1]
 
     m_ax, q_ax, dC_m1_q = obs.dN_dm1_dq(
