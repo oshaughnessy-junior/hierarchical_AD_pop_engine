@@ -50,14 +50,45 @@ figure.  Each row, panel title, legend entry, and output filename
 includes ``(N_m, N_χ)`` so post-hoc comparison across runs is
 unambiguous.  Default: one baseline pair.
 
-Memory cost
------------
-The engine LIGO-1D path materialises the full 4-D forward-rate tensor
-``(N_m, N_χ, N_m, N_χ)`` once per resolution.  In float64 that is
-``8 · (N_m · N_χ)²`` bytes — ``≈ 210 MB`` at ``(128, 40)``,
-``≈ 13 GB`` at ``(256, 80)``.  Stay at or below ``(128, 40)`` on a
-typical workstation; use a more memory-frugal scatter (``jax.lax.scan``
-over ``m_heavy`` rows) if a 256+-point sweep is needed.
+Memory cost & efficient high-resolution settings  (READ THIS)
+-------------------------------------------------------------
+The 4-D forward-rate tensor ``(N_m, N_χ, N_m, N_χ)`` (``8·(N_m·N_χ)²``
+bytes; only ``≈ 0.3 GB`` at ``(48, 128)``) is *not* the binding cost.
+The *fractal* dN/dχ marginal needs a high spin resolution
+(``N_χ = 64–128``), and there the isotropic run OOMs for two other
+reasons — both n_χ-dominated and both toggled by the ``COAG_LEAN_GAIN``
+env var:
+
+1. **Gain-side F2 χ-out cache** (``orientation_precompute.
+   R_CHI_OUT_DEFAULT = True``): a ``(N_χ,N_m,N_χ,N_m,N_χ)`` surrogate +
+   basis contraction scaling ~``N_χ⁴`` — a single **154 GB** allocation
+   at 24×64.  ``COAG_LEAN_GAIN`` patches ``R_CHI_OUT_DEFAULT = None`` at
+   import so the gain side uses the memory-lean per-Picard-iteration
+   orientation scan instead (F2 is documented bit-equivalent); the solve
+   then sits at a flat **~4–6 GB** for any n_χ.
+2. **The ∂(total_rate)/∂(v_esc) diagnostic** (below): reverse-mode AD
+   through the implicit solve, whose backward pass *stacks* the per-
+   orientation gain-scan residuals — a ``(N_m·N_χ)²·n_quad`` tensor
+   (**2.4 GB** at 24×128×128, several copies).  It is a sanity print, not
+   a plotted observable, so ``COAG_LEAN_GAIN`` skips it.
+
+RECIPE — the isotropic figure at N_χ = 64/128, on ONE 24 GB GPU:
+
+    CUDA_VISIBLE_DEVICES=<free> JAX_PLATFORMS=cuda COAG_LEAN_GAIN=1 \
+        python demo/forward_modeling_observables.py \
+        --orientation isotropic --resolutions 24x128
+
+~4.5 min (24×64) / ~6 min (24×128); host RSS ~2 GB — no cluster needed.
+Do NOT run isotropic high-n_χ on CPU: the F2 path needs >200 GB and even
+lean the CPU solve is ~25× slower.  Higher n_m is cheap now that n_χ is
+tamed (the solve is ``(N_m·N_χ)²``, ~0.3 GB at 48×128) — raise it to
+resolve the mass cascade.  Leave ``COAG_LEAN_GAIN`` UNSET for the
+low-n_χ inference solves that want the F2 speed-up + the gradient check.
+
+Re-plot for a PRD-tiled layout off the saved npz (no engine/MC re-run):
+
+    python demo/plot_fmobs_publication.py \
+        demo/artifacts_fmobs_<hash>_isotropic/cells_<res>.npz
 
 Per [[feedback-perturbative-unreliable-implicit-production]] we use
 ``solver="implicit"`` only; the perturbative path is not exercised.

@@ -117,6 +117,16 @@ from .spin_orientation import Aligned
 # ``N_χ`` (bilinear hats — see :class:`OrientationCache` field
 # docstring).  Set to ``None``/``0`` to skip F2 and fall back to
 # the F1-only path (gain side per-iter scan).
+#
+# HIGH-N_χ MEMORY WARNING: the F2 surrogate + its basis contraction scale
+# ~``N_χ⁴`` and blow up fast — a single ~154 GB allocation at N_m·N_χ=24×64.
+# For isotropic forward runs that need N_χ = 64–128 (e.g. the fractal dN/dχ
+# in ``demo/forward_modeling_observables.py``), set ``R_CHI_OUT_DEFAULT =
+# None`` to use the memory-lean per-Picard-iteration orientation scan (F1
+# only; documented bit-equivalent) — the solve then stays ~4–6 GB and fits
+# a 24 GB GPU.  That demo does exactly this when ``COAG_LEAN_GAIN`` is set;
+# see its module docstring "efficient high-resolution settings" for the full
+# recipe.  Leave ``True`` for the low-N_χ inference solves (F2 is faster there).
 R_CHI_OUT_DEFAULT = True
 
 
