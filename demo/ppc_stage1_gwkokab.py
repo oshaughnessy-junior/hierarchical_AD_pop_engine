@@ -57,8 +57,34 @@ from hierarchical_ad_pop_engine.inference.stage1_wiring import (  # noqa: E402
     build_stage1_priors,
     build_stage1_variables,
 )
+from hierarchical_ad_pop_engine.grids import BinaryGrid  # noqa: E402
+from hierarchical_ad_pop_engine.spin_orientation import Isotropic, Fisher  # noqa: E402
+
+# COAG_LEAN_GAIN patch (only matters for solver="implicit"; harmless for mc_jax)
+import os as _os  # noqa: E402
+if _os.environ.get("COAG_LEAN_GAIN"):
+    import hierarchical_ad_pop_engine.orientation_precompute as _op  # noqa: E402
+    import hierarchical_ad_pop_engine.response.implicit as _imp  # noqa: E402
+    _op.R_CHI_OUT_DEFAULT = None
+    _imp.R_CHI_OUT_DEFAULT = None
 
 PARAM_NAMES = fit.PARAM_NAMES
+
+
+def _build_orientation(spec, n_theta=None, n_dphi=None):
+    extra = {}
+    if n_theta is not None:
+        extra["n_theta"] = int(n_theta)
+    if n_dphi is not None:
+        extra["n_dphi"] = int(n_dphi)
+    s = str(spec).strip().lower()
+    if s in ("aligned", "a"):
+        return None
+    if s in ("isotropic", "iso", "i"):
+        return Isotropic.default(**extra)
+    if s.startswith("fisher:"):
+        return Fisher.default(kappa=float(s.split(":", 1)[1]), **extra)
+    raise ValueError(f"bad --orientation {spec!r}")
 
 
 def main():
@@ -78,6 +104,15 @@ def main():
     ap.add_argument("--gate", choices=["soft", "bernoulli"], default="soft",
                     help="cascade K-gate; bernoulli (B.1) is more SVI-robust")
     ap.add_argument("--seed", type=int, default=20260530)
+    ap.add_argument("--orientation", type=str, default="aligned",
+                    help="aligned | isotropic | fisher:<kappa>")
+    ap.add_argument("--solver", type=str, default="mc_jax",
+                    choices=("mc_jax", "implicit"))
+    ap.add_argument("--n-chi-fit", type=int, default=None)
+    ap.add_argument("--n-m-fit", type=int, default=None)
+    ap.add_argument("--n-theta-fit", type=int, default=2)
+    ap.add_argument("--n-dphi-fit", type=int, default=4)
+    ap.add_argument("--out-tag", type=str, default="")
     args = ap.parse_args()
     print(f"[cfg] n_obs={args.n_obs} n_seed={args.n_seed} k_max={args.k_max} "
           f"n_draws={args.n_draws} n_pred={args.n_pred} det={args.detection}")
@@ -87,17 +122,24 @@ def main():
     vt_fn = vt_powerlaw() if args.detection == "vt" else None
 
     # --- setup: dist_fn, calibrated θ*, self-consistent observed catalogue ---
-    fit_grid = demo._grid_for_fit()
+    if args.n_chi_fit is None and args.n_m_fit is None:
+        fit_grid = demo._grid_for_fit()
+    else:
+        fit_grid = BinaryGrid.default(
+            m_min=fixed["m_min"], m_max=fixed["m_max"],
+            n_m=args.n_m_fit or demo.N_M_FIT, n_chi=args.n_chi_fit or demo.N_CHI_FIT)
     demo.build_truth_model_and_calibrate_rate(args.n_obs, grid=fit_grid)
     demo.THETA_STAR["natal_spin_loc"] = 0.05
     theta_star = dict(demo.THETA_STAR)
+    orientation = _build_orientation(args.orientation, args.n_theta_fit, args.n_dphi_fit)
 
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat, k_svi, k_post, k_pred = jax.random.split(key, 5)
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
-        depletion_fraction=0.10, gate=args.gate, grid=fit_grid, mc_jax_key=k_mc)
+        depletion_fraction=0.10, gate=args.gate, grid=fit_grid, mc_jax_key=k_mc,
+        solver=args.solver, orientation=orientation)
 
     probe = dist_fn(**{**theta_star, "log_rate": 0.0})
     mu_unit, _ = coagulation_poisson_mean_estimator(probe, T_obs=1.0, n_quad=args.n_quad)

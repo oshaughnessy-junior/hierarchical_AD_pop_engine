@@ -286,6 +286,12 @@ def main():
     svi_post = guide.sample_posterior(
         k_post, svi_res.params, sample_shape=(args.svi_draws,))
     _report("SVI", svi_post)
+    # Save the posterior draws + truth so runs can be overlaid later
+    # (e.g. measurement vs delta) without re-fitting.
+    np.savez(_DEMO / "figures" / f"stage1_post_svi{args.out_tag}.npz",
+             param_names=np.array(PARAM_NAMES),
+             theta_star=np.array([float(theta_star[p]) for p in PARAM_NAMES]),
+             **{p: np.asarray(svi_post[p]).ravel() for p in PARAM_NAMES})
     _pairs_figure(svi_post, theta_star,
                   _DEMO / "figures" / f"stage1_posterior_svi{args.out_tag}.png")
 
