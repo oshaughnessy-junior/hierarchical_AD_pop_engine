@@ -63,8 +63,12 @@ def gw_dm2(m2grid, rng, ndraw=400, nsamp=20000):
     dm2 = np.empty((len(draws), len(m2grid)))
     dm = m2grid[1] - m2grid[0]; edges = np.concatenate([m2grid - dm / 2, [m2grid[-1] + dm / 2]])
     for j, d in enumerate(draws):
+        # dR/dm2 must integrate to the SAME total rate as dR/dm1, so scale the
+        # (shape-only) histogram by this draw's total rate. Previously density=True
+        # returned a PDF (int=1), leaving GWTC-5 dR/dm2 ~18x below its own dR/dm1.
+        Rtot = np.trapezoid(np.clip(r1[d], 0, None), x1)
         m1s = isample(x1, r1[d], nsamp); qs = np.clip(isample(xq, rq[d], nsamp), 1e-3, 1.0)
-        h2, _ = np.histogram(qs * m1s, edges, density=True); dm2[j] = h2
+        h2, _ = np.histogram(qs * m1s, edges, density=True); dm2[j] = h2 * Rtot
     return np.nanpercentile(dm2, [5, 50, 95], axis=0)
 
 

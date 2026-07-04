@@ -32,10 +32,30 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from matplotlib.ticker import FixedLocator, NullLocator, ScalarFormatter
 
 ENGINE_C = "#1f5fbf"   # implicit Picard engine — solid blue
 MC_C = "#1a9850"       # particle MC k-NN KDE — dashed green
 MC_RAW_C = "#9ecae1"   # MC raw histogram — faint
+
+# Mass-axis range/ticks to match the GWTC-5 population paper Fig. 1
+# (arXiv:2605.27226): log mass axis over ~3-100 Msun with plain decade labels.
+MASS_LIM = (3.0, 100.0)
+MASS_TICKS = (3, 5, 10, 30, 100)
+
+
+def _set_log_mass_axis(ax, which="x"):
+    """Apply the shared log mass-axis styling (range + plain decade ticks)."""
+    set_scale = ax.set_xscale if which == "x" else ax.set_yscale
+    set_lim = ax.set_xlim if which == "x" else ax.set_ylim
+    axis = ax.xaxis if which == "x" else ax.yaxis
+    set_scale("log")
+    set_lim(*MASS_LIM)
+    axis.set_major_locator(FixedLocator(MASS_TICKS))
+    axis.set_minor_locator(NullLocator())
+    fmt = ScalarFormatter()
+    fmt.set_scientific(False)
+    axis.set_major_formatter(fmt)
 
 
 def _jensen_shannon(x_a, p_a, x_b, p_b, n=512):
@@ -73,7 +93,9 @@ def _line_panel(ax, d, key, *, xlabel, ylabel, title, logx, js_store=None):
     ax.plot(ex, ey, color=ENGINE_C, lw=1.8, label="engine (implicit)", zorder=4)
     ax.set_yscale("log")
     if logx:
-        ax.set_xscale("log")
+        # logx is only ever set for the mass panels (src_m, m1); style them to
+        # match the GWTC-5 population paper Fig. 1 (log mass, 3-100 Msun).
+        _set_log_mass_axis(ax, which="x")
     # Clip the log-y range to ~6 decades below the engine peak.  The fractal
     # spin marginals dip to numerical zero between self-similar spikes and the
     # MC raw-histogram has empty bins; without a floor those crush the visible
@@ -112,7 +134,10 @@ def _joint_panel(ax, d, key, *, xlabel, ylabel, title):
         if levels.size >= 1:
             ax.contour(x_c, y_c, mc.T, levels=levels, colors="white",
                        linewidths=0.7, alpha=0.85)
-    ax.set_xscale("log")
+    # x is always m1 [Msun] for the two joint panels this is called on; style
+    # to match the GWTC-5 population paper Fig. 1 (log mass, 3-100 Msun).
+    # y (q or chi_eff) is not a mass axis and is left untouched.
+    _set_log_mass_axis(ax, which="x")
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title, fontsize=9)

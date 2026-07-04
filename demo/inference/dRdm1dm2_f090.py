@@ -73,8 +73,8 @@ def main():
         print(f"[pool] {m1.size} events (cached); m1 med {np.median(m1):.1f}, m2 med {np.median(m2):.1f}")
 
     # rate-weighted KDE in log10 mass, evaluated on a LINEAR (m1,m2) grid, then
-    # converted to the density per (m1,m2). GWTC-5 Fig.1 style: linear axes, blue
-    # lower triangle (m2<=m1), rate density colorbar.
+    # converted to the density per (m1,m2). GWTC-5 pop-paper Fig.1 style: LOG mass
+    # axes (3-100 Msun), blue lower triangle (m2<=m1), rate density colorbar.
     # weighted -> equal-weight resample keeps the KDE fast (and scipy-version
     # independent); the rate scale is restored by the absolute calibration below.
     ok = np.isfinite(m1) & np.isfinite(m2) & (w > 0) & (m1 > 0) & (m2 > 0)
@@ -82,7 +82,7 @@ def main():
     rng = np.random.default_rng(0)
     N = min(20000, m1.size); ridx = rng.choice(m1.size, N, p=w / w.sum())
     kde = gaussian_kde(np.vstack([np.log10(m1[ridx]), np.log10(m2[ridx])]), bw_method=0.11)
-    gm = np.linspace(3.0, 95.0, 200)
+    gm = np.logspace(np.log10(3.0), np.log10(100.0), 200)      # LOG-spaced mass grid
     M1g, M2g = np.meshgrid(gm, gm)                 # X = m1 (axis 1), Y = m2 (axis 0)
     plog = kde(np.vstack([np.log10(M1g).ravel(), np.log10(M2g).ravel()])).reshape(M1g.shape)
     dR = plog / (M1g * M2g * np.log(10.0) ** 2)    # density per (m1, m2)
@@ -94,8 +94,8 @@ def main():
     # so it integrates to R0 over the physical (m1,m2) plane.
     import vt_calibration as V
     R0 = V.rate_R0(V.mass_density_from_samples(m1, m2, w))
-    dm = gm[1] - gm[0]
-    I2 = np.nansum(np.where(np.isfinite(dR), dR, 0.0)) * dm * dm     # int dR dm1 dm2 (m2<=m1)
+    dR_pos = np.where(np.isfinite(dR), dR, 0.0)
+    I2 = np.trapezoid(np.trapezoid(dR_pos, gm, axis=0), gm)          # int dR dm1 dm2 (log grid)
     dR = dR * (R0 / I2)
     print(f"[vt] self-calibrated R0={R0:.4g} Gpc^-3 yr^-1 (kappa={V.KAPPA_LVK}); 2D integrates to R0")
 
@@ -106,8 +106,13 @@ def main():
                         cmap="Blues", shading="gouraud", rasterized=True)
     ax.contour(gm, gm, dR, levels=vmax * np.array([1e-2, 1e-1, 0.5]),
                colors="0.25", linewidths=0.7, alpha=0.6)
-    ax.plot([3, 95], [3, 95], ls="--", color="0.5", lw=0.9, alpha=0.7)
-    ax.set_xlim(3, 95); ax.set_ylim(3, 95)
+    ax.plot([3, 100], [3, 100], ls="--", color="0.5", lw=0.9, alpha=0.7)
+    from matplotlib.ticker import ScalarFormatter, NullFormatter
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlim(3, 100); ax.set_ylim(3, 100)
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_formatter(ScalarFormatter()); axis.set_minor_formatter(NullFormatter())
+    ax.set_xticks([3, 5, 10, 30, 100]); ax.set_yticks([3, 5, 10, 30, 100])
     ax.set_aspect("equal")
     ax.set_xlabel(r"$m_1\ [M_\odot]$"); ax.set_ylabel(r"$m_2\ [M_\odot]$")
     ax.set_title(r"Coagulation merger-rate density $dR/dm_1\,dm_2$, $f_{\rm dep}=0.9$")
