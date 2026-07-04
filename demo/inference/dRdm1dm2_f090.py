@@ -88,20 +88,16 @@ def main():
     dR = plog / (M1g * M2g * np.log(10.0) ** 2)    # density per (m1, m2)
     dR = np.where(M2g <= M1g, dR, np.nan)          # physical region m2 <= m1
 
-    # ABSOLUTE-RATE CALIBRATION (real Gpc^-3 yr^-1 Msun^-2, no arbitrary norm):
-    # the model weights carry only a relative rate scale (the internal log_R is fit
-    # against a dimensionless pdet, not a VT), so -- exactly as marginal_ppd.py does
-    # for the 1D marginals -- we set the absolute scale by matching the model's own
-    # m1-marginal to the GWTC-5.0 intrinsic dR/dm1 integrated rate over [5,80] Msun.
-    # Integrating the calibrated 2D over m2 then reproduces that real dR/dm1, so the
-    # 2D density is in genuine Gpc^-3 yr^-1 Msun^-2.
-    dRdm1_model = np.trapezoid(np.where(np.isfinite(dR), dR, 0.0), gm, axis=0)  # int over m2
-    gx1, gmed1 = gw_mass1_median()
-    sg = (gx1 >= 5) & (gx1 <= 80); sm = (gm >= 5) & (gm <= 80)
-    sc = np.trapezoid(gmed1[sg], gx1[sg]) / np.trapezoid(dRdm1_model[sm], gm[sm])
-    dR = dR * sc
-    print(f"[abs-rate] GWTC-5 anchor sc={sc:.3e}; "
-          f"model R([5,80], dm1)={np.trapezoid(dRdm1_model[sm], gm[sm])*sc:.3g} Gpc^-3 yr^-1")
+    # ABSOLUTE RATE (real Gpc^-3 yr^-1 Msun^-2, NO GWTC-5 anchor): the model's own
+    # z=0 rate R0 is self-calibrated from the O3+O4a+O4b injection VT
+    # (vt_calibration, validated to ~20% on a GWTC-5 self-test). Scale the 2D density
+    # so it integrates to R0 over the physical (m1,m2) plane.
+    import vt_calibration as V
+    R0 = V.rate_R0(V.mass_density_from_samples(m1, m2, w))
+    dm = gm[1] - gm[0]
+    I2 = np.nansum(np.where(np.isfinite(dR), dR, 0.0)) * dm * dm     # int dR dm1 dm2 (m2<=m1)
+    dR = dR * (R0 / I2)
+    print(f"[vt] self-calibrated R0={R0:.4g} Gpc^-3 yr^-1 (kappa={V.KAPPA_LVK}); 2D integrates to R0")
 
     vmax = np.nanmax(dR); vmin = vmax * 1e-3
 

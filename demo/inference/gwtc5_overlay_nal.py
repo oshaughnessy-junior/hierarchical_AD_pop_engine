@@ -55,6 +55,7 @@ def main():
     rng = np.random.default_rng(3)
     base_key = jax.random.PRNGKey(int(args.mc_key))
     dR_t, dR_A, dR_B, pce, pa, pct = [], [], [], [], [], []
+    poolm1, poolm2, poolw = [], [], []          # pooled population for the injection-VT rate
     for j, i in enumerate(idx):
         # independent MC realization per draw, rotating BOTH keys: the pairing
         # SAMPLER_KEY (Monte-Carlo noise) and the natal PROPOSAL_KEY (the heavy-tail
@@ -67,7 +68,10 @@ def main():
         th = {k: float(post[k][i]) for k in KS}
         s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))     # rate weights
         isA = np.zeros(len(s), bool); isA[:nA] = True
-        m1 = np.maximum(s[:, 0], s[:, 1]); a1 = np.abs(s[:, 2]); a2 = np.abs(s[:, 3])
+        m1 = np.maximum(s[:, 0], s[:, 1]); m2 = np.minimum(s[:, 0], s[:, 1])
+        a1 = np.abs(s[:, 2]); a2 = np.abs(s[:, 3])
+        _ok = np.isfinite(m1) & np.isfinite(m2) & (w > 0)
+        poolm1.append(m1[_ok]); poolm2.append(m2[_ok]); poolw.append(w[_ok])
         ct = rng.uniform(-1, 1, (len(s), 2))
         cos1 = np.where(isA, ct[:, 0], 1.0); cos2 = np.where(isA, ct[:, 1], 1.0)  # B aligned
         chie = (s[:, 0] * a1 * cos1 + s[:, 1] * a2 * cos2) / (s[:, 0] + s[:, 1])
@@ -87,9 +91,15 @@ def main():
     dR_t, dR_A, dR_B = map(lambda z: np.array(z), (dR_t, dR_A, dR_B))
 
     x_m, (mlo, mmd, mhi) = gw(gw_def, "mass_1")
-    sel = (x_m >= 5) & (x_m <= 80); gw_int = np.trapezoid(mmd[sel], x_m[sel])
-    mod_int = np.trapezoid(np.median(dR_t, 0)[(m1g >= 5) & (m1g <= 80)], m1g[(m1g >= 5) & (m1g <= 80)])
-    sc = gw_int / mod_int; dR_t *= sc; dR_A *= sc; dR_B *= sc
+    # ABSOLUTE rate: self-calibrated z=0 total rate R0 from the injection VT
+    # (vt_calibration, validated), NOT a GWTC-5 anchor. Scale the channel curves so
+    # the median TOTAL dR/dm1 integrates to R0; the A/B split keeps its rate share.
+    import vt_calibration as V
+    R0 = V.rate_R0(V.mass_density_from_samples(np.concatenate(poolm1),
+                                               np.concatenate(poolm2), np.concatenate(poolw)))
+    mod_int = np.trapezoid(np.median(dR_t, 0), m1g)
+    sc = R0 / mod_int; dR_t *= sc; dR_A *= sc; dR_B *= sc
+    print(f"[vt] self-calibrated R0={R0:.4g} Gpc^-3 yr^-1 (kappa={V.KAPPA_LVK})")
 
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))

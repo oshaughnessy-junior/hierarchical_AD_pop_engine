@@ -17,6 +17,7 @@ M = pl.M
 M.ISOTROPIC_SPIN = False
 from mass_pdet_interp import make_real_pdet_fn
 from spin_mass_trend import kernel_quantiles
+import vt_calibration as V
 KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
 ROOT = "/home/richard.oshaughnessy/coag_container"
 SHOW = [(0.30, "figures_nal_f030"), (0.60, "figures_nal_f060"), (0.90, "figures_nal_f090"), (1.20, "figures_nal_f120")]
@@ -54,7 +55,7 @@ def main():
         post = np.load(os.path.join(ROOT, d, "two_channel_pl_post.npz"))
         M.F_DEP = fdep
         n = len(post["m_max_A"]); didx = np.linspace(0, n - 1, min(args.n_draw, n)).astype(int)
-        m1L, aL, wL = [], [], []
+        m1L, m2L, aL, wL = [], [], [], []
         for dj, di in enumerate(didx):
             # fresh natal PROPOSAL seeds AND pairing key per draw, then rebuild the
             # sampler: the heavy-tail seeds are otherwise ONE fixed finite set shared
@@ -68,13 +69,18 @@ def main():
             th = {k: float(post[k][di]) for k in KS}
             s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
             m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
-            prim = m0 >= m1c; m1i = np.where(prim, m0, m1c); ai = np.abs(np.where(prim, c0, c1))
+            prim = m0 >= m1c; m1i = np.where(prim, m0, m1c); m2i = np.where(prim, m1c, m0)
+            ai = np.abs(np.where(prim, c0, c1))
             ok = np.isfinite(m1i) & (w > 0)
-            m1L.append(m1i[ok]); aL.append(ai[ok]); wL.append(w[ok] / len(didx))
-        m1 = np.concatenate(m1L); a_prim = np.concatenate(aL); w = np.concatenate(wL)
-        dR = gaussian_kde(m1, weights=w, bw_method=0.08)(m1g)   # intrinsic (match GWTC-5)
-        sel = (gx >= 5) & (gx <= 80); selm = (m1g >= 5) & (m1g <= 80)
-        dR *= np.trapezoid(gr[sel], gx[sel]) / np.trapezoid(dR[selm], m1g[selm])
+            m1L.append(m1i[ok]); m2L.append(m2i[ok]); aL.append(ai[ok]); wL.append(w[ok] / len(didx))
+        m1 = np.concatenate(m1L); m2 = np.concatenate(m2L); a_prim = np.concatenate(aL); w = np.concatenate(wL)
+        # self-calibrated z=0 rate for THIS cascade brightness (injection VT); each
+        # F_dep gets its OWN rate -- a brighter cascade shifts detectability, so the
+        # curves need not share a normalization (unlike the earlier GWTC-5 anchor).
+        R0 = V.rate_R0(V.mass_density_from_samples(m1, m2, w))
+        p1 = np.clip(gaussian_kde(m1, weights=w, bw_method=0.08)(m1g), 0, None)
+        dR = R0 * p1 / np.trapezoid(p1, m1g)
+        print(f"  F_dep={fdep}: self-calibrated R0={R0:.4g} Gpc^-3 yr^-1")
         ax[0].plot(m1g, dR, color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
         aq = kernel_quantiles(m1, a_prim, w, grid, 6.0, [0.5])
         ax[1].plot(grid, aq[:, 0], color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")

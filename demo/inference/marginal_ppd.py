@@ -142,15 +142,21 @@ def main():
     fig.tight_layout(); f1 = os.path.join(OUT, "real_spin_ppd_massregions.png"); fig.savefig(f1, dpi=140, bbox_inches="tight"); print("wrote", f1)
 
     # ---- Figure 2: intrinsic dR/dm1 AND dR/dm2 marginalized vs GWTC-5.0 ----
+    # ABSOLUTE rate: NO GWTC-5 anchor. The model's own z=0 rate R0 is self-calibrated
+    # from the O3+O4a+O4b injection VT (vt_calibration, validated to ~20% on a GWTC-5
+    # self-test), then dR/dm = R0 * (normalized mass marginal). GWTC-5 is overlaid only
+    # to compare SHAPE -- if the curves also agree in HEIGHT that is an independent
+    # rate cross-check, not an imposed normalization.
+    import vt_calibration as V
     mg = np.linspace(3, 100, 120)
-    def norm_to(model_curve, gx, gmed):
-        sel = (gx >= 5) & (gx <= 80); selm = (mg >= 5) & (mg <= 80)
-        return model_curve * np.trapezoid(gmed[sel], gx[sel]) / np.trapezoid(model_curve[selm], mg[selm])
-    dR1 = norm_to(gaussian_kde(m1, weights=wi, bw_method=0.08)(mg), *gw("mass_1")[::2])
-    dR2 = gaussian_kde(m2, weights=wi, bw_method=0.08)(mg)
+    R0 = V.rate_R0(V.mass_density_from_samples(m1, m2, wi))
+    print(f"  [vt] self-calibrated R0 = {R0:.4g} Gpc^-3 yr^-1  (kappa={V.KAPPA_LVK}, n_obs={V.N_OBS})")
+    def dRdm(x):
+        p = np.clip(gaussian_kde(x, weights=wi, bw_method=0.08)(mg), 0, None)
+        return R0 * p / np.trapezoid(p, mg)
+    dR1, dR2 = dRdm(m1), dRdm(m2)
     gx1, glo1, gmed1, ghi1 = gw("mass_1")
     g2lo, g2med, g2hi = gw_dm2(mg, rng)
-    dR2 = dR2 * np.trapezoid(g2med[(mg >= 5) & (mg <= 80)], mg[(mg >= 5) & (mg <= 80)]) / np.trapezoid(dR2[(mg >= 5) & (mg <= 80)], mg[(mg >= 5) & (mg <= 80)])
 
     def logslope(g, y, a=30, b=55):
         m = (g >= a) & (g <= b) & (y > 0)
