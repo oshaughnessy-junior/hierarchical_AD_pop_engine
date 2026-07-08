@@ -123,6 +123,10 @@ def main():
     p.add_argument("--real-pdet", action="store_true")
     p.add_argument("--pdet-grid", default="/home/richard.oshaughnessy/coag_container/vt_data/mass_pdet_grid.npz")
     p.add_argument("--checkpoint-dir", default=None)
+    p.add_argument("--fix-alpha-a", type=float, default=None,
+                   help="pin the natal interior slope alpha_A to this value (not sampled); "
+                        "with the corrected selection grid the free alpha rails at ~flat, so "
+                        "the headline run fixes alpha_A=0 (flat natal, cascade-set high mass)")
     p.add_argument("--chunk", type=int, default=25)
     p.add_argument("--outdir", default=os.path.join(_HERE, "figures_two_channel_pl"))
     args = p.parse_args()
@@ -177,15 +181,26 @@ def main():
     from gwkokab.inference.numpyro_sampled_poisson_likelihood import numpyro_sampled_poisson_likelihood
     from gwkokab.models.utils import JointDistribution
     variables = {
-        "alpha_A": dist.Uniform(1.5, 6.0), "m_max_A": dist.Uniform(40.0, 70.0),
+        # alpha_A widened DOWN to 0 (flat) to un-rail the old 1.5 floor: the corrected
+        # selection grid wants a shallower natal INTERIOR slope, and physically it can be
+        # ~flat since the observed high-mass population is reprocessed by the cascade, not
+        # set by the natal power law. Lower bound kept at 0 (not negative) -- a RISING
+        # natal (alpha<0) is unphysical AND makes the cascade MC top-heavy/slow (a -1,6
+        # run ground for 20h). (ROS 2026-07-04)
+        "alpha_A": dist.Uniform(0.0, 3.0), "m_max_A": dist.Uniform(40.0, 70.0),
         "spin_chi": dist.Uniform(0.01, 0.3),
         "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(0.5, 3.0),   # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
         "log_R_A": dist.Uniform(logr0 - 3, logr0 + 3), "log_R_B": dist.Uniform(logr0 - 3, logr0 + 3)}
+    # optionally PIN alpha_A (move it from sampled `variables` to `constant_params`)
+    constants = {}
+    if args.fix_alpha_a is not None:
+        constants["alpha_A"] = float(args.fix_alpha_a); del variables["alpha_A"]
+        print(f"FIXED alpha_A = {args.fix_alpha_a} (natal interior slope pinned, not sampled)")
     names = sorted(variables)
     priors = JointDistribution(*[variables[k] for k in names])
     kw = dict(init_strategy=init_to_median, max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
-    model = numpyro_sampled_poisson_likelihood(comb, priors, variables, {}, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
+    model = numpyro_sampled_poisson_likelihood(comb, priors, variables, constants, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
     if args.checkpoint_dir:
         from gwkokab.inference import run_nuts_with_checkpoints
         print(f"CHECKPOINT-SAFE: {args.checkpoint_dir} chunk={args.chunk}")
@@ -195,6 +210,10 @@ def main():
     else:
         mcmc = MCMC(NUTS(model, **kw), num_warmup=args.num_warmup, num_samples=args.num_samples, progress_bar=True)
         mcmc.run(jax.random.PRNGKey(0), jnp.asarray(M.T_OBS)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
+    # re-insert any pinned constant as a constant "posterior" column so downstream
+    # readers (figures, vt_calibration) that expect all 9 params still work.
+    for k, v in constants.items():
+        post[k] = np.full_like(post["m_max_A"], float(v))
     print("\nPOWER-LAW two-channel recovery:")
     for k in names:
         tag = "" if REAL else f"  [{TRUTH[k]:.3f}]"
