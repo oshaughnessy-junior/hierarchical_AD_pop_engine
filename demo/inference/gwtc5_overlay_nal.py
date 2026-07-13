@@ -10,7 +10,7 @@ Recovered intrinsic coagulation population vs the GWTC-5.0 inferred population:
     high-mass chi_eff is SUPPORTED by the per-event data (cf. the PPC); this
     panel additionally compares it to GWTC-5.0's own parametric population fit.
 
-  python gwtc5_overlay_nal.py   # defaults to figures_nal_f060, f_dep=0.6
+  python gwtc5_overlay_nal.py   # defaults to figures_nal_f090_fa0w, f_dep=0.9 (flat-natal headline)
 """
 import argparse, importlib.util, os, glob, numpy as np, h5py
 import jax, jax.numpy as jnp
@@ -34,8 +34,8 @@ def gw(path, param):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f060/two_channel_pl_post.npz")
-    p.add_argument("--f-dep", type=float, default=0.60)
+    p.add_argument("--post", default="/home/richard.oshaughnessy/coag_container/figures_nal_f090_fa0w/two_channel_pl_post.npz")
+    p.add_argument("--f-dep", type=float, default=0.90)
     p.add_argument("--n-seed", type=int, default=8000)
     p.add_argument("--n-b", type=int, default=6000)
     p.add_argument("--n-draw", type=int, default=64)
@@ -124,7 +124,7 @@ def main():
     overlay(ax[0, 1], *gw(gw_chi, "chi_eff"), ceg, np.array(pce), r"$\chi_{\rm eff}$", "Effective spin")
     overlay(ax[1, 0], *gw(gw_def, "a_1"), ag, np.array(pa), r"$a$ (spin magnitude)", "Spin magnitude (A: natal + 2g $\\sim$0.7)")
     overlay(ax[1, 1], *gw(gw_def, "cos_tilt_1"), ctg, np.array(pct), r"$\cos\theta$", "Spin tilt (A isotropic + B aligned)")
-    fig.suptitle(r"Free-$m_{\max}$ NAL fit ($F_{\rm dep}=0.6$) vs GWTC-5.0: mass ($\log\,dR/dm_1$) and spin", fontsize=12)
+    fig.suptitle(r"Free-$m_{\max}$ NAL fit ($F_{\rm dep}=0.9$, flat natal $\alpha_A=0$) vs GWTC-5.0: mass ($\log\,dR/dm_1$) and spin", fontsize=12)
     fig.tight_layout(); fig.savefig(args.out, dpi=140, bbox_inches="tight"); print("wrote", args.out)
 
 

@@ -16,13 +16,15 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
-LAB = [r"$\alpha_A$", r"$m_{\max}$", r"$\sigma_\chi$", r"$\mu_B$", r"$\sigma_B$",
+# alpha_A is a fixed constant (flat natal, alpha_A=0) in the headline fits, so it
+# has zero posterior variance and cannot be contoured -- omit it from the overlay.
+KS = ["m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
+LAB = [r"$m_{\max}$", r"$\sigma_\chi$", r"$\mu_B$", r"$\sigma_B$",
        r"$\mu_{\chi_{\rm eff}B}$", r"$\sigma_{\chi_{\rm eff}B}$", r"$\log R_A$", r"$\log R_B$"]
 # (F_dep, run-dir) over the profiled grid; missing dirs are skipped
-RUNS = [(0.10, "figures_nal_f010"), (0.30, "figures_nal_f030"), (0.50, "figures_nal_f050b"),
-        (0.60, "figures_nal_f060"), (0.70, "figures_nal_f070"), (0.90, "figures_nal_f090"),
-        (1.20, "figures_nal_f120")]
+RUNS = [(0.30, "figures_nal_f030_fa0w"), (0.60, "figures_nal_f060_fa0w"), (0.70, "figures_nal_f070_fa0w"),
+        (0.80, "figures_nal_f080_fa0w"), (0.90, "figures_nal_f090_fa0w"), (1.00, "figures_nal_f100_fa0w"),
+        (1.20, "figures_nal_f120_fa0w")]
 
 
 def main():

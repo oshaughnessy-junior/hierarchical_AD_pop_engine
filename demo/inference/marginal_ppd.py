@@ -25,8 +25,8 @@ M.ISOTROPIC_SPIN = False
 from mass_pdet_interp import make_real_pdet_fn
 KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
 ROOT = "/home/richard.oshaughnessy/coag_container"
-RUNS = {0.60: "figures_nal_f060", 0.70: "figures_nal_f070", 0.80: "figures_nal_f080",
-        0.90: "figures_nal_f090", 1.00: "figures_nal_f100", 1.20: "figures_nal_f120"}
+RUNS = {0.60: "figures_nal_f060_fa0w", 0.70: "figures_nal_f070_fa0w", 0.80: "figures_nal_f080_fa0w",
+        0.90: "figures_nal_f090_fa0w", 1.00: "figures_nal_f100_fa0w", 1.20: "figures_nal_f120_fa0w"}
 PDIR = "gwk-hierarchical-initial/paper/figures"
 OUT = f"/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/{PDIR}"
 

@@ -25,9 +25,9 @@ from mass_pdet_interp import make_real_pdet_fn
 KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
 # (f_dep, posterior dir) -- edit as new brightness points land
 RUNS_DEFAULT = [
-    (0.10, "figures_nal_f010"), (0.30, "figures_nal_f030"), (0.50, "figures_nal_f050b"),
-    (0.60, "figures_nal_f060"), (0.70, "figures_nal_f070"), (0.80, "figures_nal_f080"),
-    (0.90, "figures_nal_f090"), (1.00, "figures_nal_f100"), (1.20, "figures_nal_f120"),
+    (0.30, "figures_nal_f030_fa0w"), (0.60, "figures_nal_f060_fa0w"), (0.70, "figures_nal_f070_fa0w"),
+    (0.80, "figures_nal_f080_fa0w"), (0.90, "figures_nal_f090_fa0w"), (1.00, "figures_nal_f100_fa0w"),
+    (1.20, "figures_nal_f120_fa0w"),
 ]
 EDGES = np.array([4, 8, 12, 18, 25, 32, 40, 55, 80])
 

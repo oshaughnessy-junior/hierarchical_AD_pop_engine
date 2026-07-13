@@ -128,7 +128,23 @@ def main():
                         "with the corrected selection grid the free alpha rails at ~flat, so "
                         "the headline run fixes alpha_A=0 (flat natal, cascade-set high mass)")
     p.add_argument("--chunk", type=int, default=25)
+    p.add_argument("--log-r-width", type=float, default=3.0,
+                   help="half-width of the log_R_A/log_R_B Uniform priors about logr0=log(n_obs/T_obs/2). "
+                        "Default 3 (=exp(3)~=20x). Widen (e.g. 6) for the flat-natal + corrected-grid fits: "
+                        "the under-detectable heavy natal population drives the rate MLE (mu=n_obs) above the "
+                        "logr0+3 ceiling, so log_R rails and the count is under-predicted. A wider ceiling lets "
+                        "log_R reach mu=n_obs (rate absorbs the low detectability; absolute R0 still from vt_calibration).")
     p.add_argument("--outdir", default=os.path.join(_HERE, "figures_two_channel_pl"))
+    p.add_argument("--max-wall-s", type=float, default=None,
+                   help="exit-driven checkpointing: wall-clock budget (s) per process. After a "
+                        "checkpoint that leaves work remaining, if elapsed > this, exit with "
+                        "--checkpoint-exit-code so HTCondor spools the checkpoint and restarts "
+                        "(resumes from nuts_ckpt.pkl). Robust to hard evictions, unlike relying on "
+                        "ON_EXIT_OR_EVICT. Default None = run to completion in one process. "
+                        "Requires --checkpoint-dir.")
+    p.add_argument("--checkpoint-exit-code", type=int, default=85,
+                   help="exit code emitted on an exit-driven checkpoint (must match the sub's "
+                        "checkpoint_exit_code); only used when --max-wall-s is set.")
     args = p.parse_args()
     M.F_DEP = args.f_dep
     comb, nA = make_combined_pl(args.n_seed, args.n_b)
@@ -191,7 +207,8 @@ def main():
         "spin_chi": dist.Uniform(0.01, 0.3),
         "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(0.5, 3.0),   # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
-        "log_R_A": dist.Uniform(logr0 - 3, logr0 + 3), "log_R_B": dist.Uniform(logr0 - 3, logr0 + 3)}
+        "log_R_A": dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width),
+        "log_R_B": dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width)}
     # optionally PIN alpha_A (move it from sampled `variables` to `constant_params`)
     constants = {}
     if args.fix_alpha_a is not None:
@@ -202,11 +219,19 @@ def main():
     kw = dict(init_strategy=init_to_median, max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
     model = numpyro_sampled_poisson_likelihood(comb, priors, variables, constants, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
     if args.checkpoint_dir:
-        from gwkokab.inference import run_nuts_with_checkpoints
-        print(f"CHECKPOINT-SAFE: {args.checkpoint_dir} chunk={args.chunk}")
-        post = run_nuts_with_checkpoints(model, (jnp.asarray(M.T_OBS),), num_warmup=args.num_warmup,
-                                         num_samples=args.num_samples, key=jax.random.PRNGKey(0),
-                                         ckpt_dir=args.checkpoint_dir, chunk=args.chunk, nuts_kwargs=kw)
+        import sys
+        from gwkokab.inference import run_nuts_with_checkpoints, CheckpointExit
+        print(f"CHECKPOINT-SAFE: {args.checkpoint_dir} chunk={args.chunk}"
+              + (f" max_wall_s={args.max_wall_s} exit_code={args.checkpoint_exit_code}" if args.max_wall_s else ""))
+        try:
+            post = run_nuts_with_checkpoints(model, (jnp.asarray(M.T_OBS),), num_warmup=args.num_warmup,
+                                             num_samples=args.num_samples, key=jax.random.PRNGKey(0),
+                                             ckpt_dir=args.checkpoint_dir, chunk=args.chunk, nuts_kwargs=kw,
+                                             max_wall_s=args.max_wall_s)
+        except CheckpointExit:
+            # Checkpoint is on disk; exit with the sentinel so HTCondor spools it
+            # and restarts this job, which resumes from nuts_ckpt.pkl.
+            sys.exit(args.checkpoint_exit_code)
     else:
         mcmc = MCMC(NUTS(model, **kw), num_warmup=args.num_warmup, num_samples=args.num_samples, progress_bar=True)
         mcmc.run(jax.random.PRNGKey(0), jnp.asarray(M.T_OBS)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}

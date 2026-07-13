@@ -39,7 +39,7 @@ def sample_f090(n_seed=3000, n_b=2500, n_draw=12):
     PL = importlib.util.spec_from_file_location("pl", os.path.join(_HERE, "two_channel_pl_demo.py"))
     pl = importlib.util.module_from_spec(PL); PL.loader.exec_module(pl)
     M = pl.M; M.ISOTROPIC_SPIN = False
-    post = np.load(os.path.join(ROOT, "figures_nal_f090", "two_channel_pl_post.npz"))
+    post = np.load(os.path.join(ROOT, "figures_nal_f090_fa0w", "two_channel_pl_post.npz"))
     n = len(post["m_max_A"]); idx = np.linspace(0, n - 1, min(n_draw, n)).astype(int)
     M.F_DEP = 0.90
     base = jax.random.PRNGKey(0); ctr = 0

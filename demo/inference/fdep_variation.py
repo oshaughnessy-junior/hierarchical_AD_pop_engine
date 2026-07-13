@@ -20,7 +20,7 @@ from spin_mass_trend import kernel_quantiles
 import vt_calibration as V
 KS = ["alpha_A", "m_max_A", "spin_chi", "mu_B", "sig_B", "mu_chiB", "sig_chiB", "log_R_A", "log_R_B"]
 ROOT = "/home/richard.oshaughnessy/coag_container"
-SHOW = [(0.30, "figures_nal_f030"), (0.60, "figures_nal_f060"), (0.90, "figures_nal_f090"), (1.20, "figures_nal_f120")]
+SHOW = [(0.30, "figures_nal_f030_fa0w"), (0.60, "figures_nal_f060_fa0w"), (0.90, "figures_nal_f090_fa0w"), (1.20, "figures_nal_f120_fa0w")]
 OUT = "/home/richard.oshaughnessy/unixhome/Projects/LIGO-ScienceMode/communications/20260516-Me-CoagulationEngine/gwk-hierarchical-initial/paper/figures/real_fdep_variation.png"
 
 
