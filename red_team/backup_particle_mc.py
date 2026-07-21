@@ -99,7 +99,9 @@ def kernel_K(m1, m2, a, b):
     m_big = np.maximum(m1, m2)
     m_sml = np.minimum(m1, m2)
     q = m_sml / m_big
-    return (m1 + m2) ** a * q ** b
+    M = m1 + m2
+    ratio = (2.0 * m_sml * m_big / (M ** 2)) if ETA_KERNEL else q   # 2*eta (symmetric) or q
+    return M ** a * ratio ** b
 
 
 # ---------------------------------------------------------------------------
@@ -791,12 +793,296 @@ def sample_natals_jax(
 # Numpy ``particle_mc`` stays as the validation backstop per
 # [[feedback-red-team-validation]] and [[demo/PLAN_jax_mc]] § "Hard rule".
 # ===========================================================================
+# Prototype 1 (mass-dependent equal-mass preference; see memory
+# [[coag-highmass-cdf-failure]]).  The pairwise kernel q^b with a CONSTANT b
+# under-produces the observed near-equal-mass HIGH-mass binaries (the detected-m1
+# CDF test).  Optional module-level mass dependence promotes the mass-ratio
+# exponent to b(M) = b + KERNEL_B1 * max(log(M / KERNEL_MSTAR), 0), i.e. the
+# equal-mass preference strengthens above a pivot total mass while leaving the
+# low-mass population (M < M*) at the fitted b.  KERNEL_B1 = 0.0 is the identity
+# (backward compatible with all committed fits).  For a = 0 this leaves the
+# kernel upper bound unchanged, since it is set by equal-mass (q = 1) pairs where
+# q^{b(M)} = 1 regardless of b(M).  Set these globals BEFORE the first trace.
+KERNEL_B1 = 0.0
+KERNEL_MSTAR = 30.0
+# Opt-in EXCHANGE-SYMMETRIC mean-field kernel: use K = M^a (2 eta)^b with the
+# symmetric mass ratio 2*eta = 2 m1 m2/(m1+m2)^2 (~q, but symmetric under 1<->2)
+# instead of q^b.  False = q^b (bit-for-bit committed engine).  Set BEFORE first trace.
+ETA_KERNEL = False
+
+# ---------------------------------------------------------------------------
+# Prototype 2 — binary-single EXCHANGE + mass-segregated sampling (§5.2 of
+# notes/paper_current_thinking.md; see notes/forward_model_builds/).
+#
+# Opt-in module globals, read at TRACE time inside particle_mc_jax_soft's
+# step_fn via Python-level branches, so at the defaults below the traced
+# graph — including the PRNG split sequence — is BIT-FOR-BIT the committed
+# engine (verified by red_team/compat_check_exchange.py).  Set BEFORE the
+# first trace; one configuration per process (same rule as KERNEL_B1).
+#
+# Physics: each step still draws a "binary" pair (i, j) K-gated as before.
+# With EXCHANGE_MODE on, an intruder k is also drawn (p ∝ occ·m^EXCHANGE_
+# INTRUDER_N; RAPSTER draws exchange singles ∝ m).  The encounter is an
+# exchange-merger with probability
+#   MODE 1 (HHM96-scaled, smooth): p = C·r^{7/2} / (1 + C·r^{7/2}),
+#           r = m_k / min(m_i, m_j)   [σ_exch ∝ (m₃/M₁₃)^{7/2}, HHM96
+#           astro-ph/9604016; smooth sigmoid form, p→r^{7/2} for light
+#           intruders, →1 for heavy]
+#   MODE 2 (RAPSTER prompt rule, Kritos+2024 2210.10055): p = C if
+#           m_k > min(m_i, m_j) else 0  ["trade the intruder for the
+#           lighter binary component"]
+# On exchange the LIGHTEST of the three bodies is EJECTED from the pool
+# (occupancy −δ, no remnant — the dynamical ratchet) and the TWO HEAVIEST
+# merge (remnant retention-gated on v_esc as usual).  Without exchange the
+# drawn pair merges exactly as before.  The exchange decision is a hard
+# per-step Bernoulli (like the B.1 K-gate): forward-model faithful, but
+# NOT smoothly differentiable in EXCHANGE_C (a straight-through estimator
+# could be added if exchange ever enters a fit).
+#
+# SEGREGATION_N biases the (i, j) pair draw p ∝ occ·(m/SEGREGATION_MREF)^n
+# (mass segregation; RAPSTER samples 3bb components ∝ m^5).  0.0 = off.
+#   MODE 3 ("GP2021 eq-36 weighted ejection"): occurrence GATE identical to
+#           mode 1 (HHM96 smooth), but on exchange the EJECTED body is drawn
+#           from the realistic Ginat & Perets 2021 categorical (eq. 36 /
+#           Pouliasis+2026 eq. 26): p(eject c) ∝ W(surviving pair),
+#           W(m_i,m_j)=m_i^4 m_j^4/(m_i+m_j)^{5/2}.  Mode 1 is its modal
+#           (max-probability = eject-lightest) branch; mode 3 carries the
+#           sub-dominant mid-mass branch too (appendix_exchange_realism.tex).
+EXCHANGE_MODE = 0          # 0=off, 1=HHM96 smooth, 2=prompt, 3=GP2021 eq-36
+EXCHANGE_C = 1.0           # prefactor / prompt-exchange probability
+EXCHANGE_INTRUDER_N = 1.0  # intruder draw exponent (used only when MODE != 0)
+SEGREGATION_N = 0.0        # pair-draw mass-segregation exponent (0 = off)
+SEGREGATION_MREF = 50.0    # mass scale for the segregation weight (numerics)
+
+# ---------------------------------------------------------------------------
+# Prototype 3 — MULTIPLICATIVE mass segregation INSIDE the encounter kernel K
+# (Thrust 2.5; see notes/forward_model_builds/53_sum_kernels.md).
+#
+# SEGREGATION_N above weights the (i, j) *pair-DRAW* probability
+# (p ∝ occ·(m/M_ref)^n) — it changes WHICH pair is proposed, then the K-gate
+# accepts it with δ = (K_ij/K_max)·min(o).  That draw-segregation OVERSHOOTS
+# badly at n ≥ 1 (μ 301–392 vs 238; §5.2) because it stacks the proposal onto
+# the heaviest slots whose occupancy is consumed geometrically.
+#
+# KERNEL_SEG_N is a genuinely DIFFERENT (normalized) operation: a factor
+# multiplicative in K itself,
+#     K → K · ((m1·m2) / KERNEL_SEG_MREF^2)^(KERNEL_SEG_N / 2)
+# so it re-weights the ACCEPT-GATE δ = (K_ij/K_max)·min(o) rather than the
+# draw distribution.  Because it lives inside `_kernel_K_jax`, the upper bound
+# `_kernel_upper_bound_jax` (which calls the same function at the heaviest
+# equal-mass pair) picks up the SAME factor, so K_ij/K_max ≤ 1 is preserved
+# and the soft gate stays well-formed.  The (m1·m2)^{n/2} form is symmetric,
+# equals the geometric-mean mass to the n-th power, reduces to 1 at
+# m1·m2 = M_ref^2, and — unlike q^b — rewards BOTH bodies being heavy rather
+# than being equal, so it up-weights heavy encounters without over-equalizing.
+# KERNEL_SEG_N = 0.0 is the identity: the Python-level guard in _kernel_K_jax
+# keeps the traced graph (and PRNG sequence) BIT-FOR-BIT the committed engine.
+# Set BEFORE the first trace; one configuration per process.
+KERNEL_SEG_N = 0.0         # multiplicative K segregation exponent (0 = off)
+KERNEL_SEG_MREF = 50.0     # mass scale for the multiplicative K factor
+
+# --- straight-through estimator on the hard exchange Bernoulli -------------
+# With EXCHANGE_STE = True the FORWARD pass keeps the hard 0/1 exchange
+# decision (primals AND the PRNG split sequence stay bit-for-bit identical to
+# the pure-hard implementation), while the BACKWARD pass sees the smooth
+# exchange probability p_exch.  This makes d(logL)/d(EXCHANGE_C) — and the
+# natal-mass gradients that cross the exchange decision boundary — non-zero.
+# Only read inside the EXCHANGE_MODE != 0 branch, so the committed
+# (exchange-off) path is untouched regardless of this value.
+EXCHANGE_STE = True
+# --- opt-in smooth (sigmoid) retention in the ALIGNED cascade path ---------
+# v_esc gates remnant retention through a hard Heaviside in the Aligned path
+# (d/dv_esc == 0).  Set RETAIN_SOFT = True to use the same soft sigmoid the
+# non-Aligned path already uses, so d(logL)/d(v_esc) is usable for a
+# free-v_esc fit.  Default False keeps the committed hard retention
+# BIT-FOR-BIT.  v_esc never changes the (F_DEP-set) scan length.
+RETAIN_SOFT = False
+# Softness scale (km/s) of the sigmoid retention (used by the RETAIN_SOFT
+# aligned path and the non-Aligned J2b path).  Default 50.0 is the committed
+# value (bit-for-bit: it is baked into the trace as the same constant).
+# A rough IS-weighted likelihood in the v_esc direction can collapse NUTS
+# step-size adaptation (observed 2026-07-15: adapted step 1.9e-07 on the
+# free-v_esc refit); widening to ~100-150 smooths d(logL)/d(v_esc) at
+# modest n_seed.  Set BEFORE the first trace.
+RETAIN_TAU = 50.0
+
+# ---------------------------------------------------------------------------
+# Prototype 4 — TRUE in-cluster SUM OF KERNELS (K_tot = K1 + K2 in ONE cascade;
+# see notes/forward_model_builds/56_sumK_incluster.md).  DISTINCT from the
+# paper's additive-cluster sum R = Σ_c R_c·𝓡_cl^(c) (independent cascades, each
+# simulated separately and added in RATE — the §5.3 λ-mixture): here a SINGLE
+# cluster runs TWO interaction processes SIMULTANEOUSLY, so remnants built by one
+# channel feed the pool the OTHER channel draws from (cross-generation feeding),
+# which the independent-cluster sum cannot represent.
+#
+#   Channel 1 = the EXCHANGE process (the existing EXCHANGE_MODE path; kernel
+#     K1 = (m1+m2)^a q^b with the committed cfg exponents a_k / b_k).
+#   Channel 2 = a PLAIN-MERGER mean-field kernel K2 = (m1+m2)^{SUMK_A2} q^{SUMK_B2}.
+#
+# Per DRAWN pair the encounter rate is K_tot = C1·K1 + C2·K2 (C1 = SUMK_C1,
+# C2 = SUMK_C2).  The soft gate uses δ = (K_tot / K_max_tot)·min(o) with
+#   K_max_tot = C1·UB(a,b) + C2·UB(a2,b2)     [UB = _kernel_upper_bound_jax]
+# i.e. the SUM of the per-kernel upper bounds.  Since max(K1+K2) ≤ max(K1) +
+# max(K2), this is a valid bound (K_tot/K_max_tot ≤ 1, soft gate well-formed);
+# and for a,b ≥ 0 BOTH kernels are maximized at the heaviest equal-mass pair
+# (q = 1), so the two maxima coincide there and the bound is TIGHT.  The step is
+# then assigned to channel 1 (exchange) with probability p1 = C1·K1 / K_tot and
+# to channel 2 (plain merger) otherwise — standard total-rate/pick-reaction
+# splitting.  The channel pick is a hard per-step Bernoulli (survey instrument,
+# forward-only; no STE — deliberately simpler than the exchange gate).
+# Requires EXCHANGE_MODE != 0 to make channel 1 an exchange process (with
+# EXCHANGE_MODE == 0 both channels are plain mergers and K_tot only reweights
+# the gate).  SUMK_ON = 0 is the identity: a Python-level guard adds NO new PRNG
+# split and leaves the traced graph bit-for-bit the committed engine.  Set the
+# globals BEFORE the first trace; one configuration per process.
+SUMK_ON = 0                # 0 = off (identity); 1 = in-cluster sum of two kernels
+SUMK_A2 = 0.0              # channel-2 total-mass exponent a2
+SUMK_B2 = 0.0              # channel-2 mass-ratio exponent b2 (0 = no eq-mass pref)
+SUMK_C1 = 1.0              # channel-1 (exchange) kernel prefactor
+SUMK_C2 = 1.0              # channel-2 (plain merger) kernel prefactor
+SUMK_MODE2 = 0             # channel-2 outcome type: 0 = plain merger (reserved)
+
+# ---------------------------------------------------------------------------
+# Prototype 5 — GENERATION-GATED DEGENERATE KERNEL (the "confined 2g pairing";
+# see notes/forward_model_builds/57_degenerate_kernel_eyeball.md and §5.7).
+#
+# The eyeball shooter (demo/inference/shooter_2gen.py) showed that exchange-
+# SEEDING (EXCHANGE_MODE=1, which builds the heavy single pool) COMBINED with a
+# strong equal-mass + IMF-undoing kernel CONFINED TO THE 2g SECTOR fills the
+# largest observed occupancy box [40,100)x[20,40) (17 -> 69-74; obs 76) with mu
+# pinned at 238 and NO low-mass starvation — evading the global-b(M) dead end
+# (memory [[coag-highmass-cdf-failure]]: an equal-mass preference applied to ALL
+# pairings starves the low-mass rate, mu 240->211, N60 20->2.8).  The evasion is
+# because the boost touches ONLY pairings that involve a >=2nd-generation
+# (remnant) body — the abundant low-mass 1g pairings that set the rate keep the
+# ordinary kernel K1.
+#
+# The boost factor MATCHES the shooter's K2 parametrization (57 §1, eq for K2):
+#     B(m1,m2) = q^{KERNEL_2G_B} * exp[-(1-q)^2 / (2 KERNEL_2G_SIGQ^2)]
+#                                * (M / KERNEL_2G_MSTAR)^{KERNEL_2G_GAMMA}
+# with q = min/max, M = m1 + m2 (shooter M, M*, gamma sign convention), applied
+# to the accept-gate flow delta (w_event) ONLY when max(gen_i, gen_j) >= 2 for
+# the DRAWN pair.  The shooter's adam optimum transfers as
+#     KERNEL_2G_SIGQ = 0.17 (sigma_q),  KERNEL_2G_GAMMA = 1.07 (gamma),
+#     KERNEL_2G_MSTAR = 40.0 (M*),      KERNEL_2G_B = 0.0 (b2; the b2/sigma_q
+# degeneracy in the shooter's adam fit means only the NET 2g q-law is pinned, so
+# the engine samples sigma_q + gamma and fixes b2 = 0 = q-neutral prefactor).
+#
+# WHERE + HOW APPLIED — the design choice (and a correction to a naive bound).
+# `_kernel_K_jax(m1,m2,a,b)` does NOT see generation labels, so (as the task
+# anticipated) the factor is applied at the ACCEPT-GATE delta stage inside
+# `particle_mc_jax_soft.step_fn`, where the drawn pair's generation tags
+# (g_i = gen[i], g_j = gen[j]) ARE available.  It is a MULTIPLICATIVE boost on
+# the gate weight, CAPPED at 1:
+#     w_event  ->  min( w_event * B , 1 )       (B = 1 for 1g pairs)
+# with the base w_event = K_ij / K_max = K1 gate weight.  Two properties make
+# this the correct form (an earlier attempt divided by a global B_max = boost of
+# the heaviest-possible pair — that UNIFORMLY THROTTLED every pair by ~1/(2m_max/
+# M*)^gamma ~ 1/5, and because the F_DEP scan length is FIXED, the throttled
+# cascade under-ran and STARVED the high-mass tail: N_det(>60) 37 -> ~1, the
+# exact b(M) failure this was meant to evade.  Do NOT reintroduce a global-max
+# normalization):
+#   (1) NEUTRAL LIMIT = IDENTITY.  At the off defaults (sigma_q -> inf so the
+#       exp -> 1, gamma = 0 so (M/M*)^0 = 1, b2 = 0 so q^0 = 1) B == 1 exactly,
+#       so w_event is unchanged and the traced graph is bit-for-bit committed.
+#   (2) NO 1g THROTTLE.  B = 1 for every 1g pairing (max(gen) < 2), so the
+#       abundant low-mass pairings that set the rate keep their exact K1 gate
+#       weight — the cascade throughput (and thus the F_DEP fixed point) is
+#       preserved; only >=2g pairs are re-weighted.  The min(.,1) cap keeps
+#       w_event <= 1 (so delta <= min(o_i,o_j), no negative occupancy) for ANY
+#       sign of gamma / b2 (a very negative b2 pushes unequal 2g pairs toward
+#       the cap = spreads weight to the moderately-unequal box, as the shooter's
+#       adam b2 ~ -6 does; a positive gamma lifts heavy pairs to the cap).
+# NO new PRNG is drawn in this branch (B is a deterministic function of the drawn
+# masses/generations), so the PRNG split sequence is UNCHANGED whether the branch
+# is on or off — EXCHANGE_MODE=1 outputs are bit-for-bit identical before/after
+# this edit even with the branch active at neutral params.  With EXCHANGE_MODE on
+# the exchange-step flow delta_exch reuses w_event, so it inherits the boost.
+#
+# EFFECTIVE q-LAW NOTE (deviation from the shooter's literal params).  The base
+# kernel is K1 = q^b (committed b = 2), so the effective 2g equal-mass exponent
+# is (b + KERNEL_2G_B): the boost MULTIPLIES the base q^2, it does not replace
+# it.  Hence the shooter's K2 exponents do NOT transfer 1:1 — the MC's effective
+# q-law is q^{2+b2} * exp[-(1-q)^2/2sigq^2].  This (plus the shooter's b2/sigma_q
+# degeneracy, note 57 §3) means (sigma_q, gamma) must be re-tuned in the MC's own
+# parametrization; the fit samples them freely, and the forward grid in note 59
+# reports the MC-optimal values.  The MECHANISM (gen-confined equal-mass +
+# IMF-undoing boost, exchange-seeded, no low-mass starvation) is what transfers.
+#
+# KERNEL_2G_ON is a CONCRETE Python bool read as a trace-time guard: with it
+# False (default) the branch is not traced and the graph — including the PRNG
+# split sequence — is BIT-FOR-BIT the committed engine.  The VALUE globals
+# (KERNEL_2G_SIGQ/GAMMA/B/MSTAR) may be concrete floats (forward runs, anchor
+# fit) OR JAX tracers (free fit: set to the sampled sigma_q/gamma inside the
+# traced model so gradients flow — the factor is smooth, no STE needed).  Set
+# BEFORE the first trace; one configuration per process.
+KERNEL_2G_ON = False       # concrete trace-time guard (False = identity)
+KERNEL_2G_SIGQ = float("inf")   # sigma_q (equal-mass width); inf = q-neutral
+KERNEL_2G_GAMMA = 0.0      # gamma (IMF-undoing total-mass exponent); 0 = neutral
+KERNEL_2G_B = 0.0          # b2 (extra q-tilt prefactor exponent); 0 = neutral
+KERNEL_2G_MSTAR = 40.0     # M* (total-mass pivot; shooter M* = 40)
+
+# ---------------------------------------------------------------------------
+# Prototype 6 — STEADILY-SEEDED / DRIVEN cascade (non-zero augmentation term
+# r(x;t) != 0; see paper §demos:feeding "Why the cascade cannot be steadily
+# fed" and App. cascade_theory for the driven-vs-starved distinction, and
+# notes/paper_vnext/near_equal_gap_model_choice.md for the physics motivation).
+#
+# The committed engine hard-codes the source term r(x;t) = 0: the natal pool is
+# injected ONCE at t=0 (slots [0:n_init], occupancy 1) and then only coagulates
+# and DEPLETES.  ``depletion_fraction`` (F_DEP) is the fraction of that one-time
+# pool consumed to build the high-mass tail; depletion therefore pulls the
+# low-mass objects UP/OUT, opening a ~15-25 Msun transition gap and under-
+# producing near-equal high mass (memory [[coag-highmass-cdf-failure]],
+# [[coag-inverse-kernel-design]]).
+#
+# DRIVEN_MODE = 1 turns on a CONTINUOUS natal source r(x;t) != 0.  Each cascade
+# step the natal reservoir (slots [0:n_init], which carry the natal masses/spins
+# and their importance weights) is REPLENISHED toward its initial occupancy:
+#     occ[:n_init] += DRIVEN_SEED_RATE * max(occ0[:n_init] - occ[:n_init], 0)
+# i.e. r(x;t) = (DRIVEN_SEED_RATE / dt) * (occ0 - occ)_+ * p_natal(x) — a
+# restoring natal source that models the reservoir being refilled by ongoing
+# star formation on a timescale 1/DRIVEN_SEED_RATE.  Because adding uniform
+# occupancy to the natal slots (each already an importance-weighted draw of the
+# proposal) adds a term proportional to p_natal(x), the source is exactly the
+# natal mass/spin distribution — the physically-motivated "steady seeding".
+#   * DRIVEN_SEED_RATE = 0.0  -> no replenishment  == source-free (bit-for-bit).
+#   * DRIVEN_SEED_RATE = 1.0  -> reservoir held FULL every step (fast-replenish /
+#                                fully-driven limit; the constant-flux cascade).
+#   * 0 < rate < 1            -> partial driving (finite replenishment time).
+# In driven mode the one-time DEPLETION-BUDGET halt is lifted (the reservoir no
+# longer runs out), so the cascade runs the full scan length; the number of
+# encounters per body is then set by n_steps (i.e. by depletion_fraction via the
+# n_steps auto-formula, reinterpreted as a driven DEPTH knob).  Occupancy stays
+# bounded in [0, 1] (refill only tops up toward occ0; coagulation only removes),
+# so no runaway.  The refill is a deterministic, smooth occupancy update — NO new
+# PRNG is drawn — so with DRIVEN_MODE = 0 (default) the traced graph, the PRNG
+# split sequence, and every output are BIT-FOR-BIT the committed engine
+# (red_team/compat_check_exchange.py), and with it ON gradients in the natal /
+# kernel / v_esc params still flow (differentiable for the fit).  Composes with
+# EXCHANGE / SEGREGATION / SUMK / KERNEL_2G (orthogonal occupancy bookkeeping).
+# Set BEFORE the first trace; one configuration per process.
+DRIVEN_MODE = 0            # 0 = source-free r=0 (committed); 1 = steadily-seeded
+DRIVEN_SEED_RATE = 1.0     # per-step natal replenishment fraction toward occ0
+#                            (only read when DRIVEN_MODE != 0; 1.0 = full reservoir)
+
+
 def _kernel_K_jax(m1, m2, a, b):
     """JAX mirror of :func:`kernel_K`.  Inputs are scalars or arrays."""
     m_big = jnp.maximum(m1, m2)
     m_sml = jnp.minimum(m1, m2)
     q = m_sml / m_big
-    return (m1 + m2) ** a * q ** b
+    M = m1 + m2
+    b_eff = b + KERNEL_B1 * jnp.maximum(jnp.log(M / KERNEL_MSTAR), 0.0)
+    ratio = (2.0 * m_sml * m_big / (M ** 2)) if ETA_KERNEL else q   # 2*eta (symmetric) or q
+    K = M ** a * ratio ** b_eff
+    # Opt-in multiplicative mass segregation in K (Thrust 2.5).  Python-level
+    # guard so KERNEL_SEG_N == 0.0 leaves the traced graph bit-for-bit
+    # unchanged; applied identically in the gate and (via this same function)
+    # the K_max upper bound, so K_ij / K_max <= 1 is preserved.
+    if KERNEL_SEG_N != 0.0:
+        K = K * (m_big * m_sml / (KERNEL_SEG_MREF ** 2)) ** (KERNEL_SEG_N / 2.0)
+    return K
 
 
 def _kernel_upper_bound_jax(m_min_active, m_max_active, a, b):
@@ -812,7 +1098,87 @@ def _kernel_upper_bound_jax(m_min_active, m_max_active, a, b):
     cand_mi = _kernel_K_jax(
         m_max_active + m_min_active, m_max_active + m_min_active, a, b,
     )
-    return jnp.maximum(jnp.maximum(cand_hi, cand_lo), cand_mi) * 1.05
+    # NEGATIVE-b support (note 60 family C: the 1g pairing exponent b1 < 0 =
+    # unequal-preferring).  q^b for b<0 is MAXIMIZED at the smallest q, i.e. the
+    # MOST-UNEQUAL active pair (m_min_active with m_max_active), NOT the q=1
+    # corners above — so those three candidates UNDER-bound a b<0 kernel and the
+    # gate w_event = K/K_max could exceed 1 (negative occupancy).  Add the most-
+    # unequal pair.  For a,b >= 0 this candidate is <= cand_mi (q<=1 and M<=the
+    # mid total mass), so jnp.maximum leaves the bound BIT-FOR-BIT unchanged; it
+    # only raises the bound when b<0 makes the unequal corner dominate.
+    cand_uneq = _kernel_K_jax(m_min_active, m_max_active, a, b)
+    m = jnp.maximum(jnp.maximum(cand_hi, cand_lo), cand_mi)
+    return jnp.maximum(m, cand_uneq) * 1.05
+
+
+# ===========================================================================
+# Prototype 6 (Part B) — DIFFERENTIABLE GENERATION-AWARE TILT MOMENTS.
+# The thin engine capability that makes the aligned-seed cascade (note 58)
+# FITTABLE.  A forward aligned-seed run assigns each merger component a cos-tilt
+# by a HARD map on the integer generation label + FRESH random draws
+# (aligned_seed_forward.make_aligned_seed_sampler): g==1 -> cos=+1 (aligned
+# natal field), g>=2 -> cos ~ U[-1,1] (isotropic remnant), with a `twog_memory`
+# fraction of 2g+ retaining near-alignment (cos ~ U[0.7,1]).  That map is
+# non-differentiable (hard where on gen) and MC-noisy (fresh RNG), so it cannot
+# enter NUTS/SVI (note 58 §4, the "one real blocker").
+#
+# These helpers give the analytic ALTERNATIVE recommended there: a smooth
+# per-component ISOTROPY WEIGHT P_iso (deterministic function of the generation
+# labels the 8-col merger schema already carries in cols 4,5), and the analytic
+# TILT-MARGINALIZED chi_eff MEAN and VARIANCE — the exact moments of the same
+# random tilt model, but integrated over the tilt in closed form.  They are
+# smooth in the masses/spins (hence in the seed hyperparameters theta, since the
+# cascade dynamics are already differentiable), carry NO RNG, and never touch the
+# traced cascade — so this is purely additive and compat-clean (the committed
+# path is byte-for-byte unchanged; it simply calls neither function).
+#
+# Per-component tilt statistics (cos = cosine of the tilt to the orbital angular
+# momentum), matching aligned_seed_forward exactly:
+#   g == 1 (aligned): cos = +1 deterministic          -> E[cos]=1,    E[cos^2]=1
+#   g >= 2, isotropic (prob 1-tw): cos ~ U[-1,1]       -> E[cos]=0,    E[cos^2]=1/3
+#   g >= 2, memory    (prob tw):   cos ~ U[0.7,1]      -> E[cos]=0.85, E[cos^2]=0.73
+# (E[cos^2] for U[a,b] = (a^2+ab+b^2)/3; U[0.7,1] -> (0.49+0.70+1.00)/3 = 0.73.)
+# With chi_eff = (m1 a1 cos1 + m2 a2 cos2)/(m1+m2) and independent tilts,
+#   E[chi_eff]   = (m1 a1 E[cos1] + m2 a2 E[cos2]) / M
+#   Var[chi_eff] = ( (m1 a1)^2 Var[cos1] + (m2 a2)^2 Var[cos2] ) / M^2
+# where a1,a2 are the component spin MAGNITUDES (merger cols 2,3 out of the
+# aligned cascade) and Var[cos] = E[cos^2] - E[cos]^2.
+
+def generation_isotropy_weight(gen, twog_memory=0.0):
+    """Smooth per-component isotropy weight P_iso in [0,1]: the fraction of the
+    tilt distribution that is FULLY isotropic (cos ~ U[-1,1]).  g==1 natal seeds
+    are aligned (P_iso = 0); g>=2 remnants are isotropic except a `twog_memory`
+    fraction that retains near-alignment.  Deterministic + differentiable
+    (an expectation, not a random draw)."""
+    is_2g = (jnp.asarray(gen) >= 1.5).astype(jnp.float32)
+    return is_2g * (1.0 - float(twog_memory))
+
+
+def generation_tilt_chieff_moments(m1, m2, a1, a2, g1, g2, twog_memory=0.0):
+    """Analytic tilt-marginalized (mean, variance) of chi_eff under the
+    generation-aware cos-tilt model (the smooth replacement for the hard random
+    tilt map in aligned_seed_forward).  Inputs: component masses m1,m2, spin
+    MAGNITUDES a1,a2 (merger cols 2,3), integer generations g1,g2 (cols 4,5).
+    Returns (mu_chieff, var_chieff), both smooth in the masses/spins.  A fit uses
+    these to marginalize the tilt analytically instead of MC-sampling it."""
+    tw = jnp.asarray(twog_memory)
+    Ecos_2g = (1.0 - tw) * 0.0 + tw * 0.85           # E[cos | g>=2]
+    Ecos2_2g = (1.0 - tw) * (1.0 / 3.0) + tw * 0.73  # E[cos^2 | g>=2]
+
+    def _moms(g):
+        is2 = jnp.asarray(g) >= 1.5
+        Ecos = jnp.where(is2, Ecos_2g, 1.0)
+        Ecos2 = jnp.where(is2, Ecos2_2g, 1.0)
+        return Ecos, Ecos2 - Ecos ** 2               # (E[cos], Var[cos])
+
+    E1, V1 = _moms(g1)
+    E2, V2 = _moms(g2)
+    M = m1 + m2
+    c1 = m1 * a1 / M
+    c2 = m2 * a2 / M
+    mu = c1 * E1 + c2 * E2
+    var = c1 ** 2 * V1 + c2 ** 2 * V2
+    return mu, var
 
 
 def particle_mc_jax(
@@ -1283,9 +1649,10 @@ def particle_mc_jax_soft(
     # ``key_loop`` below).  Keeps the Aligned path bit-for-bit — the
     # orientation stream is never split off ``key`` when Aligned.
     orientation_key = jax.random.PRNGKey(int(cfg.orientation_key_seed))
-    # Fixed retention softness scale (km/s).  Mirrors the implicit path's
-    # ``retention_kind="sigmoid"`` convention.
-    retain_tau = 50.0
+    # Retention softness scale (km/s).  Mirrors the implicit path's
+    # ``retention_kind="sigmoid"`` convention.  Module global RETAIN_TAU
+    # (default 50.0 = the committed constant, bit-for-bit).
+    retain_tau = float(RETAIN_TAU)
 
     key_natal, key_loop = jax.random.split(key)
     m0, chi0, w0 = sample_natals_jax(
@@ -1310,6 +1677,21 @@ def particle_mc_jax_soft(
     b_k = jnp.asarray(cfg.kernel_b)
     v_esc = jnp.asarray(cfg.v_esc)
     R_target = jnp.asarray(cfg.depletion_fraction) * n_init
+    # ---- opt-in STEADILY-SEEDED / DRIVEN cascade (Prototype 6; Python-level
+    # gate — with DRIVEN_MODE == 0 nothing below is traced and the graph, PRNG
+    # stream and every output are bit-for-bit the committed engine).  In driven
+    # mode the one-time depletion-budget halt is lifted (R_target -> effectively
+    # unbounded) so the continuously-reseeded cascade runs the full scan length;
+    # `natal_mask` selects the reservoir slots [0:n_init] the source refills.
+    if DRIVEN_MODE:
+        # Large finite cap: total net removal is bounded by mult(<=3)*n_steps, so
+        # R_target = 4 * S can never bind -> budget_left stays > occ_tol every
+        # step (step_active_now / delta_cap keep their gradient-safe form, the
+        # cap just never triggers).  Not inf, to keep delta_cap = budget/mult
+        # finite-valued in the backward pass.
+        R_target = jnp.asarray(4.0 * S, dtype=m0.dtype)
+    natal_mask = (jnp.arange(S) < n_init).astype(m0.dtype)
+    driven_rate = jnp.asarray(DRIVEN_SEED_RATE, dtype=m0.dtype)
 
     carry0 = (m_arr0, chi_arr0, w_arr0, occ0, gen0,
               jnp.asarray(0.0, dtype=m0.dtype), key_loop)
@@ -1332,8 +1714,16 @@ def particle_mc_jax_soft(
 
         # Occupancy-weighted pair draw (soft analog of numpy's uniform-
         # over-active draw): P(slot) ∝ o.  Two splits, j != i.
+        # Opt-in mass segregation (SEGREGATION_N != 0, Python-level gate so
+        # the default path is bit-for-bit): P(slot) ∝ o · (m/M_ref)^n.
         key, k_i, k_j = jax.random.split(key, 3)
-        p_occ = jnp.where(occ_active, occ, 0.0)
+        if SEGREGATION_N != 0.0:
+            seg_w = jnp.power(
+                jnp.maximum(m_arr, 0.0) / SEGREGATION_MREF, SEGREGATION_N
+            )
+            p_occ = jnp.where(occ_active, occ * seg_w, 0.0)
+        else:
+            p_occ = jnp.where(occ_active, occ, 0.0)
         denom_i = jnp.maximum(p_occ.sum(), occ_tol)
         p_i = p_occ / denom_i
         i = jax.random.choice(k_i, S, p=p_i)
@@ -1355,6 +1745,208 @@ def particle_mc_jax_soft(
         w_event = K_ij / K_max
         delta_raw = w_event * jnp.minimum(o_i, o_j)
 
+        # ---- opt-in GENERATION-GATED DEGENERATE KERNEL (Prototype 5; Python-
+        # level guard — with KERNEL_2G_ON False nothing below is traced, the
+        # PRNG stream is untouched, and the graph is bit-for-bit committed).
+        # Boost the accept-gate flow for pairings involving a >=2g (remnant)
+        # body: B = q^b2 * exp[-(1-q)^2/(2 sigq^2)] * (M/M*)^gamma, matching the
+        # shooter's K2 (57 §1).  NO PRNG here (deterministic), so even ON the
+        # exchange PRNG sequence is unchanged.  Applied to w_event so the
+        # exchange-step delta_exch (which reuses w_event) inherits it.
+        if KERNEL_2G_ON:
+            m_big_p = jnp.maximum(m_i, m_j)
+            m_sml_p = jnp.minimum(m_i, m_j)
+            q_p = m_sml_p / jnp.maximum(m_big_p, 1e-30)
+            M_p = m_i + m_j
+            is_2g = jnp.maximum(g_i, g_j) >= 1.5   # >=2nd generation body
+            sigq = jnp.asarray(KERNEL_2G_SIGQ, dtype=m_arr.dtype)
+            gamma = jnp.asarray(KERNEL_2G_GAMMA, dtype=m_arr.dtype)
+            b2g = jnp.asarray(KERNEL_2G_B, dtype=m_arr.dtype)
+            mstar = jnp.asarray(KERNEL_2G_MSTAR, dtype=m_arr.dtype)
+            # B = q^b2 * exp[-(1-q)^2/(2 sigq^2)] * (M/M*)^gamma.  At the off
+            # defaults (sigq -> inf, gamma 0, b2 0) every factor is 1 => B == 1
+            # (identity).  1/(2 sigq^2) -> 0 for sigq -> inf (no NaN).
+            inv_2s2 = 1.0 / (2.0 * sigq * sigq)
+            fq = q_p ** b2g * jnp.exp(-((1.0 - q_p) ** 2) * inv_2s2)
+            fM = (M_p / mstar) ** gamma
+            boost = jnp.where(is_2g, fq * fM, 1.0)
+            # MULTIPLICATIVE boost capped at 1 (no global-max throttle; 1g pairs
+            # keep B=1 so the rate-setting low-mass flow is untouched).
+            w_event = jnp.minimum(w_event * boost, 1.0)
+            delta_raw = w_event * jnp.minimum(o_i, o_j)
+
+        # ---- opt-in TRUE in-cluster SUM OF KERNELS (Prototype 4; Python-level
+        # gate — with SUMK_ON == 0 nothing below is traced and the PRNG stream
+        # is untouched).  Add a second PLAIN-MERGER kernel channel K2 in the
+        # SAME cascade: the gate flow δ is driven by K_tot = C1 K1 + C2 K2, and
+        # the step is assigned to channel 1 (exchange, below) w.p. C1 K1 / K_tot
+        # else channel 2 (plain merger).  K_max_tot = C1 UB(K1) + C2 UB(K2)
+        # bounds K_tot (tight at the heaviest equal-mass pair for a,b>=0).
+        chan1 = True
+        if SUMK_ON:
+            key, k_c = jax.random.split(key)
+            a2_k = jnp.asarray(SUMK_A2)
+            b2_k = jnp.asarray(SUMK_B2)
+            C1 = jnp.asarray(SUMK_C1, dtype=m_arr.dtype)
+            C2 = jnp.asarray(SUMK_C2, dtype=m_arr.dtype)
+            K1_ij = K_ij
+            K2_ij = _kernel_K_jax(m_i, m_j, a2_k, b2_k)
+            K_tot = C1 * K1_ij + C2 * K2_ij
+            # Upper bound of channel 2 over the current pool; K_max is the
+            # channel-1 bound already computed above.  Sum bounds K_tot.
+            K2_max = _kernel_upper_bound_jax(
+                m_min_active, m_max_active, a2_k, b2_k
+            )
+            K2_max = jnp.where(step_active_now, K2_max, 1.0)
+            K_max_tot = C1 * K_max + C2 * K2_max
+            # Re-drive the gate flow with K_tot (delta_exch below reuses
+            # w_event, so it inherits the K_tot normalization consistently).
+            w_event = K_tot / K_max_tot
+            delta_raw = w_event * jnp.minimum(o_i, o_j)
+            # Channel assignment: p1 = C1 K1 / K_tot (fraction of the encounter
+            # rate carried by the exchange channel on THIS pair).
+            p1 = (C1 * K1_ij) / jnp.maximum(K_tot, 1e-30)
+            u_c = jax.random.uniform(k_c)
+            chan1 = u_c < p1
+
+        # ---- opt-in binary-single EXCHANGE (Prototype 2; Python-level
+        # gate — with EXCHANGE_MODE == 0 nothing below is traced and the
+        # PRNG stream is untouched).  Draw an intruder k, decide exchange,
+        # and on exchange REPLACE the merging pair by the two heaviest of
+        # {i, j, k} (the lightest is ejected — occupancy removed below,
+        # no remnant).  The kernel gate above stays on the DRAWN pair
+        # (encounter rate); the remnant physics below then sees the
+        # effective merging pair.
+        if EXCHANGE_MODE:
+            key, k_k, k_x = jax.random.split(key, 3)
+            if EXCHANGE_INTRUDER_N != 0.0:
+                intr_w = jnp.power(
+                    jnp.maximum(m_arr, 0.0) / SEGREGATION_MREF,
+                    EXCHANGE_INTRUDER_N,
+                )
+                p_k_unnorm = jnp.where(occ_active, occ * intr_w, 0.0)
+            else:
+                p_k_unnorm = jnp.where(occ_active, occ, 0.0)
+            slot_ids = jnp.arange(S)
+            p_k_unnorm = jnp.where(
+                (slot_ids == i) | (slot_ids == j), 0.0, p_k_unnorm
+            )
+            sum_k = p_k_unnorm.sum()
+            has_third = sum_k > occ_tol
+            p_k = jnp.where(
+                has_third, p_k_unnorm / jnp.maximum(sum_k, occ_tol),
+                jnp.ones(S) / S,
+            )
+            kk = jax.random.choice(k_k, S, p=p_k)
+            m_kk = m_arr[kk]; chi_kk = chi_arr[kk]
+            w_kk = w_arr[kk]; g_kk = gen[kk]; o_kk = occ[kk]
+
+            m_light_bin = jnp.minimum(m_i, m_j)
+            if EXCHANGE_MODE == 2:
+                # RAPSTER prompt rule: exchange iff intruder heavier than
+                # the lighter binary member.
+                p_exch = jnp.where(
+                    m_kk > m_light_bin,
+                    jnp.minimum(jnp.asarray(EXCHANGE_C), 1.0), 0.0,
+                )
+            else:
+                # HHM96-scaled smooth probability in r = m3/min(m1,m2):
+                # p = C r^{7/2} / (1 + C r^{7/2}).  Shared by MODE 1 and MODE 3
+                # (mode 3 changes only WHICH body is ejected, not the gate).
+                r72 = EXCHANGE_C * (
+                    m_kk / jnp.maximum(m_light_bin, 1e-30)
+                ) ** 3.5
+                p_exch = r72 / (1.0 + r72)
+            u_x = jax.random.uniform(k_x)
+            is_exch = (u_x < p_exch) & step_active_now & has_third
+            if SUMK_ON:
+                # In-cluster sum: this step is an exchange only if it was
+                # assigned to channel 1; channel-2 steps fall through to a
+                # plain merger of the drawn pair (is_exch = False).
+                is_exch = is_exch & chan1
+
+            # ---- straight-through estimator (STE) on the hard decision.
+            # ``gate`` FORWARD-equals ``is_exch`` bit-for-bit (p_gate −
+            # stop_gradient(p_gate) == 0), but its BACKWARD pass carries
+            # d(p_exch), so gradients flow into EXCHANGE_C and the natal
+            # masses that set p_exch.  ``ste`` is 0 in the forward pass.
+            gate_hard = is_exch.astype(m_arr.dtype)
+            if EXCHANGE_STE:
+                p_gate = p_exch * (
+                    step_active_now & has_third
+                ).astype(m_arr.dtype)
+                gate = gate_hard + (p_gate - jax.lax.stop_gradient(p_gate))
+            else:
+                gate = gate_hard
+            ste = gate - jax.lax.stop_gradient(gate)
+
+            def _ste_sel(A, B):
+                # forward == where(is_exch, A, B) exactly; backward adds the
+                # decision gradient ste·(A − B) on top of the value gradient
+                # that ``where`` already routes to whichever branch was taken.
+                return jnp.where(is_exch, A, B) + ste * jax.lax.stop_gradient(
+                    A - B
+                )
+
+            # Stack the triple; choose which body is EJECTED, so the two
+            # SURVIVORS (hvy = heavier, lgt = lighter) become the merging
+            # pair.  hvy → i / lgt → j keeps the heavier-in-i convention the
+            # remnant physics below assumes (and matches modes 1/2 exactly).
+            ms3 = jnp.stack([m_i, m_j, m_kk])
+            cs3 = jnp.stack([chi_i, chi_j, chi_kk])
+            ws3 = jnp.stack([w_i, w_j, w_kk])
+            gs3 = jnp.stack([g_i, g_j, g_kk])
+            order3 = jnp.argsort(ms3)          # ascending
+            if EXCHANGE_MODE == 3:
+                # ---- GP2021 eq-36 weighted ejection (arXiv:2011.00010 eq.36
+                # = Pouliasis+2026 eq.26).  p(eject body c) ∝ W(surviving
+                # pair), W(m_i,m_j) = m_i^4 m_j^4 / (m_i+m_j)^{5/2}.  Drawn as
+                # a categorical over the three candidate-ejected bodies with
+                # logits = log W(survivors), computed in LOG-SPACE (4·log m
+                # terms) so m~100^4 never overflows float32.  The extra
+                # key-split lives ONLY in this branch, so the traced graph and
+                # PRNG stream of every other mode are bit-for-bit unchanged.
+                key, k_ej = jax.random.split(key)
+                logm3 = jnp.log(jnp.maximum(ms3, 1e-30))
+                # logit_e = logW of the pair that SURVIVES when body e leaves:
+                #   e=0 → survivors (1,2);  e=1 → (0,2);  e=2 → (0,1)
+                logits_ej = jnp.stack([
+                    4.0 * logm3[1] + 4.0 * logm3[2]
+                    - 2.5 * jnp.log(ms3[1] + ms3[2]),
+                    4.0 * logm3[0] + 4.0 * logm3[2]
+                    - 2.5 * jnp.log(ms3[0] + ms3[2]),
+                    4.0 * logm3[0] + 4.0 * logm3[1]
+                    - 2.5 * jnp.log(ms3[0] + ms3[1]),
+                ])
+                ej = jax.random.categorical(k_ej, logits_ej)   # 0/1/2
+                # survivors = the two triple-indices != ej (order-preserving),
+                # then sorted heavier-first.
+                idx3 = jnp.arange(3)
+                surv = jnp.where(idx3 < ej, idx3, idx3 + 1)[:2]
+                sa, sb = surv[0], surv[1]
+                a_ge_b = ms3[sa] >= ms3[sb]
+                hvy = jnp.where(a_ge_b, sa, sb)
+                lgt = jnp.where(a_ge_b, sb, sa)
+            else:
+                # modes 1/2 modal branch: eject the LIGHTEST (order3[0]),
+                # merge the two heaviest — bit-for-bit the committed rule.
+                hvy = order3[2]
+                lgt = order3[1]
+            m_i = _ste_sel(ms3[hvy], m_i)
+            m_j = _ste_sel(ms3[lgt], m_j)
+            chi_i = _ste_sel(cs3[hvy], chi_i)
+            chi_j = _ste_sel(cs3[lgt], chi_j)
+            w_i = _ste_sel(ws3[hvy], w_i)
+            w_j = _ste_sel(ws3[lgt], w_j)
+            # generation labels are discrete counters (no occupancy/mass
+            # flow) — keep the hard select, no STE.
+            g_i = jnp.where(is_exch, gs3[hvy], g_i)
+            g_j = jnp.where(is_exch, gs3[lgt], g_j)
+            # δ additionally bounded by the intruder's occupancy when the
+            # step consumes all three bodies.
+            delta_exch = w_event * jnp.minimum(jnp.minimum(o_i, o_j), o_kk)
+            delta_raw = _ste_sel(delta_exch, delta_raw)
+
         # Remnant physics — pair-selection order (matches numpy / B.1
         # bit-for-bit; heavier-first is applied only to the record).
         if aligned_path:
@@ -1363,12 +1955,19 @@ def particle_mc_jax_soft(
             m_new = _M_rem_jax(m_i, m_j, chi_i, chi_j)
             chi_new = _chi_rem_jax(m_i, m_j, chi_i, chi_j)
             v_kick_evt = _v_kick_aligned_jax(m_i, m_j, chi_i, chi_j)
-            retain_bool = (
-                _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
-            )
-            # ``retain`` is the continuous quantity the occupancy flow uses;
-            # under Aligned it is the hard bool cast to float (bit-for-bit).
-            retain = retain_bool.astype(m_arr.dtype)
+            if RETAIN_SOFT:
+                # opt-in smooth retention so d(logL)/d(v_esc) flows (same
+                # sigmoid form / retain_tau as the non-Aligned path below).
+                retain = jax.nn.sigmoid((v_esc - v_kick_evt) / retain_tau)
+                retain_bool = retain > 0.5
+            else:
+                retain_bool = (
+                    _retention_aligned_jax(m_i, m_j, chi_i, chi_j, v_esc) > 0.5
+                )
+                # ``retain`` is the continuous quantity the occupancy flow
+                # uses; under Aligned it is the hard bool cast to float
+                # (bit-for-bit committed behaviour).
+                retain = retain_bool.astype(m_arr.dtype)
         else:
             # J2b non-Aligned vector path.  Sample ONE orientation for this
             # step's pair (φ_1 = 0, φ_2 = Δφ; azimuthal-symmetry collapse).
@@ -1399,7 +1998,14 @@ def particle_mc_jax_soft(
         # Net occupancy removed by a FULL-δ step is ``mult · δ`` with
         # ``mult = 1`` if retained (2 consumed − 1 born) else ``2``.  Under
         # the soft path ``retain`` is continuous ⇒ ``mult = 2 − retain``.
+        # An exchange step also ejects the lightest body: 3 consumed −
+        # retain born ⇒ ``mult = 3 − retain``.
         mult = 2.0 - retain
+        if EXCHANGE_MODE:
+            # exchange ejects the lightest body: +1 net consumed (3 − retain
+            # vs 2 − retain).  ``gate`` forward-equals is_exch (bit-identical
+            # to the hard ``where``) and carries the STE decision gradient.
+            mult = mult + gate
 
         # Depletion-budget cap — division-free, gradient-SAFE.  Cap δ so
         # this step's net removal cannot overshoot the remaining budget:
@@ -1425,6 +2031,12 @@ def particle_mc_jax_soft(
         # Occupancy updates on the two parents.
         new_occ = occ.at[i].add(-delta)
         new_occ = new_occ.at[j].add(-delta)
+        if EXCHANGE_MODE:
+            # Exchange step: the third body is consumed too (either it is
+            # in the merging pair — with one of i/j ejected — or it was
+            # the lightest and got ejected itself).  All three slots lose
+            # δ; the remnant is born from the effective pair below.
+            new_occ = new_occ.at[kk].add(-delta * gate)
 
         # Remnant born into tail slot (n_init + k) — the scan counter is
         # the static write index, so no write-pointer.  Occupancy δ if
@@ -1440,6 +2052,21 @@ def particle_mc_jax_soft(
         new_gen = gen.at[tail].set(
             (jnp.maximum(g_i, g_j) + 1).astype(jnp.int32)
         )
+
+        # ---- opt-in DRIVEN natal source r(x;t) != 0 (Prototype 6).  Replenish
+        # the natal reservoir toward its initial occupancy AFTER the coagulation
+        # occupancy flow: occ[:n_init] += rate * (occ0 - occ)_+.  occ0 is 1 on
+        # the reservoir and 0 on the remnant tail, so (occ0 - occ)_+ is the
+        # unfilled reservoir fraction on [0:n_init] and 0 elsewhere (the
+        # natal_mask makes the tail-slot no-op explicit).  Deterministic + smooth
+        # (no PRNG), so the DRIVEN_MODE == 0 path is bit-for-bit committed and the
+        # ON path keeps occupancy in [0,1] (top-up only) with live natal/kernel/
+        # v_esc gradients.  Placed here so the just-born tail remnant (occ0 = 0
+        # there) is never touched and the drawn parents i/j are refilled if they
+        # are reservoir slots.
+        if DRIVEN_MODE:
+            refill = driven_rate * jnp.maximum(occ0 - new_occ, 0.0) * natal_mask
+            new_occ = new_occ + refill
 
         new_net_removed = net_removed + net_this
 
