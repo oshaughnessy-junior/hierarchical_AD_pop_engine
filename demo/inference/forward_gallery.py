@@ -33,6 +33,17 @@ def main():
                    help="use the EXCHANGE-SYMMETRIC kernel M^a (2 eta)^b instead of M^a q^b.")
     p.add_argument("--b1", type=float, default=0.0, help="mass-dependent b(M) slope")
     p.add_argument("--mstar", type=float, default=40.0)
+    # RATIONAL g(eta) kernel (note 61; opt-in, replaces the q/eta power factor)
+    p.add_argument("--geta-form", default=None, choices=["sat", "lor"],
+                   help="rational g(eta) kernel: K = M^a [floor + g(eta)]. "
+                        "'sat' = eta^p/(eta0^p+eta^p); 'lor' = Pade bump "
+                        "1/(1+((eta-eta0)/w)^2). None = off (committed kernel).")
+    p.add_argument("--geta-eta0", type=float, default=0.1875,
+                   help="eta scale: sat half-max / lor centre (eta(q=1/3)=0.1875)")
+    p.add_argument("--geta-p", type=float, default=4.0, help="sat sharpness p")
+    p.add_argument("--geta-w", type=float, default=0.03, help="lor half-width in eta")
+    p.add_argument("--geta-floor", type=float, default=0.0,
+                   help="additive floor on g (keeps unequal pairings alive)")
     # environment
     p.add_argument("--v-esc", type=float, default=300.0)
     p.add_argument("--f-dep", type=float, default=0.9)
@@ -114,6 +125,16 @@ def main():
     if args.eta_kernel:
         bpm.ETA_KERNEL = True
         print("ETA_KERNEL ON: K = M^a (2 eta)^b (exchange-symmetric)", flush=True)
+    if args.geta_form is not None:
+        bpm.KERNEL_GETA_ON = True
+        bpm.KERNEL_GETA_FORM = str(args.geta_form)
+        bpm.KERNEL_GETA_ETA0 = float(args.geta_eta0)
+        bpm.KERNEL_GETA_P = float(args.geta_p)
+        bpm.KERNEL_GETA_W = float(args.geta_w)
+        bpm.KERNEL_GETA_FLOOR = float(args.geta_floor)
+        print(f"KERNEL_GETA ON: form={bpm.KERNEL_GETA_FORM} eta0={bpm.KERNEL_GETA_ETA0} "
+              f"p={bpm.KERNEL_GETA_P} w={bpm.KERNEL_GETA_W} floor={bpm.KERNEL_GETA_FLOOR} "
+              f"(kernel_b ignored)", flush=True)
     if args.exchange_mode:
         bpm.EXCHANGE_MODE = int(args.exchange_mode)
         bpm.EXCHANGE_C = float(args.exchange_c)

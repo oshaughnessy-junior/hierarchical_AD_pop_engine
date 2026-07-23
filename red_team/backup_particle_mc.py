@@ -100,6 +100,8 @@ def kernel_K(m1, m2, a, b):
     m_sml = np.minimum(m1, m2)
     q = m_sml / m_big
     M = m1 + m2
+    if KERNEL_GETA_ON:                       # rational g(eta) kernel (note 61)
+        return M ** a * _geta_g(m_sml * m_big / (M ** 2))
     ratio = (2.0 * m_sml * m_big / (M ** 2)) if ETA_KERNEL else q   # 2*eta (symmetric) or q
     return M ** a * ratio ** b
 
@@ -811,6 +813,53 @@ KERNEL_MSTAR = 30.0
 ETA_KERNEL = False
 
 # ---------------------------------------------------------------------------
+# Prototype 7 — RATIONAL g(eta) mean-field kernel (note 61).
+#
+# Opt-in replacement of the mass-ratio factor by a RATIONAL function of the
+# symmetric mass ratio eta = m1 m2 / (m1+m2)^2 in (0, 1/4]:
+#
+#     K = M^a * [ KERNEL_GETA_FLOOR + g(eta) ]        (the a is cfg.kernel_a;
+#                                                      cfg.kernel_b is IGNORED)
+#   form "sat" (saturating Hill step, concentrated above eta0):
+#     g(eta) = eta^p / (eta0^p + eta^p)               eta0 ~ eta(q=1/3)=0.1875
+#   form "lor" (Pade / Lorentzian bump centred at eta0 of half-width w):
+#     g(eta) = 1 / (1 + ((eta - eta0)/w)^2)
+#
+# The additive FLOOR keeps very-unequal pairings alive (guards against the
+# overly-narrow-g "plaid" echo failure and cascade starvation).  KERNEL_GETA_ON
+# is a CONCRETE Python bool read as a trace-time guard (same rule as
+# KERNEL_2G_ON): False (default) means none of this is traced and the graph —
+# including the PRNG split sequence — is BIT-FOR-BIT the committed engine.
+# Set BEFORE the first trace; one configuration per process.
+KERNEL_GETA_ON = False       # concrete trace-time guard (False = identity)
+KERNEL_GETA_FORM = "sat"     # "sat" | "lor"
+KERNEL_GETA_ETA0 = 0.1875    # eta scale: sat half-max point / lor bump centre
+KERNEL_GETA_P = 4.0          # sat sharpness exponent p (unused by "lor")
+KERNEL_GETA_W = 0.03         # lor half-width in eta (unused by "sat")
+KERNEL_GETA_FLOOR = 0.0      # additive floor (0 = pure form)
+
+
+def _geta_g(eta):
+    """g(eta) for the opt-in rational kernel; works on numpy or jnp arrays."""
+    if KERNEL_GETA_FORM == "sat":
+        r = (eta / KERNEL_GETA_ETA0) ** KERNEL_GETA_P
+        g = r / (1.0 + r)
+    elif KERNEL_GETA_FORM == "lor":
+        g = 1.0 / (1.0 + ((eta - KERNEL_GETA_ETA0) / KERNEL_GETA_W) ** 2)
+    else:
+        raise ValueError(f"unknown KERNEL_GETA_FORM {KERNEL_GETA_FORM!r}")
+    return KERNEL_GETA_FLOOR + g
+
+
+def _geta_sup():
+    """Concrete sup of floor+g over the physical eta range (0, 1/4].
+
+    Used by the acceptance-rejection upper bounds.  Evaluated on a dense grid
+    (form-agnostic; the module globals are concrete floats at trace time)."""
+    ee = np.linspace(1e-6, 0.25, 4001)
+    return float(np.max(_geta_g(ee)))
+
+# ---------------------------------------------------------------------------
 # Prototype 2 — binary-single EXCHANGE + mass-segregated sampling (§5.2 of
 # notes/paper_current_thinking.md; see notes/forward_model_builds/).
 #
@@ -1073,9 +1122,12 @@ def _kernel_K_jax(m1, m2, a, b):
     m_sml = jnp.minimum(m1, m2)
     q = m_sml / m_big
     M = m1 + m2
-    b_eff = b + KERNEL_B1 * jnp.maximum(jnp.log(M / KERNEL_MSTAR), 0.0)
-    ratio = (2.0 * m_sml * m_big / (M ** 2)) if ETA_KERNEL else q   # 2*eta (symmetric) or q
-    K = M ** a * ratio ** b_eff
+    if KERNEL_GETA_ON:                       # rational g(eta) kernel (note 61)
+        K = M ** a * _geta_g(m_sml * m_big / (M ** 2))
+    else:
+        b_eff = b + KERNEL_B1 * jnp.maximum(jnp.log(M / KERNEL_MSTAR), 0.0)
+        ratio = (2.0 * m_sml * m_big / (M ** 2)) if ETA_KERNEL else q  # 2*eta or q
+        K = M ** a * ratio ** b_eff
     # Opt-in multiplicative mass segregation in K (Thrust 2.5).  Python-level
     # guard so KERNEL_SEG_N == 0.0 leaves the traced graph bit-for-bit
     # unchanged; applied identically in the gate and (via this same function)
@@ -1108,7 +1160,21 @@ def _kernel_upper_bound_jax(m_min_active, m_max_active, a, b):
     # only raises the bound when b<0 makes the unequal corner dominate.
     cand_uneq = _kernel_K_jax(m_min_active, m_max_active, a, b)
     m = jnp.maximum(jnp.maximum(cand_hi, cand_lo), cand_mi)
-    return jnp.maximum(m, cand_uneq) * 1.05
+    m = jnp.maximum(m, cand_uneq)
+    # RATIONAL g(eta) support (note 61): a "lor" bump peaks at an INTERIOR
+    # eta0 < 1/4 that none of the equal-mass / most-unequal corner candidates
+    # need realize, so bound K <= max_M(M^a) * sup_eta(floor+g) directly
+    # (sup on a dense concrete grid; M^a max at an endpoint for either sign
+    # of a).  Python-level guard: OFF -> traced graph bit-for-bit unchanged.
+    if KERNEL_GETA_ON:
+        Ma = jnp.maximum((2.0 * m_max_active) ** a, (2.0 * m_min_active) ** a)
+        cand_g = Ma * _geta_sup()
+        if KERNEL_SEG_N != 0.0:
+            cand_g = cand_g * jnp.maximum(
+                (m_max_active ** 2 / KERNEL_SEG_MREF ** 2) ** (KERNEL_SEG_N / 2.0),
+                (m_min_active ** 2 / KERNEL_SEG_MREF ** 2) ** (KERNEL_SEG_N / 2.0))
+        m = jnp.maximum(m, cand_g)
+    return m * 1.05
 
 
 # ===========================================================================
@@ -2160,6 +2226,8 @@ def _kernel_upper_bound(m_active: np.ndarray, a: float, b: float) -> float:
         kernel_K(np.array(2 * mlo), np.array(2 * mlo), a, b),  # equal-mass light
         kernel_K(np.array(mhi + mlo), np.array(mhi + mlo), a, b),  # asymmetric (q=mlo/mhi)
     ]
+    if KERNEL_GETA_ON:  # interior-eta "lor" peak (note 61): bound directly
+        candidates.append(max((2 * mhi) ** a, (2 * mlo) ** a) * _geta_sup())
     return float(max(candidates)) * 1.05
 
 
