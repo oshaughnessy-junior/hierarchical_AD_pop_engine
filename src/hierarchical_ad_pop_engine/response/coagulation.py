@@ -806,6 +806,8 @@ def build_gaussian_coagulation(
     # sizes the soft path's n_steps upper bound (ignored under bernoulli).
     mc_jax_gate: str = "bernoulli",
     mc_jax_n_steps_mult: float = 3.0,
+    mc_jax_kde_adaptive: bool = False,
+    mc_jax_hybrid_1g: Optional[bool] = None,
 ) -> "CoagulationResponse":
     """Convenience constructor for an impulse-response demo / unit test.
 
@@ -875,6 +877,8 @@ def build_gaussian_coagulation(
         mc_jax_k_ratio=mc_jax_k_ratio,
         mc_jax_gate=mc_jax_gate,
         mc_jax_n_steps_mult=mc_jax_n_steps_mult,
+        mc_jax_kde_adaptive=mc_jax_kde_adaptive,
+        mc_jax_hybrid_1g=mc_jax_hybrid_1g,
     )
 
 
@@ -894,6 +898,7 @@ def _finalize_response_solver(
     mc_jax_gate: str,
     mc_jax_n_steps_mult: float,
     mc_jax_kde_adaptive: bool = False,
+    mc_jax_hybrid_1g: Optional[bool] = None,
 ) -> "CoagulationResponse":
     """Run + attach the eager MC solver state (shared by the builders).
 
@@ -955,6 +960,7 @@ def _finalize_response_solver(
             gate=mc_jax_gate,
             n_steps_mult=float(mc_jax_n_steps_mult),
             kde_adaptive=bool(mc_jax_kde_adaptive),
+            hybrid_1g=mc_jax_hybrid_1g,
         )
         import equinox as _eqx
         response = _eqx.tree_at(

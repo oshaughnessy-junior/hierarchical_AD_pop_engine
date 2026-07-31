@@ -66,6 +66,7 @@ from hierarchical_ad_pop_engine.inference.stage1_wiring import (  # noqa: E402
     build_coagulation_likelihood,
     build_stage1_priors,
     build_stage1_variables,
+    stage1_prior_factories,
 )
 
 PARAM_NAMES = fit.PARAM_NAMES
@@ -100,17 +101,21 @@ def _setup(args):
     fit_grid = BinaryGrid.default(m_min=fixed["m_min"], m_max=fixed["m_max"],
                                   n_m=n_m, n_chi=n_chi)
     demo.build_truth_model_and_calibrate_rate(args.n_obs, grid=fit_grid)
-    demo.THETA_STAR["natal_spin_loc"] = 0.05
+    demo.THETA_STAR["natal_spin_loc"] = args.spin_loc_truth
     theta_star = dict(demo.THETA_STAR)
     orientation = _build_orientation(args.orientation, args.n_theta_fit, args.n_dphi_fit)
 
     key = jax.random.PRNGKey(args.seed)
     k_mc, k_cat = jax.random.split(key, 2)
+    # hybrid_1g: evaluate the gen==1 natal population ANALYTICALLY (no chi=0 KDE
+    # boundary bias) — needed (together with --inject particles) to recover a
+    # near-edge natal spin MEAN. Default off = the plain KDE path, unchanged.
     dist_fn = make_coagulation_dist_fn(
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
         depletion_fraction=0.10, gate="soft", grid=fit_grid, mc_jax_key=k_mc,
-        solver=args.solver, orientation=orientation)
+        solver=args.solver, orientation=orientation,
+        hybrid_1g=(True if args.hybrid_1g else None))
 
     # self-consistent log_rate calibration against the fit's own μ metric
     probe = dist_fn(**{**theta_star, "log_rate": 0.0})
@@ -121,8 +126,14 @@ def _setup(args):
     truth_model = dist_fn(**theta_star)
     k_true, k_scat = jax.random.split(k_cat, 2)
     m_hi = fixed["m_max"] * 2.5
-    true_pts = fit.sample_from_model(truth_model, args.n_obs, k_true,
-                                     m_lo=fixed["m_min"], m_hi=m_hi)
+    if args.inject == "particles":
+        # exact particle spins (no coarse chi-grid smear) — draws binary pairs
+        # straight from the mc_jax pool. Needed to recover a near-edge natal
+        # spin mean; the grid sampler's 8-point chi grid smears it.
+        true_pts = fit.sample_pairs_from_particles(truth_model, args.n_obs, k_true)
+    else:
+        true_pts = fit.sample_from_model(truth_model, args.n_obs, k_true,
+                                         m_lo=fixed["m_min"], m_hi=m_hi)
     if args.delta:
         # exact-injection (delta PE): one delta sample per event, flat weights
         # — the density-mode cross-check catalogue.
@@ -133,7 +144,18 @@ def _setup(args):
         ln_offsets = jnp.zeros((args.n_obs, args.n_samples))
 
     # the REAL gwkokab numpyro model (priors + analytical-Poisson factor)
-    variables, variables_index = build_stage1_variables()
+    # The default log_rate prior is Uniform(-2, 6); log_rate* = log(n_obs/mu_unit)
+    # grows with the catalogue and EXCEEDS 6 for n_obs >~ 150 (at n_obs=300 the
+    # truth is 6.70). A ceiling below the truth forbids the true rate and forces
+    # the fit to compensate through kernel_b (sign-flips) — so widen it at scale.
+    if args.log_rate_max is not None:
+        import numpyro.distributions as _dist
+        pf = stage1_prior_factories()
+        _hi = float(args.log_rate_max)
+        pf["log_rate"] = (lambda hi=_hi: _dist.Uniform(-2.0, hi))
+        variables, variables_index = build_stage1_variables(prior_factories=pf)
+    else:
+        variables, variables_index = build_stage1_variables()
     priors = build_stage1_priors(variables)
     log_lik_fn = build_coagulation_likelihood(
         dist_fn=dist_fn, priors=priors, variables=variables,
@@ -227,6 +249,30 @@ def main():
     ap.add_argument("--svi-lr", type=float, default=0.01)
     ap.add_argument("--svi-draws", type=int, default=2000)
     ap.add_argument("--svi-init-scale", type=float, default=0.1)
+    ap.add_argument("--guide", choices=["meanfield", "mvn", "lowrank"],
+                    default="meanfield",
+                    help="SVI guide family; use mvn/lowrank (full-rank) at "
+                         "catalogue scale where the mean-field factorised "
+                         "Gaussian collapses to a biased mode")
+    ap.add_argument("--spin-loc-truth", type=float, default=0.05,
+                    help="injected natal_spin_loc (mu_chi). 0.05 is 0.5-sigma "
+                         "from the chi=0 edge (hard); >=0.15 is cleanly recoverable")
+    ap.add_argument("--inject", choices=["grid", "particles"], default="grid",
+                    help="mock-catalogue sampler: 'particles' draws exact spins "
+                         "from the pool (no coarse chi-grid smear) — needed for "
+                         "near-edge spin recovery")
+    ap.add_argument("--hybrid-1g", action="store_true",
+                    help="evaluate the gen==1 natal population analytically "
+                         "(no chi=0 KDE boundary bias)")
+    ap.add_argument("--log-rate-max", type=float, default=None,
+                    help="override the log_rate Uniform upper bound (default 6); "
+                         "REQUIRED for n_obs>~150 where log_rate*=log(n_obs/mu) "
+                         "exceeds 6 and the default prior forbids the truth")
+    ap.add_argument("--init", choices=["default", "median", "truth"],
+                    default="default",
+                    help="guide init: 'truth' seeds at theta* (local coverage "
+                         "demo) to avoid the kernel_b<0 decoy mode that attracts "
+                         "generic starts at large n_obs")
     ap.add_argument("--svi-clip", type=float, default=10.0)
     ap.add_argument("--nuts", action="store_true")
     ap.add_argument("--nuts-warmup", type=int, default=150)
@@ -263,7 +309,9 @@ def main():
 
     import optax
     from numpyro.infer import SVI, Trace_ELBO
-    from numpyro.infer.autoguide import AutoNormal
+    from numpyro.infer.autoguide import (AutoNormal, AutoMultivariateNormal,
+                                          AutoLowRankMultivariateNormal)
+    from numpyro.infer import init_to_median, init_to_value
     from numpyro.optim import optax_to_numpyro
 
     # --- SVI -----------------------------------------------------------------
@@ -271,9 +319,39 @@ def main():
     # the mean-field guide out of the param regions where the soft-gate cascade
     # NaNs in the BACKWARD pass (the forward is nan_to_num-guarded inside
     # gwkokab; the gradient is not — [[feedback-where-guards-forward-not-backward]]).
-    print(f"\n[SVI] AutoNormal(init_scale={args.svi_init_scale}) + clipped Adam, "
-          f"{args.svi_steps} steps")
-    guide = AutoNormal(model, init_scale=args.svi_init_scale)
+    #
+    # GUIDE CHOICE: the mean-field AutoNormal is fine at small N (the posterior is
+    # broad and near-round), but as the catalogue grows the posterior TIGHTENS and
+    # DEVELOPS CORRELATIONS (notably kernel_b <-> log_rate <-> natal_spin_loc); the
+    # factorised Gaussian then cannot represent the curved ridge and collapses onto
+    # a CONFIDENT BIASED mode (observed at n_obs=300: kernel_b flips to ~-1.6 while
+    # the 1-D logL profiles through theta* still peak exactly at truth — i.e. an
+    # inference artefact, not a likelihood bias). A full-rank guide restores the
+    # correlations. Use --guide mvn (or lowrank) at catalogue scale.
+    #
+    # INIT: at n_obs=300 a SECOND mode (kernel_b ~ -1.6, lower log_rate) becomes
+    # broadly attractive and EVERY generic-start guide (mean-field AND full-rank,
+    # init_to_uniform AND init_to_median) collapses into it, despite theta* being
+    # the true global logL max (profiles confirm). --init truth seeds the guide at
+    # theta* so it stays in the correct basin: a LOCAL / initialisation-assisted
+    # coverage demonstration (disclosed as such), not a claim that a blind fit
+    # lands on truth at this catalogue size.
+    if args.init == "truth":
+        init_loc_fn = init_to_value(
+            values={p: float(theta_star[p]) for p in PARAM_NAMES})
+    elif args.init == "median":
+        init_loc_fn = init_to_median()
+    else:
+        init_loc_fn = None
+    guide_kw = {} if init_loc_fn is None else {"init_loc_fn": init_loc_fn}
+    if args.guide == "mvn":
+        guide = AutoMultivariateNormal(model, init_scale=args.svi_init_scale, **guide_kw)
+    elif args.guide == "lowrank":
+        guide = AutoLowRankMultivariateNormal(model, init_scale=args.svi_init_scale, **guide_kw)
+    else:
+        guide = AutoNormal(model, init_scale=args.svi_init_scale, **guide_kw)
+    print(f"\n[SVI] guide={args.guide} init={args.init} "
+          f"(init_scale={args.svi_init_scale}) + clipped Adam, {args.svi_steps} steps")
     optimizer = optax_to_numpyro(
         optax.chain(optax.clip_by_global_norm(args.svi_clip),
                     optax.adam(args.svi_lr)))

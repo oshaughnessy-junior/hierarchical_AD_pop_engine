@@ -113,6 +113,10 @@ def main():
     ap.add_argument("--n-theta-fit", type=int, default=2)
     ap.add_argument("--n-dphi-fit", type=int, default=4)
     ap.add_argument("--out-tag", type=str, default="")
+    ap.add_argument("--spin-loc-truth", type=float, default=0.05,
+                    help="injected natal_spin_loc (must match the posterior run)")
+    ap.add_argument("--hybrid-1g", action="store_true",
+                    help="analytic gen==1 natal density (match the posterior run)")
     ap.add_argument("--load-posterior", type=str, default=None,
                     help="npz of saved posterior draws (stage1_post_svi*.npz from "
                          "posterior_stage1_gwkokab.py) to forward-model; skips the "
@@ -134,7 +138,7 @@ def main():
             m_min=fixed["m_min"], m_max=fixed["m_max"],
             n_m=args.n_m_fit or demo.N_M_FIT, n_chi=args.n_chi_fit or demo.N_CHI_FIT)
     demo.build_truth_model_and_calibrate_rate(args.n_obs, grid=fit_grid)
-    demo.THETA_STAR["natal_spin_loc"] = 0.05
+    demo.THETA_STAR["natal_spin_loc"] = args.spin_loc_truth
     theta_star = dict(demo.THETA_STAR)
     orientation = _build_orientation(args.orientation, args.n_theta_fit, args.n_dphi_fit)
 
@@ -144,7 +148,8 @@ def main():
         v_esc=fixed["v_esc"], m_min=fixed["m_min"], m_max=fixed["m_max"],
         kernel_a=fixed["kernel_a"], k_max=args.k_max, n_seed=args.n_seed,
         depletion_fraction=0.10, gate=args.gate, grid=fit_grid, mc_jax_key=k_mc,
-        solver=args.solver, orientation=orientation)
+        solver=args.solver, orientation=orientation,
+        hybrid_1g=(True if args.hybrid_1g else None))
 
     probe = dist_fn(**{**theta_star, "log_rate": 0.0})
     mu_unit, _ = coagulation_poisson_mean_estimator(probe, T_obs=1.0, n_quad=args.n_quad)

@@ -222,6 +222,7 @@ def make_coagulation_dist_fn(
     natal_family: str = "gaussian",
     float_kernel_a: bool = False,
     kde_adaptive: bool = False,
+    hybrid_1g: Optional[bool] = None,
     solver: str = "mc_jax",
     epsilon: float = 1.0,
     orientation: Any = None,
@@ -400,6 +401,8 @@ def make_coagulation_dist_fn(
                 mc_jax_key=mc_jax_key,
                 mc_jax_gate=gate,
                 mc_jax_n_steps_mult=n_steps_mult,
+                mc_jax_kde_adaptive=kde_adaptive,
+                mc_jax_hybrid_1g=hybrid_1g,
             )
             return _wrap(response)
     else:  # two_gaussian
