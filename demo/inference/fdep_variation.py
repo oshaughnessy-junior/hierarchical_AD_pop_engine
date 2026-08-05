@@ -48,6 +48,7 @@ def main():
     ax[0].fill_between(gx, glo, ghi, color="grey", alpha=0.25, label="GWTC-5.0 90%")
     ax[0].plot(gx, gr, "k", lw=1.2, label="GWTC-5.0 median")
     cols = plt.cm.viridis(np.linspace(0.1, 0.85, len(SHOW)))
+    R0s = []                       # (f_dep, R0) per brightness -> results fragment
     base_key = jax.random.PRNGKey(0)
     for fi, ((fdep, d), col) in enumerate(zip(SHOW, cols)):
         if not os.path.exists(os.path.join(ROOT, d, "two_channel_pl_post.npz")):
@@ -67,6 +68,15 @@ def main():
             M.SAMPLER_KEY = jax.random.fold_in(jax.random.fold_in(base_key, 100 + fi), int(dj))
             comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
             th = {k: float(post[k][di]) for k in KS}
+            # STALENESS REPAIR (2026-08-04): make_combined_pl's `combined()` gained a
+            # REQUIRED keyword-only `v_esc` after this script was last run, so it had
+            # been failing outright. Take it per-draw from the posterior when present
+            # else M.V_ESC (= 300 km/s). NOT 1000: the committed f0*_fa0w config
+            # (NOTES.md sec.4) does not pass --v-esc, and --v-esc defaults to
+            # M.V_ESC, so these posteriors were fitted at the 300 km/s default.
+            # Hardcoding 1000 here would silently change the physics, not repair
+            # the API.
+            th["v_esc"] = float(np.asarray(post["v_esc"])[di]) if "v_esc" in post.files else float(M.V_ESC)
             s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
             m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
             prim = m0 >= m1c; m1i = np.where(prim, m0, m1c); m2i = np.where(prim, m1c, m0)
@@ -81,6 +91,7 @@ def main():
         p1 = np.clip(gaussian_kde(m1, weights=w, bw_method=0.08)(m1g), 0, None)
         dR = R0 * p1 / np.trapezoid(p1, m1g)
         print(f"  F_dep={fdep}: self-calibrated R0={R0:.4g} Gpc^-3 yr^-1")
+        R0s.append((fdep, float(R0)))
         ax[0].plot(m1g, dR, color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
         aq = kernel_quantiles(m1, a_prim, w, grid, 6.0, [0.5])
         ax[1].plot(grid, aq[:, 0], color=col, lw=2, label=rf"$F_{{\rm dep}}={fdep}$")
@@ -93,6 +104,29 @@ def main():
     ax[1].set_title("Spin-magnitude trend vs cascade brightness"); ax[1].legend(fontsize=8)
     fig.suptitle(r"Dependence of the observables on cascade brightness $F_{\rm dep}$", fontsize=12)
     fig.tight_layout(); fig.savefig(OUT, dpi=140, bbox_inches="tight"); print("wrote", OUT)
+
+    # ---- paper results fragment (2026-08-04) --------------------------------
+    # appendix_fdep_stability.tex quotes ONE self-calibrated rate as stable
+    # across the brightness sweep. It carried a hand-transcribed R_0 ~ 28, which
+    # was the factor-2.05 VT bug (vt_calibration.mass_density_from_samples
+    # returned the half/full-plane density where compute_VT needs the ordered
+    # one). Emit it as a computed macro so the value can no longer drift from
+    # the run that produced it.
+    if R0s:
+        import sys
+        sys.path.insert(0, os.path.join(
+            _HERE, "../../../gwk-hierarchical-interactions/refit_exchange"))
+        from results_fragment import write_fragment
+        vals = [r for _, r in R0s]
+        lo, hi = min(vals), max(vals)
+        write_fragment(
+            os.path.join(ROOT, "fdep_variation_fragment.json"),
+            {"StabRzero": {"latex": rf"\approx{np.mean(vals):.0f}", "value": round(float(np.mean(vals)), 2)},
+             "StabRzeroRange": {"latex": rf"{lo:.1f}\text{{--}}{hi:.1f}", "value": [round(lo, 2), round(hi, 2)]}},
+            source=("fdep_variation.py (self-calibrated injection-VT rate, "
+                    f"kappa={V.KAPPA_LVK}, n_draw={args.n_draw}, f_dep sweep "
+                    f"{[f for f, _ in R0s]}); CORRECTED VT (ordered-density fix)"),
+            data="figures_nal_f0{030,060,090,120}_fa0w posteriors, v_esc=M.V_ESC=300")
 
 
 if __name__ == "__main__":

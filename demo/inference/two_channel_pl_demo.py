@@ -206,11 +206,114 @@ def make_sampler_alignedseed(n_seed):
     return sampler_alignedseed
 
 
+# ---- opt-in CHANNEL-B MIXTURE: power law + Gaussian peak (--channel-b-mix) ----
+# The single aligned low-mass Gaussian is forced to cover ALL m1<15 structure in
+# the NAL fits (fitted sig_B 2.4-2.75, far wider than the sharp ~10 Msun GWTC-5
+# peak; sig_chiB rails at 0.3).  Following the hierarchical sub-population paper
+# (arXiv 2607.15431, Zeeshan & O'Shaughnessy; GWTC-5 BPL+2P run: low-mass peak
+# loc 9.8+/-0.3, scale ~0.8, PL slope alpha1~1.4, peak share lambda~0.4), channel
+# B becomes the two-component 1D mass law
+#     p(m) = (1-f_peakB) * PL(m^-alpha_B) + f_peakB * N(mu_B, sig_B)
+# on [BMIX_MLO, BMIX_MHI], both components grid/trunc-normalized on that support.
+# (mu_B, sig_B) keep their existing priors and are REINTERPRETED as the narrow
+# peak; NEW sampled params f_peakB (peak share) and alpha_B (PL slope).  The two
+# component masses are IMPORTANCE-SAMPLED from a FROZEN log-uniform proposal so
+# every hyperparameter (incl. alpha_B, f_peakB) enters smoothly through the IS
+# weights -- no discrete component assignment, no inverse-CDF alpha=1 pole (the
+# PL norm is a grid sum, cf. _log_p_mass_pl_cutoff).  Pairing (iid pair, sort)
+# and the aligned spin law chi ~ N(mu_chiB, sig_chiB) (both cols) are UNCHANGED
+# from make_channelB_sampler.  All OFF unless --channel-b-mix (bit-compatible).
+CHANNEL_B_MIX = False                # master switch (set by --channel-b-mix)
+BMIX_MLO, BMIX_MHI = 5.0, 20.0       # mixture mass support [Msun]
+# proposal = (1-FRAC)*log-uniform + FRAC*truncnorm(MU,SIG): the truncnorm part
+# covers narrow peaks near ~10 Msun (ESS at the Zee-like point 1414/2500 vs 684
+# for pure log-uniform; narrow-peak corner 125 vs 43).  Frozen, self-correcting.
+BMIX_PROP_MU, BMIX_PROP_SIG, BMIX_PROP_FRAC = 10.0, 2.0, 0.4
+BMIX_KEY = jax.random.PRNGKey(20260722)
+
+
+def make_channelB_mix_sampler(n_b):
+    from jax.scipy.special import ndtri
+    from jax.scipy.stats import norm as _jn
+    u_m = jax.random.uniform(BMIX_KEY, (n_b, 2))
+    z_chi = jax.random.normal(jax.random.fold_in(BMIX_KEY, 1), (n_b,))
+    u_sel = jax.random.uniform(jax.random.fold_in(BMIX_KEY, 2), (n_b, 2))
+    u_pk = jax.random.uniform(jax.random.fold_in(BMIX_KEY, 3), (n_b, 2))
+    # frozen two-component proposal on [BMIX_MLO, BMIX_MHI] for both pair members
+    m_lu = BMIX_MLO * (BMIX_MHI / BMIX_MLO) ** u_m
+    clo = _jn.cdf((BMIX_MLO - BMIX_PROP_MU) / BMIX_PROP_SIG)
+    chi_ = _jn.cdf((BMIX_MHI - BMIX_PROP_MU) / BMIX_PROP_SIG)
+    m_gs = BMIX_PROP_MU + BMIX_PROP_SIG * ndtri(clo + u_pk * (chi_ - clo))
+    m_prop = jnp.where(u_sel < BMIX_PROP_FRAC, m_gs, m_lu)
+    q_lu = 1.0 / (m_prop * math.log(BMIX_MHI / BMIX_MLO))
+    q_gs = (jnp.exp(_jn.logpdf((m_prop - BMIX_PROP_MU) / BMIX_PROP_SIG))
+            / BMIX_PROP_SIG / (chi_ - clo))
+    log_q_prop = jnp.log((1.0 - BMIX_PROP_FRAC) * q_lu + BMIX_PROP_FRAC * q_gs)
+    grid = jnp.linspace(BMIX_MLO, BMIX_MHI, 2001)
+    dg = grid[1] - grid[0]
+
+    def log_p_mix(m, f_peak, mu, sig, alpha):
+        norm_pl = jnp.sum(grid ** (-alpha)) * dg          # smooth in alpha, no pole
+        log_pl = -alpha * jnp.log(m) - jnp.log(norm_pl)
+        log_pk = _tn_logpdf_trunc(m, mu, sig, BMIX_MLO, BMIX_MHI)
+        return jnp.logaddexp(jnp.log1p(-f_peak) + log_pl, jnp.log(f_peak) + log_pk)
+
+    def sampler_B_mix(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B, f_peakB, alpha_B):
+        lp = log_p_mix(m_prop, f_peakB, mu_B, sig_B, alpha_B)
+        log_w = jnp.sum(lp - log_q_prop, axis=1)          # iid pair IS weight
+        m1 = jnp.maximum(m_prop[:, 0], m_prop[:, 1])
+        m2 = jnp.minimum(m_prop[:, 0], m_prop[:, 1])
+        chi = jnp.clip(mu_chiB + sig_chiB * z_chi, -0.99, 0.99)
+        s = jnp.stack([m1, m2, chi, chi], axis=1)
+        log_w = log_w - logsumexp(log_w) + log_R_B
+        return s, log_w
+    return sampler_B_mix
+
+
+# ---- opt-in CHANNEL C: analytic near-equal "gap-filler" (paper Fig 3 B_c/B_d) --
+# A THIRD, non-cascading component: primary mass from a power law (B_c: the
+# physics-constrained field-2g bump, PL m^-2 on [20,45]) or a Gaussian (B_d: the
+# broad unconstrained ansatz, N(28,10)); q ~ Beta(qa,qb) favouring equal;
+# ISOTROPIC chi_eff ~ N(0, chi_sig).  Frozen base draws + smooth reparametrisation
+# so the Gaussian (mu_C, sig_C) can be SAMPLED (B_d) while the PL shape stays a
+# fixed model identity (B_c).  chi_eff is stored in both spin columns (channel-B
+# convention) so the downstream (Mc,eta,chi_eff) map reproduces it exactly.
+CHANNEL_C = "off"                    # off | pl | gauss   (set by --channel-c)
+C_MLO, C_MHI, C_ALPHA = 20.0, 45.0, 2.0   # PL bounds/slope (B_c identity)
+C_QA, C_QB = 4.0, 1.0                # q ~ Beta(qa,qb) (near-equal preference)
+C_CHI_SIG = 0.2                      # isotropic chi_eff width
+N_C = 2500                           # channel-C sample count (analytic: cheap)
+# B_b (alignedseed gap-filler): the aligned-seed cascade shape is PINNED at the
+# borrowed field values (only the rate log_R_C is free) -- the B_b identity.
+AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C = 9.5, 1.0, 0.10, 0.05
+C_KEY = jax.random.PRNGKey(20260721)
+
+
+def make_channelC_sampler(n_c):
+    u_m = jax.random.uniform(C_KEY, (n_c,))
+    z_m = jax.random.normal(jax.random.fold_in(C_KEY, 1), (n_c,))
+    q_c = jax.random.beta(jax.random.fold_in(C_KEY, 2), C_QA, C_QB, (n_c,))
+    z_chi = jax.random.normal(jax.random.fold_in(C_KEY, 3), (n_c,))
+
+    def sampler_C(mu_C, sig_C, log_R_C):
+        if CHANNEL_C == "pl":        # inverse-CDF PL m^-alpha on [C_MLO, C_MHI]
+            a1 = 1.0 - C_ALPHA
+            m1 = (C_MLO ** a1 + u_m * (C_MHI ** a1 - C_MLO ** a1)) ** (1.0 / a1)
+        else:                        # gauss: smooth reparam, (mu_C, sig_C) sampleable
+            m1 = jnp.clip(mu_C + sig_C * z_m, M.M_MIN * 1.2, M_MAX_PROP * 0.99)
+        m2 = jnp.clip(q_c * m1, M.M_MIN * 1.01, m1)
+        chieff = jnp.clip(C_CHI_SIG * z_chi, -0.99, 0.99)
+        s = jnp.stack([m1, m2, chieff, chieff], axis=1)
+        return s, jnp.full((n_c,), log_R_C - math.log(n_c))
+    return sampler_C
+
+
 def make_combined_pl(n_seed_A, n_b):
     samp_A = make_sampler_A_mmax(n_seed_A)       # power-law natal, FREE m_max, cascade
     # channel B: non-cascading aligned Gaussian (default) OR the REAL aligned-seed
     # exchange cascade with differentiable tilt-moment chi_eff (--aligned-seed).
     samp_B = (make_sampler_alignedseed(n_b) if ALIGNED_SEED
+              else make_channelB_mix_sampler(n_b) if CHANNEL_B_MIX
               else tc.make_channelB_sampler(n_b))  # aligned Gaussian, no cascade
 
     # NOTE: kernel_a/kernel_b are kept fixed (M.KERNEL_A/B). Freeing them was a
@@ -237,8 +340,17 @@ def make_combined_pl(n_seed_A, n_b):
     # both the 2g kernel and a free/negative b1 are on we set KERNEL_2G_B = -b1 so
     # the 2g net q-power is 0 (the boost cancels the base q^b1 for >=2g pairs and
     # leaves exp[-(1-q)^2/2sigq^2]*(M/M*)^gamma).  None = keep the pinned M.KERNEL_B.
+    # channel C (opt-in gap-filler, paper Fig 3): analytic near-equal component
+    # (pl = B_c, gauss = B_d) or the REAL aligned-seed cascade (alignedseed = B_b,
+    # shape pinned at the borrowed field values; only its rate log_R_C is free).
+    if CHANNEL_C in ("pl", "gauss"):
+        samp_C = make_channelC_sampler(N_C)
+    elif CHANNEL_C == "alignedseed":
+        samp_C = make_sampler_alignedseed(N_C)
+
     def combined(*, alpha_A, m_max_A, spin_chi, mu_B, sig_B, mu_chiB, sig_chiB,
-                 log_R_A, log_R_B, v_esc, sigq_2g=None, gamma_2g=None, kernel_b1=None):
+                 log_R_A, log_R_B, v_esc, sigq_2g=None, gamma_2g=None, kernel_b1=None,
+                 log_R_C=None, mu_C=None, sig_C=None, f_peakB=None, alpha_B=None):
         if sigq_2g is not None:
             bpm.KERNEL_2G_SIGQ = sigq_2g
         if gamma_2g is not None:
@@ -249,9 +361,18 @@ def make_combined_pl(n_seed_A, n_b):
         sA, lwA = samp_A(alpha_A, m_max_A, spin_chi, M.KERNEL_A, kb, log_R_A, v_esc)
         if ALIGNED_SEED:
             sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B, v_esc)
+        elif CHANNEL_B_MIX:
+            sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B, f_peakB, alpha_B)
         else:
             sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B)
-        return jnp.concatenate([sA, sB], 0), jnp.concatenate([lwA, lwB], 0)
+        parts_s, parts_lw = [sA, sB], [lwA, lwB]
+        if CHANNEL_C in ("pl", "gauss"):
+            sC, lwC = samp_C(mu_C, sig_C, log_R_C)
+            parts_s.append(sC); parts_lw.append(lwC)
+        elif CHANNEL_C == "alignedseed":
+            sC, lwC = samp_C(AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C, log_R_C, v_esc)
+            parts_s.append(sC); parts_lw.append(lwC)
+        return jnp.concatenate(parts_s, 0), jnp.concatenate(parts_lw, 0)
     sA0, _ = samp_A(2.0, 50.0, 0.1, M.KERNEL_A, M.KERNEL_B, 0.0, M.V_ESC)
     return combined, int(sA0.shape[0])
 
@@ -370,6 +491,74 @@ def main():
     p.add_argument("--as-sig", type=float, default=1.0, help="borrowed aligned-field mass width")
     p.add_argument("--as-chimu", type=float, default=0.10, help="borrowed natal aligned chi mean")
     p.add_argument("--as-chisig", type=float, default=0.05, help="borrowed natal aligned chi width")
+    # ---- opt-in RATIONAL g(eta) mean-field kernel (note 61; observables 692197e) --
+    # Replaces the (2eta)^b / exchange comparable-mass preference with the
+    # scanned rational form: K = M^a * [floor + g(eta)], g = "sat" saturating
+    # eta^p/(eta0^p+eta^p) or "lor" interior Lorentzian bump at eta0 (note-61
+    # winner: lor, eta0~0.23). FIXED params (grid/scan values), not sampled.
+    p.add_argument("--kernel-geta", action="store_true",
+                   help="turn on the rational g(eta) kernel (bpm.KERNEL_GETA_ON).")
+    p.add_argument("--kernel-geta-form", default="lor", choices=["sat", "lor"])
+    p.add_argument("--kernel-geta-eta0", type=float, default=0.23)
+    p.add_argument("--kernel-geta-p", type=float, default=4.0, help="sat sharpness")
+    p.add_argument("--kernel-geta-w", type=float, default=0.03, help="lor half-width")
+    p.add_argument("--kernel-geta-floor", type=float, default=0.0)
+    # ---- opt-in CHANNEL-B MIXTURE: PL + Gaussian peak (arXiv 2607.15431) ------
+    p.add_argument("--channel-b-mix", action="store_true",
+                   help="channel B mass law = (1-f_peakB)*PL(m^-alpha_B) + "
+                        "f_peakB*N(mu_B,sig_B) on [bmix-mlo,bmix-mhi]; SAMPLES "
+                        "f_peakB + alpha_B on top of the existing B params "
+                        "(mu_B/sig_B reinterpreted as the NARROW peak). "
+                        "Incompatible with --aligned-seed.")
+    p.add_argument("--bmix-mlo", type=float, default=5.0)
+    p.add_argument("--bmix-mhi", type=float, default=20.0)
+    p.add_argument("--bmix-f-min", type=float, default=0.01,
+                   help="f_peakB ~ U[f-min,f-max] (bounds off 0/1 keep logaddexp finite)")
+    p.add_argument("--bmix-f-max", type=float, default=0.99)
+    p.add_argument("--bmix-alpha-min", type=float, default=-4.0,
+                   help="alpha_B ~ U[alpha-min,alpha-max] (2607.15431 prior U[-4,12]; "
+                        "GWTC-5 posterior alpha1 ~ 1.4)")
+    p.add_argument("--bmix-alpha-max", type=float, default=8.0)
+    p.add_argument("--fix-alpha-b", type=float, default=None,
+                   help="PIN the channel-B mixture PL slope alpha_B at this value "
+                        "(model identity, like the channel-C shapes) instead of "
+                        "sampling it. Post-NSBH-cleanup the PL goes vestigial "
+                        "(f_peakB ~0.88) so a FREE alpha_B is unidentifiable and its "
+                        "flat direction wrecks sig_B's mixing; pinning it keeps the "
+                        "narrow-peak + tail structure AND restores identifiability. "
+                        "2607.15431 GWTC-5 value ~1.4. None = sampled (default).")
+    p.add_argument("--sig-b-min", type=float, default=0.5,
+                   help="sig_B prior floor (U[sig-b-min,3]). Default 0.5 = committed "
+                        "prior. The first Bmix fit's sig_B 5th pct touched 0.5 -> use "
+                        "0.2 for mixture runs so the narrow peak is not floor-limited.")
+    # ---- opt-in CHANNEL C gap-filler (paper Fig 3 B_b/B_c/B_d full inference) --
+    p.add_argument("--channel-c", default="off", choices=["off", "pl", "gauss", "alignedseed"],
+                   help="third component: pl = B_c physics-constrained near-equal bump "
+                        "(PL m^-alpha on [c-mlo,c-mhi], shape FIXED, rate free); gauss = B_d "
+                        "broad unconstrained ansatz (mu_C/sig_C SAMPLED + rate); alignedseed = "
+                        "B_b native aligned-seed cascade (shape pinned at --as-*, rate free).")
+    p.add_argument("--c-mlo", type=float, default=20.0)
+    p.add_argument("--c-mhi", type=float, default=45.0)
+    p.add_argument("--c-alpha", type=float, default=2.0)
+    p.add_argument("--c-qa", type=float, default=4.0, help="q ~ Beta(qa,qb); B_c best 4, B_d best 6")
+    p.add_argument("--c-qb", type=float, default=1.0)
+    p.add_argument("--c-chi-sig", type=float, default=0.2, help="isotropic chi_eff width (B_d best 0.1)")
+    p.add_argument("--c-mu", type=float, default=28.0, help="gauss (B_d) mass mean init")
+    p.add_argument("--c-sig", type=float, default=10.0, help="gauss (B_d) mass width init")
+    p.add_argument("--fix-c-shape", action="store_true",
+                   help="gauss only: PIN (mu_C, sig_C) instead of sampling them")
+    p.add_argument("--n-c", type=int, default=2500)
+    # ---- chain initialization at a known good point (Fig 3 construction) ------
+    p.add_argument("--seed", type=int, default=0,
+                   help="NUTS PRNG seed (was hard-coded 0). Distinct seeds give "
+                        "INDEPENDENT chains for the same model, so a batch of runs can "
+                        "be pooled to get usable quantiles/tails at the ~30-40 ESS a "
+                        "single 400-sample chain delivers. Default 0 = bit-compatible "
+                        "with every run to date. Feeds the checkpointed and plain paths.")
+    p.add_argument("--init-json", default=None,
+                   help="JSON dict {param: value} -> numpyro init_to_value for the listed "
+                        "sampled params (others fall back to prior median). Use the Fig 3 / "
+                        "v_esc-scan posterior means to start chains at the known basin.")
     p.add_argument("--outdir", default=os.path.join(_HERE, "figures_two_channel_pl"))
     p.add_argument("--max-wall-s", type=float, default=None,
                    help="exit-driven checkpointing: wall-clock budget (s) per process. After a "
@@ -382,6 +571,10 @@ def main():
                    help="exit code emitted on an exit-driven checkpoint (must match the sub's "
                         "checkpoint_exit_code); only used when --max-wall-s is set.")
     args = p.parse_args()
+    global CHANNEL_C, C_MLO, C_MHI, C_ALPHA, C_QA, C_QB, C_CHI_SIG, N_C
+    global AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C
+    global ALIGNED_SEED, AS_F_DEP, AS_SEED_LO, AS_SEED_HI, AS_TWOG_MEMORY
+    global CHANNEL_B_MIX, BMIX_MLO, BMIX_MHI
     M.F_DEP = args.f_dep
     # Configure the opt-in engine knobs BEFORE building the sampler (globals are
     # read at trace time; make_combined_pl traces once during construction).
@@ -411,13 +604,23 @@ def main():
         print(f"KERNEL_2G ON: b2={bpm.KERNEL_2G_B} mstar={bpm.KERNEL_2G_MSTAR} "
               f"sigq={bpm.KERNEL_2G_SIGQ} gamma={bpm.KERNEL_2G_GAMMA} "
               f"{'FREE (sampled)' if args.free_2g_kernel else 'FIXED (anchor)'}")
+    # rational g(eta) kernel: concrete guard BEFORE trace; params fixed (note 61).
+    if args.kernel_geta:
+        bpm.KERNEL_GETA_ON = True
+        bpm.KERNEL_GETA_FORM = str(args.kernel_geta_form)
+        bpm.KERNEL_GETA_ETA0 = float(args.kernel_geta_eta0)
+        bpm.KERNEL_GETA_P = float(args.kernel_geta_p)
+        bpm.KERNEL_GETA_W = float(args.kernel_geta_w)
+        bpm.KERNEL_GETA_FLOOR = float(args.kernel_geta_floor)
+        print(f"KERNEL_GETA ON: form={bpm.KERNEL_GETA_FORM} eta0={bpm.KERNEL_GETA_ETA0} "
+              f"p={bpm.KERNEL_GETA_P} w={bpm.KERNEL_GETA_W} floor={bpm.KERNEL_GETA_FLOOR} (FIXED)")
     print(f"ENGINE KNOBS: exchange_mode={bpm.EXCHANGE_MODE} C={bpm.EXCHANGE_C} "
           f"intruder_n={bpm.EXCHANGE_INTRUDER_N} seg_n={bpm.SEGREGATION_N} "
           f"STE={bpm.EXCHANGE_STE} RETAIN_SOFT={bpm.RETAIN_SOFT} tau={bpm.RETAIN_TAU} | "
           f"v_esc={'FREE[%g,%g]' % (args.v_esc_min, args.v_esc_max) if args.free_v_esc else 'FIXED %g' % args.v_esc}")
     # aligned-seed channel B (opt-in): set the module globals BEFORE the sampler is
     # built (make_sampler_alignedseed reads them at construction/trace time).
-    global ALIGNED_SEED, AS_F_DEP, AS_SEED_LO, AS_SEED_HI, AS_TWOG_MEMORY
+    # (globals declared above, with the channel-C block)
     if args.aligned_seed:
         ALIGNED_SEED = True
         AS_F_DEP = float(args.as_f_dep)
@@ -426,11 +629,48 @@ def main():
         print(f"ALIGNED-SEED channel B: cascade seed ~ N(mu_B,sig_B)[{AS_SEED_LO},{AS_SEED_HI}] "
               f"x aligned natal chi ~ N(mu_chiB,sig_chiB)[0,1]; as_f_dep={AS_F_DEP} "
               f"twog_memory={AS_TWOG_MEMORY}; chi_eff via SMOOTH generation_tilt_chieff_moments")
+    # channel-B mixture globals: set BEFORE make_combined_pl (sampler built there)
+    if args.channel_b_mix:
+        if args.aligned_seed:
+            raise SystemExit("--channel-b-mix is incompatible with --aligned-seed")
+        CHANNEL_B_MIX = True
+        BMIX_MLO, BMIX_MHI = float(args.bmix_mlo), float(args.bmix_mhi)
+        print(f"CHANNEL-B MIX ON: (1-f_peakB)*PL(m^-alpha_B) + f_peakB*N(mu_B,sig_B) "
+              f"on [{BMIX_MLO},{BMIX_MHI}]; f_peakB ~ U[{args.bmix_f_min},{args.bmix_f_max}], "
+              f"alpha_B ~ U[{args.bmix_alpha_min},{args.bmix_alpha_max}] (2607.15431)")
+    # channel C globals: set BEFORE make_combined_pl (samplers built/traced there;
+    # global declarations at the top of main)
+    if args.channel_c != "off":
+        CHANNEL_C = args.channel_c
+        C_MLO, C_MHI, C_ALPHA = args.c_mlo, args.c_mhi, args.c_alpha
+        C_QA, C_QB, C_CHI_SIG = args.c_qa, args.c_qb, args.c_chi_sig
+        N_C = int(args.n_c)
+        AS_MU_C, AS_SIG_C = float(args.as_mu), float(args.as_sig)
+        AS_CHIMU_C, AS_CHISIG_C = float(args.as_chimu), float(args.as_chisig)
+        if args.channel_c == "alignedseed":
+            AS_F_DEP = float(args.as_f_dep)
+            AS_SEED_LO = float(args.as_seed_lo); AS_SEED_HI = float(args.as_seed_hi)
+            AS_TWOG_MEMORY = float(args.as_twog_memory)
+        print(f"CHANNEL C ON ({CHANNEL_C}): "
+              + (f"PL alpha={C_ALPHA} on [{C_MLO},{C_MHI}], q~Beta({C_QA},{C_QB}), "
+                 f"chi_sig={C_CHI_SIG}, shape FIXED" if CHANNEL_C == "pl" else
+                 f"gauss init ({args.c_mu},{args.c_sig}), q~Beta({C_QA},{C_QB}), "
+                 f"chi_sig={C_CHI_SIG}, shape "
+                 + ("FIXED" if args.fix_c_shape else "SAMPLED") if CHANNEL_C == "gauss" else
+                 f"aligned-seed cascade pinned at ({AS_MU_C},{AS_SIG_C},{AS_CHIMU_C},{AS_CHISIG_C}), "
+                 f"as_f_dep={args.as_f_dep}")
+              + f"; n_c={N_C}, rate log_R_C free")
     comb, nA = make_combined_pl(args.n_seed, args.n_b)
 
     TRUTH = dict(alpha_A=2.0, m_max_A=50.0, spin_chi=0.05, mu_B=9.0, sig_B=1.2,
                  mu_chiB=0.15, sig_chiB=0.05, log_R_A=math.log(0.4), log_R_B=math.log(0.6),
                  v_esc=float(args.v_esc))
+    if args.channel_c != "off":
+        TRUTH["log_R_C"] = math.log(0.15)
+        if args.channel_c == "gauss":
+            TRUTH["mu_C"] = args.c_mu; TRUTH["sig_C"] = args.c_sig
+    if args.channel_b_mix:
+        TRUTH["f_peakB"] = 0.6; TRUTH["alpha_B"] = 1.5
 
     if args.mode == "check":
         s, lw = comb(**TRUTH); s = np.asarray(s); w = np.exp(np.asarray(lw))
@@ -485,7 +725,7 @@ def main():
         # run ground for 20h). (ROS 2026-07-04)
         "alpha_A": dist.Uniform(0.0, 3.0), "m_max_A": dist.Uniform(40.0, 70.0),
         "spin_chi": dist.Uniform(0.01, 0.3),
-        "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(0.5, 3.0),   # NARROW low-mass peak
+        "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(args.sig_b_min, 3.0),  # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
         "log_R_A": dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width),
         "log_R_B": dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width)}
@@ -528,9 +768,38 @@ def main():
               "(note 60 family C: extends NEGATIVE)")
     elif args.base_b is not None:
         constants["kernel_b1"] = float(args.base_b)
+    # channel C: the gap-filler rate is always free; the gauss (B_d) shape is
+    # sampled unless --fix-c-shape.  The pl (B_c) / alignedseed (B_b) shapes are
+    # fixed model identities (constants live in the module globals, not kwargs).
+    # channel-B mixture: peak share + PL slope join the sampled set (the peak
+    # (mu_B, sig_B) and the aligned spin law keep their existing priors).
+    if args.channel_b_mix:
+        variables["f_peakB"] = dist.Uniform(args.bmix_f_min, args.bmix_f_max)
+        if args.fix_alpha_b is not None:
+            constants["alpha_B"] = float(args.fix_alpha_b)
+            print(f"FIXED alpha_B = {args.fix_alpha_b} (channel-B PL slope pinned as a "
+                  "model identity, not sampled)")
+        else:
+            variables["alpha_B"] = dist.Uniform(args.bmix_alpha_min, args.bmix_alpha_max)
+    if args.channel_c != "off":
+        variables["log_R_C"] = dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width)
+        if args.channel_c == "gauss":
+            if args.fix_c_shape:
+                constants["mu_C"] = float(args.c_mu); constants["sig_C"] = float(args.c_sig)
+            else:
+                variables["mu_C"] = dist.Uniform(12.0, 45.0)
+                variables["sig_C"] = dist.Uniform(2.0, 15.0)
     names = sorted(variables)
     priors = JointDistribution(*[variables[k] for k in names])
-    kw = dict(init_strategy=init_to_median, max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
+    init_strategy = init_to_median
+    if args.init_json:
+        import json
+        from numpyro.infer import init_to_value
+        init_vals = {k: float(v) for k, v in json.loads(args.init_json).items()
+                     if k in variables}
+        init_strategy = init_to_value(values=init_vals)
+        print(f"INIT at supplied point: {init_vals}")
+    kw = dict(init_strategy=init_strategy, max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
     model = numpyro_sampled_poisson_likelihood(comb, priors, variables, constants, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
     if args.checkpoint_dir:
         import sys
@@ -539,7 +808,7 @@ def main():
               + (f" max_wall_s={args.max_wall_s} exit_code={args.checkpoint_exit_code}" if args.max_wall_s else ""))
         try:
             post = run_nuts_with_checkpoints(model, (jnp.asarray(M.T_OBS),), num_warmup=args.num_warmup,
-                                             num_samples=args.num_samples, key=jax.random.PRNGKey(0),
+                                             num_samples=args.num_samples, key=jax.random.PRNGKey(args.seed),
                                              ckpt_dir=args.checkpoint_dir, chunk=args.chunk, nuts_kwargs=kw,
                                              max_wall_s=args.max_wall_s)
         except CheckpointExit:
@@ -548,7 +817,7 @@ def main():
             sys.exit(args.checkpoint_exit_code)
     else:
         mcmc = MCMC(NUTS(model, **kw), num_warmup=args.num_warmup, num_samples=args.num_samples, progress_bar=True)
-        mcmc.run(jax.random.PRNGKey(0), jnp.asarray(M.T_OBS)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
+        mcmc.run(jax.random.PRNGKey(args.seed), jnp.asarray(M.T_OBS)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
     # re-insert any pinned constant as a constant "posterior" column so downstream
     # readers (figures, vt_calibration) that expect all 9 params still work.
     for k, v in constants.items():
@@ -559,7 +828,21 @@ def main():
         print(f"  {k:9s}: {post[k].mean():7.3f} +/- {post[k].std():.3f}{tag}")
     print(f"  R_A/R_B = {np.exp(post['log_R_A']-post['log_R_B']).mean():.2f}")
     os.makedirs(args.outdir, exist_ok=True)
+    cmeta = ({} if args.channel_c == "off" else dict(
+        channel_c=args.channel_c, c_mlo=C_MLO, c_mhi=C_MHI, c_alpha=C_ALPHA,
+        c_qa=C_QA, c_qb=C_QB, c_chi_sig=C_CHI_SIG, n_c=N_C))
+    bmeta = ({} if not args.channel_b_mix else dict(
+        channel_b_mix=1, bmix_mlo=BMIX_MLO, bmix_mhi=BMIX_MHI,
+        alpha_b_fixed=(-999.0 if args.fix_alpha_b is None else float(args.fix_alpha_b))))
+    # seed provenance: pooling several runs for quantiles requires knowing that
+    # the chains were INDEPENDENT (distinct seeds), so always record it.
+    smeta = dict(seed=int(args.seed))
+    gmeta = ({} if not args.kernel_geta else dict(
+        kernel_geta=1, geta_form=args.kernel_geta_form, geta_eta0=args.kernel_geta_eta0,
+        geta_p=args.kernel_geta_p, geta_w=args.kernel_geta_w,
+        geta_floor=args.kernel_geta_floor))
     np.savez(os.path.join(args.outdir, "two_channel_pl_post.npz"), **post, f_dep=args.f_dep,
+             **cmeta, **bmeta, **gmeta, **smeta,
              **({} if REAL else {f"truth_{k}": TRUTH[k] for k in TRUTH}))
     print(f"wrote {args.outdir}/two_channel_pl_post.npz")
     return 0

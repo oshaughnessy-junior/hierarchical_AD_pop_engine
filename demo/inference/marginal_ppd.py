@@ -93,6 +93,15 @@ def build_pool(n_seed, n_b, n_draw, rng):
             M.SAMPLER_KEY = jax.random.fold_in(base_key, 100000 + ctr); ctr += 1
             comb, nA = pl.make_combined_pl(n_seed, n_b)
             th = {k: float(post[k][i]) for k in KS}
+            # STALENESS REPAIR (2026-08-04): make_combined_pl's `combined()` gained a
+            # REQUIRED keyword-only `v_esc` after this script was last run, so it had
+            # been failing outright. Take it per-draw from the posterior when present
+            # else M.V_ESC (= 300 km/s). NOT 1000: the committed f0*_fa0w config
+            # (NOTES.md sec.4) does not pass --v-esc, and --v-esc defaults to
+            # M.V_ESC, so these posteriors were fitted at the 300 km/s default.
+            # Hardcoding 1000 here would silently change the physics, not repair
+            # the API.
+            th["v_esc"] = float(np.asarray(post["v_esc"])[i]) if "v_esc" in post.files else float(M.V_ESC)
             s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))
             m0, m1c, c0, c1 = s[:, 0], s[:, 1], s[:, 2], s[:, 3]
             isA = np.zeros(len(s), bool); isA[:nA] = True

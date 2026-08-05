@@ -89,6 +89,13 @@ def main():
         M.SAMPLER_KEY = jax.random.fold_in(base, 100000 + row)
         th = {k: float(post[k][i]) for k in KS}
         hyper[row] = [th[k] for k in KS]
+        # STALENESS REPAIR (2026-08-04): make_combined_pl's `combined()` gained a
+        # REQUIRED keyword-only `v_esc` after this script was last run, so it had
+        # been failing outright. Take it per-draw from the posterior when present,
+        # else M.V_ESC (= 300 km/s) -- the committed default these runs were
+        # fitted under (they do not pass --v-esc, whose default IS M.V_ESC).
+        # NOT 1000: that would silently change the physics, not repair the API.
+        th["v_esc"] = float(np.asarray(post["v_esc"])[i]) if "v_esc" in post.files else float(M.V_ESC)
         d = _draw_population(th, rng)
         R0 = V.rate_R0(V.mass_density_from_samples(d["m1"], d["m2"], d["w"]), inj=inj)
         R0s.append(R0)

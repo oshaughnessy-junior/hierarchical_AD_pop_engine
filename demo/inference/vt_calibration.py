@@ -83,8 +83,32 @@ def rate_R0(p_mass_fn, n_obs=N_OBS, kappa=KAPPA_LVK, inj=None):
 
 
 def mass_density_from_samples(m1, m2, w, ngrid=90):
-    """Build a normalized p(m1,m2) [int=1] from weighted population samples, via a
-    smoothed 2D log-mass histogram (symmetrized in m1<->m2). Returns a callable."""
+    """Build p(m1,m2) from weighted population samples, via a smoothed 2D log-mass
+    histogram (symmetrized in m1<->m2). Returns a callable.
+
+    NORMALIZATION CONVENTION --- ORDERED, int_{m1>=m2} p dm1 dm2 = 1.
+    ==============================================================
+    This MUST match compute_VT's `lnpdraw`, which is the LVK injection draw density
+    in the ORDERED variables (mass1_source >= mass2_source). It therefore also
+    matches _gw5_mass_density(), which returns p(m1) p(q) / m1 (unit integral over
+    the half-plane m2 < m1).
+
+    BUG FIXED 2026-08-04 (appendix-G audit): this function previously normalized
+    the SYMMETRIZED density to unit integral over the FULL (m1,m2) plane, i.e. it
+    returned exactly HALF the density compute_VT requires. Every absolute rate
+    computed through it was therefore ~2.05x too high, while the module self-test
+    -- which uses _gw5_mass_density, already in the ordered convention -- kept
+    passing and hid the error. Diagnostic that exposed it: pushing GWTC-5.0's OWN
+    population through this function returned R0 = 30.7 Gpc^-3 yr^-1 against the
+    published 19.1 (and 15.0 via _gw5_mass_density). See _self_test below, which
+    now cross-checks the two routes against each other.
+    AFFECTED CALLERS (all previously ~2.05x high in absolute rate; re-run them):
+      demo/inference/{export_popsummary,gwtc5_overlay_nal,dRdm1dm2_f090,
+                      marginal_ppd,fdep_variation}.py
+      gwk-hierarchical-interactions/refit_exchange/{postprocess_rate_bands,
+                      postprocess_2d_bseries}.py
+      notes/paper_vnext/{plot_nal_validation_dRdm1,rebuild_headline_banded}.py
+    """
     from scipy.ndimage import gaussian_filter
     ok = np.isfinite(m1) & np.isfinite(m2) & (w > 0) & (m1 > 0) & (m2 > 0)
     m1, m2, w = m1[ok], m2[ok], w[ok]
@@ -97,7 +121,8 @@ def mass_density_from_samples(m1, m2, w, ngrid=90):
     M1c = (10.0 ** ctr)[:, None]; M2c = (10.0 ** ctr)[None, :]
     area = M1c * M2c * (np.log(10.0) * dl) ** 2           # linear (m1,m2) bin area
     dens = H / area
-    dens /= np.sum(dens * area)                            # normalize int p dm1 dm2 = 1
+    dens /= np.sum(dens * area)                            # symmetric: int over FULL plane = 1
+    dens *= 2.0                                            # -> ORDERED: int over m1>=m2 = 1
 
     def p_mass(a, b):
         A, B = np.maximum(a, b), np.minimum(a, b)
@@ -138,7 +163,29 @@ def _self_test():
     print(f"  back-calibrated R0(GWTC-5 mass, {N_OBS} ev) = {R0:.4g} Gpc^-3 yr^-1  (cf 18.3)")
     ok = 0.7 < mu / N_OBS < 1.4
     print(f"  SELF-TEST {'PASS' if ok else 'FAIL'} (mu/N_obs = {mu/N_OBS:.2f}, want 0.7-1.4)")
-    return ok
+
+    # REGRESSION GUARD (2026-08-04): the two density builders must agree. Before the
+    # fix, mass_density_from_samples returned the symmetric (half) density and this
+    # ratio was ~2.05, silently doubling every absolute rate built from samples --
+    # while the check above, which never touches that function, kept passing.
+    import numpy.random as _nr
+    rng = _nr.default_rng(0)
+    path = glob.glob(f"{GW5}/**/*default_mmax*popsummary_result.h5", recursive=True)[0]
+    with h5py.File(path, "r") as h:
+        x1 = np.asarray(h["posterior/rates_on_grids/mass_1/positions"]).squeeze()
+        r1 = np.nanpercentile(np.asarray(h["posterior/rates_on_grids/mass_1/rates"]), 50, 0)
+        xq = np.asarray(h["posterior/rates_on_grids/mass_ratio/positions"]).squeeze()
+        rq = np.nanpercentile(np.asarray(h["posterior/rates_on_grids/mass_ratio/rates"]), 50, 0)
+    def _draw(x, r, n):
+        r = np.clip(r, 0, None); c = np.cumsum(r); c /= c[-1]
+        return np.interp(rng.uniform(size=n), c, x)
+    s1 = _draw(x1, r1, 400000); s2 = s1 * _draw(xq, rq, 400000)
+    vt_s = compute_VT(mass_density_from_samples(s1, s2, np.ones_like(s1)), inj=inj)
+    ratio = VT / vt_s
+    ok2 = 0.9 < ratio < 1.1
+    print(f"  CONVENTION CHECK {'PASS' if ok2 else 'FAIL'}: VT(analytic)/VT(from_samples) "
+          f"= {ratio:.3f} (want ~1.0; 2.0 = the pre-2026-08-04 half-density bug)")
+    return ok and ok2
 
 
 if __name__ == "__main__":

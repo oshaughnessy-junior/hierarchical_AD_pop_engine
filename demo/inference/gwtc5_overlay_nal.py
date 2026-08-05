@@ -66,6 +66,19 @@ def main():
         M.SAMPLER_KEY = jax.random.fold_in(base_key, 10000 + j)
         comb, nA = pl.make_combined_pl(args.n_seed, args.n_b)
         th = {k: float(post[k][i]) for k in KS}
+        # STALENESS REPAIR (2026-08-04): make_combined_pl's `combined()` gained a
+        # REQUIRED keyword-only `v_esc` after this script was last run, so it had
+        # been failing outright. Take it per-draw from the posterior when present
+        # else M.V_ESC (= 300 km/s).
+        # CORRECTED 2026-08-04 (was 1000.0): this script's DEFAULT --post is
+        # figures_nal_f090_fa0w, whose committed config (refit_exchange/NOTES.md
+        # sec.4) does not pass --v-esc; --v-esc defaults to M.V_ESC, so that
+        # posterior was fitted at 300 km/s. Evaluating it forward at 1000 raises
+        # remnant retention well above what the fit assumed -- a physics change,
+        # not an API repair. (Note 55 does evaluate this posterior forward at
+        # v_esc=1000, but that is a deliberate labelled forward assessment, not
+        # the self-consistent overlay this figure shows.)
+        th["v_esc"] = float(np.asarray(post["v_esc"])[i]) if "v_esc" in post.files else float(M.V_ESC)
         s, lw = comb(**th); s = np.asarray(s); w = np.exp(np.asarray(lw))     # rate weights
         isA = np.zeros(len(s), bool); isA[:nA] = True
         m1 = np.maximum(s[:, 0], s[:, 1]); m2 = np.minimum(s[:, 0], s[:, 1])
