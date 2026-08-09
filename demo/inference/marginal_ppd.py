@@ -125,7 +125,17 @@ def main():
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
     p.add_argument("--n-draw", type=int, default=32)
+    # --figdir added 2026-08-09. As committed, OUT pointed straight into the LIVE
+    # paper checkout, so merely running this script to read a number overwrote
+    # two committed figures in a tree other sessions are editing -- the same
+    # landmine class as detected_m1_cdf.py's hardcoded OUT. Default is unchanged,
+    # so existing invocations behave identically; pass --figdir to render
+    # somewhere harmless when you only want the fragment.
+    p.add_argument("--figdir", default=OUT)
+    p.add_argument("--frag-dir", default=ROOT)
     args = p.parse_args()
+    outdir = args.figdir
+    os.makedirs(outdir, exist_ok=True)
     rng = np.random.default_rng(11)
     m1, m2, ce, ch, ct, wi, pd = build_pool(args.n_seed, args.n_b, args.n_draw, rng)
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -152,7 +162,7 @@ def main():
     ax[2].set_xlabel(r"$\cos\theta$ (primary tilt)"); ax[2].set_title("Spin tilt by mass region")
     for a in ax: a.set_ylabel("norm. density"); a.legend(fontsize=8)
     fig.suptitle("Model spin PPDs conditioned on primary-mass region (marginalized over $F_{\\rm dep}$, $m_{\\max}$) vs GWTC-5.0 marginal", fontsize=12)
-    fig.tight_layout(); f1 = os.path.join(OUT, "real_spin_ppd_massregions.png"); fig.savefig(f1, dpi=140, bbox_inches="tight"); print("wrote", f1)
+    fig.tight_layout(); f1 = os.path.join(outdir, "real_spin_ppd_massregions.png"); fig.savefig(f1, dpi=140, bbox_inches="tight"); print("wrote", f1)
 
     # ---- Figure 2: intrinsic dR/dm1 AND dR/dm2 marginalized vs GWTC-5.0 ----
     # ABSOLUTE rate: NO GWTC-5 anchor. The model's own z=0 rate R0 is self-calibrated
@@ -174,8 +184,49 @@ def main():
     def logslope(g, y, a=30, b=55):
         m = (g >= a) & (g <= b) & (y > 0)
         return np.polyfit(g[m], np.log(y[m]), 1)[0] if m.sum() > 3 else np.nan
-    print(f"  high-mass (30-55 Msun) log-slope: model dR/dm1={logslope(mg, dR1):+.3f}  dR/dm2={logslope(mg, dR2):+.3f}")
-    print(f"                                    GWTC-5 dR/dm1={logslope(gx1, gmed1):+.3f}  dR/dm2={logslope(mg, g2med):+.3f}")
+    s1, s2 = logslope(mg, dR1), logslope(mg, dR2)
+    g1, gg2 = logslope(gx1, gmed1), logslope(mg, g2med)
+    print(f"  high-mass (30-55 Msun) log-slope: model dR/dm1={s1:+.3f}  dR/dm2={s2:+.3f}")
+    print(f"                                    GWTC-5 dR/dm1={g1:+.3f}  dR/dm2={gg2:+.3f}")
+
+    # RESULT-IZED 2026-08-09 (ROS: "agree we should have result-ized the moving
+    # numbers"). These four slopes were HAND-TRANSCRIBED into
+    # supp_realdata_pairwise.tex as -0.10/-0.13 (model) and -0.13/-0.15
+    # (GWTC-5), and they MOVED -- the 2026-08-04 rerun gave model
+    # -0.144/-0.170 -- with no cause established and no tool to flag it,
+    # because they were plain prose rather than \result{} macros. Emitting them
+    # here means the next run either reproduces the printed numbers or visibly
+    # changes them.
+    #
+    # WHAT THE CLAIM ACTUALLY RESTS ON: not the individual slopes, but the
+    # SIGN of (secondary - primary) in both the model and GWTC-5. That
+    # difference is recorded too, so the sentence can be checked directly
+    # against the thing it asserts.
+    #
+    # CAVEAT, deliberately not hidden: the GWTC-5 dR/dm2 curve is reconstructed
+    # from published m1 and q marginals under an independence assumption, via
+    # rng draws (seeded rng=11 here, so reproducible run-to-run, but NOT a
+    # measurement of the published population). The model slopes additionally
+    # carry cascade MC noise at this n_seed. Treat all four as ~1e-2-level
+    # quantities; do not read a difference in the third decimal.
+    import sys
+    sys.path.insert(0, os.path.join(
+        _HERE, "../../../gwk-hierarchical-interactions/refit_exchange"))
+    from results_fragment import write_fragment
+    write_fragment(
+        os.path.join(args.frag_dir, "marginal_ppd_fragment.json"),
+        {"MargSlopeModelPrimary":     {"latex": f"{s1:+.3f}",       "value": round(float(s1), 4)},
+         "MargSlopeModelSecondary":   {"latex": f"{s2:+.3f}",       "value": round(float(s2), 4)},
+         "MargSlopeGwtcPrimary":      {"latex": f"{g1:+.3f}",       "value": round(float(g1), 4)},
+         "MargSlopeGwtcSecondary":    {"latex": f"{gg2:+.3f}",      "value": round(float(gg2), 4)},
+         "MargSlopeModelSteepening":  {"latex": f"{s2 - s1:+.3f}",  "value": round(float(s2 - s1), 4)},
+         "MargSlopeGwtcSteepening":   {"latex": f"{gg2 - g1:+.3f}", "value": round(float(gg2 - g1), 4)}},
+        source=(f"marginal_ppd.py logslope(30-55 Msun) on the f_dep-profile-weighted, "
+                f"m_max-marginalized pool (n_seed={args.n_seed}, n_b={args.n_b}, "
+                f"n_draw={args.n_draw}, rng=11); CORRECTED VT (ordered-density fix). "
+                f"GWTC-5 dR/dm2 is RECONSTRUCTED from published m1 x q marginals "
+                f"assuming independence -- it does not retain the m1-q correlation"),
+        data=f"{sorted(RUNS.values())} posteriors, v_esc=M.V_ESC={M.V_ESC}, R0={R0:.4g}")
 
     fig2, ax2 = plt.subplots(1, 2, figsize=(12, 4.8))
     ax2[0].fill_between(gx1, glo1, ghi1, color="grey", alpha=0.3, label="GWTC-5.0 90%"); ax2[0].plot(gx1, gmed1, "k", lw=1.5, label="GWTC-5.0 median")
@@ -187,7 +238,7 @@ def main():
         a.set_xlabel(r"$m\ [M_\odot]$"); a.set_ylabel(lab + r" $[{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-1}]$"); a.legend(fontsize=8)
     ax2[0].set_title(r"Primary mass $m_1$"); ax2[1].set_title(r"Secondary mass $m_2$ (GWTC-5 reconstructed)")
     fig2.suptitle(r"Intrinsic mass functions marginalized over $F_{\rm dep}$, $m_{\max}$ vs GWTC-5.0 (median + 90\%)", fontsize=12)
-    fig2.tight_layout(); f2 = os.path.join(OUT, "real_dRdm1_marginal.png"); fig2.savefig(f2, dpi=140, bbox_inches="tight"); print("wrote", f2)
+    fig2.tight_layout(); f2 = os.path.join(outdir, "real_dRdm1_marginal.png"); fig2.savefig(f2, dpi=140, bbox_inches="tight"); print("wrote", f2)
 
 
 if __name__ == "__main__":
