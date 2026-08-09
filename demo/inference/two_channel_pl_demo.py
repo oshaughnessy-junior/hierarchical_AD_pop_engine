@@ -527,6 +527,16 @@ def main():
                         "flat direction wrecks sig_B's mixing; pinning it keeps the "
                         "narrow-peak + tail structure AND restores identifiability. "
                         "2607.15431 GWTC-5 value ~1.4. None = sampled (default).")
+    p.add_argument("--m-max-lo", type=float, default=40.0,
+                   help="m_max_A prior lower bound (default 40.0 = the committed "
+                        "value; every suite fit to date used it, and every one of "
+                        "them rails against it, so the cut-off they report is an "
+                        "upper limit). Lowering this is how you turn that bound "
+                        "into a measurement -- but see the note at the prior "
+                        "definition: lower m_max_A trades against f_dep, which "
+                        "is fixed per run.")
+    p.add_argument("--m-max-hi", type=float, default=70.0,
+                   help="m_max_A prior upper bound (default 70.0, committed)")
     p.add_argument("--sig-b-min", type=float, default=0.5,
                    help="sig_B prior floor (U[sig-b-min,3]). Default 0.5 = committed "
                         "prior. The first Bmix fit's sig_B 5th pct touched 0.5 -> use "
@@ -723,7 +733,20 @@ def main():
         # set by the natal power law. Lower bound kept at 0 (not negative) -- a RISING
         # natal (alpha<0) is unphysical AND makes the cascade MC top-heavy/slow (a -1,6
         # run ground for 20h). (ROS 2026-07-04)
-        "alpha_A": dist.Uniform(0.0, 3.0), "m_max_A": dist.Uniform(40.0, 70.0),
+        # m_max_A prior bounds are now settable. HARDCODED U(40,70) UNTIL
+        # 2026-08-09, and that floor turned out to be load-bearing: every member
+        # of the B-series suite piles against 40 (medians 40.3-40.8, 5th
+        # percentiles within 0.05 of the bound, 35-74% of samples within
+        # 0.5 Msun of it), so the natal cut-off is an UPPER LIMIT, not a
+        # measurement, and the paper's "the model found the PISN edge without
+        # being told to" was circular. Defaults are UNCHANGED so every existing
+        # launch script reproduces bit-for-bit; pass --m-max-lo to open it up.
+        # CAUTION (ROS): a lower m_max_A forces a larger f_dep to fit the same
+        # high-mass census, and that degeneracy is NOT captured here because
+        # f_dep is held fixed per run. A wide sweep can therefore wander into a
+        # region the fixed f_dep cannot support. Prefer a modest widening.
+        "alpha_A": dist.Uniform(0.0, 3.0),
+        "m_max_A": dist.Uniform(args.m_max_lo, args.m_max_hi),
         "spin_chi": dist.Uniform(0.01, 0.3),
         "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(args.sig_b_min, 3.0),  # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
