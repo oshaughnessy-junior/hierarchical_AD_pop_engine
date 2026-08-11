@@ -39,6 +39,12 @@ def main():
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
     p.add_argument("--n-draw", type=int, default=24, help="posterior draws pooled per F_DEP (each a distinct params+key realization; decorrelates high-mass tail)")
+    # --out added 2026-08-10, same landmine as detected_m1_cdf.py and
+    # marginal_ppd.py: the destination was a module constant pointing into the
+    # LIVE paper checkout, so running this script at all overwrote committed
+    # figures in a tree other sessions edit. Default unchanged.
+    p.add_argument("--out", default=OUT,
+                   help="output destination (default: the committed paper figure(s))")
     args = p.parse_args()
     rng = np.random.default_rng(4); pdet = make_real_pdet_fn()
     m1g = np.linspace(3, 100, 120); grid = np.linspace(6, 99, 120)
@@ -103,7 +109,7 @@ def main():
     ax[1].set_ylabel(r"$\chi$ (primary spin magnitude, median)")
     ax[1].set_title("Spin-magnitude trend vs cascade brightness"); ax[1].legend(fontsize=8)
     fig.suptitle(r"Dependence of the observables on cascade brightness $F_{\rm dep}$", fontsize=12)
-    fig.tight_layout(); fig.savefig(OUT, dpi=140, bbox_inches="tight"); print("wrote", OUT)
+    fig.tight_layout(); fig.savefig(args.out, dpi=140, bbox_inches="tight"); print("wrote", args.out)
 
     # ---- paper results fragment (2026-08-04) --------------------------------
     # appendix_fdep_stability.tex quotes ONE self-calibrated rate as stable

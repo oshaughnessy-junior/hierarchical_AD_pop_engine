@@ -527,6 +527,11 @@ def main():
                         "flat direction wrecks sig_B's mixing; pinning it keeps the "
                         "narrow-peak + tail structure AND restores identifiability. "
                         "2607.15431 GWTC-5 value ~1.4. None = sampled (default).")
+    p.add_argument("--spin-chi-lo", type=float, default=0.01,
+                   help="spin_chi prior lower bound (default 0.01 = committed). "
+                        "The v_esc=1000 combined fit rails against it, so the "
+                        "natal spin scale it reports is an upper limit; pass "
+                        "1e-3 to test whether it is identified.")
     p.add_argument("--m-max-lo", type=float, default=40.0,
                    help="m_max_A prior lower bound (default 40.0 = the committed "
                         "value; every suite fit to date used it, and every one of "
@@ -747,7 +752,14 @@ def main():
         # region the fixed f_dep cannot support. Prefer a modest widening.
         "alpha_A": dist.Uniform(0.0, 3.0),
         "m_max_A": dist.Uniform(args.m_max_lo, args.m_max_hi),
-        "spin_chi": dist.Uniform(0.01, 0.3),
+        # spin_chi lower bound settable for the same reason as m_max_A: at
+        # v_esc=1000 the combined fit gives 0.04 [0.01, 0.09], i.e. pressed
+        # against the 0.01 floor, so the natal spin scale is an UPPER LIMIT
+        # under the committed prior rather than a measurement. Default
+        # unchanged; --spin-chi-lo 1e-3 opens it up (ROS 2026-08-10, who also
+        # judged this NOT worth flagging hard in the paper -- it is a follow-up,
+        # not a defect).
+        "spin_chi": dist.Uniform(args.spin_chi_lo, 0.3),
         "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(args.sig_b_min, 3.0),  # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
         "log_R_A": dist.Uniform(logr0 - args.log_r_width, logr0 + args.log_r_width),

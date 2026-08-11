@@ -62,6 +62,16 @@ def sample_f090(n_seed=3000, n_b=2500, n_draw=12):
 
 
 def main():
+    # --figdir added 2026-08-10. This script had NO argparse at all and wrote
+    # straight into the live paper checkout via the OUT constant -- the same
+    # landmine as detected_m1_cdf.py and marginal_ppd.py, and the last one in
+    # this directory. Default unchanged, so existing invocations are identical.
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--figdir", default=OUT,
+                   help="output directory (default: the committed paper figures/)")
+    args = p.parse_args()
+    os.makedirs(args.figdir, exist_ok=True)
     # Cache the (m1,m2,w) pool so restyling the plot needs no re-sampling.
     cache = os.path.join(_HERE, "_dRdm1dm2_f090_pool.npz")
     if os.path.exists(cache):
@@ -119,7 +129,7 @@ def main():
     cb = fig.colorbar(pcm, ax=ax, fraction=0.046, pad=0.03)
     cb.set_label(r"$dR/dm_1\,dm_2\ \ [{\rm Gpc}^{-3}\,{\rm yr}^{-1}\,M_\odot^{-2}]$")
     fig.tight_layout()
-    out = os.path.join(OUT, "real_dRdm1dm2_f090.png")
+    out = os.path.join(args.figdir, "real_dRdm1dm2_f090.png")
     for f in (out, out.replace(".png", ".pdf")):
         fig.savefig(f, dpi=150, bbox_inches="tight")
     print("wrote", out)

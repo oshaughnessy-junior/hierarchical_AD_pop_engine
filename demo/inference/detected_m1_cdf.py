@@ -46,6 +46,16 @@ def main():
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=2500)
     p.add_argument("--n-draw", type=int, default=12)
+    # --out added 2026-08-10. OUT was a module constant pointing straight at
+    # gwk-hierarchical-initial/paper/figures/real_detected_m1_cdf.png, with no
+    # way to override it -- so merely RUNNING this script to look at a number
+    # silently overwrote the frozen App-D figure in a checkout other sessions
+    # are editing. Same class of landmine as marginal_ppd.py's OUT, fixed
+    # 2026-08-09; this was the last one known. The default is unchanged, so
+    # existing invocations behave identically.
+    p.add_argument("--out", default=OUT,
+                   help="output PNG (default: the committed App-D figure -- pass "
+                        "something else when you only want to read the numbers)")
     args = p.parse_args()
     pdet = make_real_pdet_fn()
     grid = np.linspace(5, 100, 400)
@@ -98,7 +108,9 @@ def main():
     ax[1].set_title("High-mass tail (log scale)")
     fig.suptitle(r"Predicted vs observed detected primary-mass distribution "
                  rf"($n_{{\rm seed}}={args.n_seed}$, {args.n_draw} draws pooled)", fontsize=12)
-    fig.tight_layout(); fig.savefig(OUT, dpi=140, bbox_inches="tight"); print("wrote", OUT)
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    fig.tight_layout(); fig.savefig(args.out, dpi=140, bbox_inches="tight")
+    print("wrote", args.out)
 
 
 if __name__ == "__main__":
