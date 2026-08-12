@@ -752,13 +752,19 @@ def main():
         # region the fixed f_dep cannot support. Prefer a modest widening.
         "alpha_A": dist.Uniform(0.0, 3.0),
         "m_max_A": dist.Uniform(args.m_max_lo, args.m_max_hi),
-        # spin_chi lower bound settable for the same reason as m_max_A: at
-        # v_esc=1000 the combined fit gives 0.04 [0.01, 0.09], i.e. pressed
-        # against the 0.01 floor, so the natal spin scale is an UPPER LIMIT
-        # under the committed prior rather than a measurement. Default
-        # unchanged; --spin-chi-lo 1e-3 opens it up (ROS 2026-08-10, who also
-        # judged this NOT worth flagging hard in the paper -- it is a follow-up,
-        # not a defect).
+        # spin_chi lower bound settable. RATIONALE PARTLY RETRACTED 2026-08-12:
+        # this flag was added because the v_esc=1000 fit looked like it was
+        # railing -- "0.04 [0.01, 0.09]" -- and that reading was an artefact of
+        # printing the interval to two decimals. At full precision the 5th
+        # percentile is 0.0144 and the smallest sample is 0.0113, both clear of
+        # the 0.01 floor, with 0% of samples within 10% of it.
+        # The --spin-chi-lo 1e-3 rerun CONFIRMS it: mean 0.0381 -> 0.0412, 90%
+        # [0.0144, 0.0859] -> [0.0135, 0.0935]. Opening the floor tenfold moves
+        # nothing, so spin_chi is MEASURED at ~0.04, not an upper limit.
+        # The flag is still worth having -- it is what turned a suspicion into a
+        # check -- but do not repeat the claim that this parameter rails.
+        # LESSON: decide "is it railing?" from min/percentiles at full
+        # precision, not from a rounded summary table.
         "spin_chi": dist.Uniform(args.spin_chi_lo, 0.3),
         "mu_B": dist.Uniform(5., 15.), "sig_B": dist.Uniform(args.sig_b_min, 3.0),  # NARROW low-mass peak
         "mu_chiB": dist.Uniform(-0.1, 0.5), "sig_chiB": dist.Uniform(0.01, 0.3),
