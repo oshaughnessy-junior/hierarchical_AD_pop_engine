@@ -105,7 +105,7 @@ def mass_density_from_samples(m1, m2, w, ngrid=90):
     AFFECTED CALLERS (all previously ~2.05x high in absolute rate; re-run them):
       demo/inference/{export_popsummary,gwtc5_overlay_nal,dRdm1dm2_f090,
                       marginal_ppd,fdep_variation}.py
-      gwk-hierarchical-interactions/refit_exchange/{postprocess_rate_bands,
+      notes/refit_exchange/{postprocess_rate_bands,
                       postprocess_2d_bseries}.py
       notes/paper_vnext/{plot_nal_validation_dRdm1,rebuild_headline_banded}.py
     """

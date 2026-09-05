@@ -211,7 +211,7 @@ def main():
     # quantities; do not read a difference in the third decimal.
     import sys
     sys.path.insert(0, os.path.join(
-        _HERE, "../../../gwk-hierarchical-interactions/refit_exchange"))
+        _HERE, "../../../notes/refit_exchange"))
     from results_fragment import write_fragment
     write_fragment(
         os.path.join(args.frag_dir, "marginal_ppd_fragment.json"),
