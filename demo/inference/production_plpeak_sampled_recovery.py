@@ -519,8 +519,11 @@ def main() -> int:
             print(f"no cached posterior at {path} — run --mode nuts first")
             return 1
         with np.load(path) as z:
-            names = sorted(k for k in z.files if not k.startswith("truth_")
-                           and k not in ("n_obs", "n_seed"))
+            # take the PARAMETERS, not the run-config scalars that also live in
+            # this npz (n_obs, n_seed, f_dep, mc_ref, v_esc) -- selecting by
+            # "not truth_*" swept those in and then died on truth_f_dep.
+            names = [k for k in _CORNER_ORDER
+                     if k in z.files and f"truth_{k}" in z.files]
             post = {k: z[k] for k in names}
             theta_cached = {k: float(z[f"truth_{k}"]) for k in names}
         _make_recovery_figures(post, theta_cached, args.outdir)
@@ -567,6 +570,19 @@ def _make_recovery_figures(post, theta_true, outdir):
         print("corner not installed — skipping plpeak_corner.png")
         return
     data = np.stack([post[k] for k in names], axis=1)
+    # PRINT SIZING (ROS 2026-09-05: "fig 9: axis labels and tick labels").
+    # corner.py defaults to 2 in per panel, so six parameters came out on a
+    # 13.9 in canvas -- reduced by 0.24x at \columnwidth, its 11 pt labels
+    # printed under 3 pt.  Draw at the width the figure is actually placed at
+    # (7.0 in = revtex4-2 \textwidth) with fonts set to what they should
+    # measure on paper, and emit a vector PDF alongside the raster.
+    plt.rcParams.update({
+        "font.size": 8, "axes.labelsize": 8.5,
+        "xtick.labelsize": 7, "ytick.labelsize": 7,
+        "axes.linewidth": 0.6, "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6, "xtick.major.size": 2.5,
+        "ytick.major.size": 2.5,
+    })
     fig = corner.corner(
         data,
         labels=[_CORNER_LABELS.get(k, k) for k in names],
@@ -575,17 +591,23 @@ def _make_recovery_figures(post, theta_true, outdir):
         quantiles=(0.16, 0.5, 0.84),
         show_titles=True,
         title_fmt=".2f",
-        title_kwargs=dict(fontsize=9),
-        label_kwargs=dict(fontsize=11),
+        title_kwargs=dict(fontsize=7),
+        label_kwargs=dict(fontsize=8.5),
+        max_n_ticks=3,
         smooth=0.9,
         plot_datapoints=False,
         fill_contours=True,
         levels=(0.39, 0.86),  # 1- and 2-sigma in 2D
         color="C0",
     )
+    fig.set_size_inches(7.0, 7.0)          # = \textwidth: include at scale 1.0
+    fig.subplots_adjust(left=0.105, right=0.985, bottom=0.085, top=0.965,
+                        wspace=0.07, hspace=0.16)   # hspace: room for the
+    #                            per-parameter titles corner draws on the diagonal
     out = os.path.join(outdir, "plpeak_corner.png")
-    fig.savefig(out, dpi=160)
-    print(f"wrote {out}")
+    fig.savefig(out, dpi=300)
+    fig.savefig(out.replace(".png", ".pdf"))
+    print(f"wrote {out} (+ .pdf)")
 
 
 if __name__ == "__main__":

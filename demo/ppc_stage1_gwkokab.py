@@ -285,10 +285,18 @@ def main():
     cloud = np.concatenate(cloud_parts, axis=0)
 
     # persist the computed bands so figures survive a killed/again run
+    # bins + run config travel WITH the bands: the paper figure is composed
+    # downstream (notes/paper_vnext/stage1_recovery_figure.py) and must be able
+    # to redraw the injection histogram on the same edges without re-running.
     np.savez(_DEMO / "figures" / f"stage1_ppc_data_{args.detection}.npz",
              m_cent=m_cent, m_lo=m_lo_, m_med=m_med, m_hi=m_hi_, obs_m=obs_m,
              chi_cent=chi_cent, c_lo=c_lo_, c_med=c_med, c_hi=c_hi_,
-             obs_chi=obs_chi, obs_pts=obs_pts, cloud=cloud)
+             obs_chi=obs_chi, obs_pts=obs_pts, cloud=cloud,
+             m_bins=m_bins, chi_bins=chi_bins,
+             n_obs=args.n_obs, n_seed=args.n_seed, k_max=args.k_max,
+             n_draws=args.n_draws, n_pred=args.n_pred,
+             orientation=str(args.orientation), solver=str(args.solver),
+             detection=str(args.detection))
     _figures(args, m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
              chi_cent, c_lo_, c_med, c_hi_, obs_chi, chi_bins,
              obs_pts, cloud, fixed)
@@ -328,8 +336,23 @@ def _figures(args, m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
     m_xlabel = r"component mass $m\ [M_\odot]$"
     chi_xlabel = r"component spin $\chi$"
 
+    # PRINT SIZING (ROS 2026-09-05: "infinitesimal rendered font size as
+    # rendered, unreadable ... lots of whitespace on the page wasted").  The
+    # old canvas was 13 in wide and went into revtex at 0.62\textwidth
+    # (4.4 in) -- a 0.34x reduction that turned the default 10 pt labels into
+    # 3.4 pt.  Draw at the final printed size instead (7.0 in = \textwidth,
+    # include with width=\textwidth, scale factor 1.0) and set the fonts to
+    # what they should measure on paper.
+    plt.rcParams.update({
+        "font.size": 8, "axes.labelsize": 8.5, "axes.titlesize": 8.5,
+        "xtick.labelsize": 7, "ytick.labelsize": 7, "legend.fontsize": 7.5,
+        "axes.linewidth": 0.6, "lines.linewidth": 1.3,
+        "xtick.major.width": 0.6, "ytick.major.width": 0.6,
+        "xtick.major.size": 2.5, "ytick.major.size": 2.5,
+        "xtick.minor.size": 1.4, "ytick.minor.size": 1.4,
+    })
     # PPD: rows = {linear-y, log-p y}; cols = {mass (log-x), spin}.
-    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+    fig, ax = plt.subplots(2, 2, figsize=(7.0, 4.3), sharex="col")
     _ppd_panel(ax[0, 0], m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
                m_xlabel, logx=True)
     _ppd_panel(ax[0, 1], chi_cent, c_lo_, c_med, c_hi_, obs_chi, chi_bins,
@@ -342,13 +365,18 @@ def _figures(args, m_cent, m_lo_, m_med, m_hi_, obs_m, m_bins,
     ax[0, 1].set_title("Spin PPD — linear")
     ax[1, 0].set_title(r"Mass PPD — $\log p$ (dynamic range)")
     ax[1, 1].set_title(r"Spin PPD — $\log p$ (the 2G high-$\chi$ bump)")
-    ax[0, 0].legend(fontsize=9)
-    fig.suptitle(f"Stage-1 posterior-predictive distributions "
-                 f"({tag} selection; N={args.n_obs}, {args.n_draws} draws × "
-                 f"{args.n_pred} pred pairs; particle-resampled)")
-    fig.tight_layout()
+    ax[0, 0].legend(loc="upper right")
+    # the top row shares x with the bottom row, so it needs neither its own
+    # x label nor its own tick labels -- that is a whole row of dead space
+    for a in ax[0, :]:
+        a.set_xlabel("")
+    # no suptitle: the LaTeX caption carries the run description, and on the
+    # page the title was a second caption in a smaller font
+    fig.subplots_adjust(left=0.075, right=0.995, bottom=0.100, top=0.950,
+                        wspace=0.19, hspace=0.30)
     out1 = figdir / f"stage1_ppd_mass_spin_{tag}.png"
-    fig.savefig(out1, dpi=140)
+    fig.savefig(out1, dpi=300)
+    fig.savefig(out1.with_suffix(".pdf"))
     print(f"[fig] {out1}")
 
     # Event scatter over predicted 2-D density (log-log mass plane)
