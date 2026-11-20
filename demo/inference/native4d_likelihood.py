@@ -91,10 +91,13 @@ def log_dlprime(z):
     return jnp.log(comoving_distance(z) + (1 + z) * DH / E(z))
 
 
-def distance_logfactor(z, kind):
-    """log p_DL(dL(z)) + log dDL/dz, up to the reference's event constant."""
-    sq = 2 * jnp.log(luminosity_distance(z)) + log_dlprime(z)
-    sf = log_dvc_dz_sr(z) - jnp.log1p(z)
+def distance_logfactor(z, kind, dc=None):
+    """log p_DL(dL(z)) + log dDL/dz, up to the reference's event constant.
+    Pass dc = comoving_distance(z) to reuse it."""
+    dc = comoving_distance(z) if dc is None else dc
+    e = E(z)
+    sq = 2 * jnp.log((1 + z) * dc) + jnp.log(dc + (1 + z) * DH / e)
+    sf = math.log(DH) + 2 * jnp.log(dc) - jnp.log(e) - jnp.log1p(z)
     return jnp.where(kind == 0, sq, sf)
 
 
@@ -198,18 +201,21 @@ def component_terms(mc, eta, chi, z, P):
     return P["logw"] + T @ P["theta"].T - P["logZ"] + P["lnorm"] - 0.5 * quad
 
 
-def log_likelihood_unmasked(x, P):
+def log_likelihood_unmasked(x, P, dc=None):
     mc, eta, chi, z = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
     lf = logsumexp(component_terms(mc, eta, chi, z, P), -1)
     logJ = jnp.log(mc * (1 + z)) - 1.2 * jnp.log(eta) - math.log(2.0)
-    return lf - logJ - jnp.log(z) - distance_logfactor(z, P["kind"])
+    return lf - logJ - jnp.log(z) - distance_logfactor(z, P["kind"], dc)
 
 
-def log_likelihood(x, P):
-    """x (..., 4) = [Mc_source, eta, chi_eff, z]; -inf outside support. Safe under grad."""
+def log_likelihood(x, P, dc=None):
+    """x (..., 4) = [Mc_source, eta, chi_eff, z]; -inf outside support. Safe under grad.
+    dc: optional comoving_distance(z) (must correspond to safe z where unsupported)."""
     good = support_mask(x, P)
     safe = jnp.where(good[..., None], x, jnp.array([20.0, 0.2, 0.0, 0.1]))
-    return jnp.where(good, log_likelihood_unmasked(safe, P), -jnp.inf)
+    if dc is not None:
+        dc = jnp.where(good, dc, comoving_distance(0.1))
+    return jnp.where(good, log_likelihood_unmasked(safe, P, dc), -jnp.inf)
 
 
 # vmapped over a stacked event axis, shared points
