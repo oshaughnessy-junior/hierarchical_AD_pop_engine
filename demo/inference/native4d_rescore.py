@@ -54,6 +54,7 @@ def main():
     ap.add_argument('--post', default=str(ROOT / 'inputs/headline_combined_vesc1000_post.npz'))
     ap.add_argument('--out', default=str(ROOT / 'runs/A_rescore'))
     ap.add_argument('--only-mean', action='store_true')
+    ap.add_argument('--finalize-only', action='store_true', help='rebuild summary from the cache without the engine')
     a = ap.parse_args()
     out = Path(a.out); cache = out / 'cache'; cache.mkdir(parents=True, exist_ok=True)
     post = np.load(a.post, allow_pickle=True)
@@ -66,6 +67,10 @@ def main():
     sel = NP.ZSelection(ROOT / 'inputs/combined_pdet_grid_mmin2_refinedz.npz')
     from mass_pdet_interp import make_real_pdet_fn
     pdet_old = make_real_pdet_fn(str(ROOT / 'inputs/mass_pdet_grid_kappa2.7.npz'))
+    if a.finalize_only:
+        rows = [dict(np.load(f)) for f in [cache / 'mean.npz'] + sorted(cache.glob('post_*.npz'))]
+        nA = int(json.loads((out / 'summary.json').read_text())['nA']) if (out / 'summary.json').exists() else None
+        return finalize(a, out, rows, names, nev, xw, m1, m2, nA)
     pl, M, comb, nA = setup_engine(post, a.key, float(post['f_dep']), a.n_seed, a.n_b)
     print(f'engine ready: nA={nA} n_b={a.n_b}; native4d primary {len(m1["name"])}, alt {len(m2["name"])}', flush=True)
 
@@ -119,6 +124,12 @@ def finalize(a, out, rows, names, nev, xw, m1, m2, nA):
     change = d_hyb - d_old; change_x = d_ext - d_old
     infl = np.max(np.abs(change), 0); infl_x = np.max(np.abs(change_x), 0)
     N = nev
+    zz = np.linspace(1e-6, NP.ZMAX_POP, 200001); pzz = np.exp(np.asarray(NP.log_pz(jnp.asarray(zz), a.kappa)))
+    pz_above = float(np.trapezoid(pzz[zz > 2.0708], zz[zz > 2.0708]))
+    # overall rate profiled out: ln L_prof = sum ln I - N ln mu + const
+    prof_old = d_old.sum(1) - N * np.log(mu_old / mu_old[0])
+    prof_hyb = d_hyb.sum(1) - N * np.log(mu_new / mu_new[0])
+    prof_ext = d_ext.sum(1) - N * np.log(mu_new / mu_new[0])
     per_pop = []
     for j, r in enumerate(rows):
         per_pop.append(dict(label=str(r['label']), params=json.loads(str(r['params'])), mu_old=mu_old[j], mu_new=mu_new[j],
@@ -129,6 +140,8 @@ def finalize(a, out, rows, names, nev, xw, m1, m2, nA):
                             dlnL_total_old=float(d_old[j].sum() - (mu_old[j] - mu_old[0])),
                             dlnL_total_hybrid=float(d_hyb[j].sum() - (mu_new[j] - mu_new[0])),
                             dlnL_total_extended=float(d_ext[j].sum() - (mu_new[j] - mu_new[0])),
+                            dlnL_rate_profiled_old=float(prof_old[j]), dlnL_rate_profiled_hybrid=float(prof_hyb[j]),
+                            dlnL_rate_profiled_extended=float(prof_ext[j]),
                             ess_min_old=float(e_old[j].min()), ess_min_hybrid=float(e_hyb[j].min()),
                             ess_min_native4d_only=float(e_hyb[j][has4].min()),
                             n_ess_below_10_old=int((e_old[j] < 10).sum()), n_ess_below_10_hybrid=int((e_hyb[j] < 10).sum()),
@@ -166,8 +179,12 @@ def finalize(a, out, rows, names, nev, xw, m1, m2, nA):
         n_seed=a.n_seed, n_b=a.n_b, nA=int(nA), key=a.key, kappa=a.kappa, gl_nodes=a.nodes, n_populations=D,
         posterior=a.post, posterior_sha256=sha(a.post),
         selection=dict(old='mass_pdet_grid_kappa2.7 xi(m1,m2), floor 1e-4, T_OBS=1',
-                       new='combined_pdet_grid_mmin2_refinedz trilinear (log m1, log m2, z), z-integrated with p(z|kappa), no floor; '
-                           'R_new*T_obs read as R_old',
+                       new='combined_pdet_grid_mmin2_refinedz trilinear (m1, m2, z), z-integrated with p(z|kappa) on (0, 2.5], '
+                           'no floor; R_new*T_obs read as R_old',
+                       p_z_mass_above_old_zmax=pz_above, mu_new_mean_renormalized_to_old_zmax=float(mu_new[0] / (1 - pz_above)),
+                       convention_note='The old xi grid averages z over p(z|2.7) normalized on [0, 2.07]; the new one on (0, 2.5]. '
+                                       'pdet is ~0 above z=2.07 for most masses, so most of mu_new/mu_old is the change of rate '
+                                       'normalization volume, not of detectability; mu_new/(1-P(z>2.07)) is the like-for-like value.',
                        mu_old_mean=mu_old[0], mu_new_mean=mu_new[0], n_obs=N,
                        profiled_selection_dlnL_new_minus_old=float(-N * np.log(mu_new[0] / mu_old[0])),
                        note='At fixed rate, selection term changes by -(mu_new-mu_old). With the overall rate profiled out '
@@ -179,12 +196,15 @@ def finalize(a, out, rows, names, nev, xw, m1, m2, nA):
                                  old_median=float(np.median(e_old[0])), new_hybrid_median=float(np.median(e_hyb[0])),
                                  n_below_10_old=int((e_old[0] < 10).sum()), n_below_10_new=int((e_hyb[0] < 10).sum())),
         populations=per_pop,
+        rate_profiled_note='Fixed-rate totals favour draws with high rates under the new selection only because the old draws carry '
+                           'rates fitted under the old normalization; the rate-profiled totals remove that.',
         priority_events=[ev[names.index(n)] for n in PRIORITY],
         biggest_movers=[ev[i] for i in order[:15]])
     if D > 1:
         ix = slice(1, D)
-        for scope, delta in [('hybrid', d_hyb - d_old), ('extended', d_ext - d_old)]:
-            lwr = delta[ix].sum(1) - (mu_new[ix] - mu_new[0]) + (mu_old[ix] - mu_old[0])
+        for scope, lwr_all in [('hybrid_fixed_rate', (d_hyb - d_old).sum(1) - (mu_new - mu_new[0]) + (mu_old - mu_old[0])),
+                               ('hybrid_rate_profiled', prof_hyb - prof_old), ('extended_rate_profiled', prof_ext - prof_old)]:
+            lwr = lwr_all[ix]
             wr = np.exp(lwr - lwr.max()); wr /= wr.sum()
             summ.setdefault('exploratory_reweighting', {})[scope] = dict(
                 ess=float(1 / (wr @ wr)), n_draws=D - 1, max_weight=float(wr.max()),
