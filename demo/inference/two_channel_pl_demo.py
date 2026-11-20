@@ -377,6 +377,108 @@ def make_combined_pl(n_seed_A, n_b):
     return combined, int(sA0.shape[0])
 
 
+# ---- opt-in NATIVE4D event likelihoods (--likelihood native4d) ----------------
+# Revised per-event fits in (Mc_source, eta, chi_eff, z) (gw-event-likelihood-fits,
+# backend native_spin_base_redshift) replace the 3D NAL Gaussians where a fit exists;
+# the other events keep their 3D NAL. z is integrated per event against the
+# population law p(z|kappa) ~ dVc/dz (1+z)^(kappa-1) on (0, 2.5] by fixed quadrature,
+# and selection uses pdet(m1, m2, z) from the refinedz grid integrated over the same
+# p(z|kappa). Rates are then per year of detector time (T_obs from the grid
+# metadata), so log_R values differ from the nal3d runs by about -log(T_obs) plus
+# the selection-grid change. See native4d_likelihood.py / native4d_population.py.
+def _native4d_model(args, comb, variables, constants, zc, init_vals=None):
+    import numpyro
+    import native4d_population as NP
+    NP.install_rift_stub()
+    mc_ref = None
+    if args.native4d_window:
+        # population draw positions barely move with theta (IS-reweighted frozen proposals),
+        # so one reference draw sizes the per-event chirp-mass windows
+        ref = {k: float((init_vals or {}).get(k, np.median(np.asarray(variables[k].sample(jax.random.PRNGKey(0), (2001,))))))
+               for k in variables if k != "kappa"}
+        s0, _ = comb(**constants, **ref)
+        mc_ref = np.asarray(NP.mc_eta_chieff(jnp.asarray(s0))[:, 0])
+    like = NP.HybridPoissonLikelihood(zc, args.native4d_tables, args.pdet_z_grid,
+                                      tiers=tuple(args.native4d_tiers.split(",")),
+                                      nodes=args.native4d_nodes, T_obs=args.t_obs, mc_ref=mc_ref)
+    if like.window is not None:
+        print(f"NATIVE4D window: {len(like.window.buckets)} buckets, {like.window.cost_fraction:.3f} of the "
+              f"unwindowed event-sample work")
+    kappa_fixed = float(args.kappa)
+    print(f"NATIVE4D: {like.n4} events with 4D fits ({args.native4d_tiers}), {like.n3} on 3D NAL; "
+          f"kappa {'FREE' if args.free_kappa else '= %g' % kappa_fixed}; T_obs = {like.T_obs:.4f} yr; "
+          f"selection = {args.pdet_z_grid} (z-resolved; --pdet-grid/--real-pdet ignored)")
+
+    def model(T_obs):
+        params = {k: numpyro.sample(k, variables[k]) for k in sorted(variables)}
+        kappa = params.pop("kappa", kappa_fixed)
+        s, lw = comb(**constants, **params)
+        lnL, diag = like(s, lw, kappa)
+        if like.window is not None:   # a too-short window slice would silently drop draws
+            lnL = jnp.where(diag["window_overflow"] > 0, -jnp.inf, lnL)
+        numpyro.factor("log_likelihood", jnp.nan_to_num(lnL, nan=-jnp.inf, posinf=-jnp.inf, neginf=-jnp.inf))
+    return model, like
+
+
+def _map_or_grad(args, model, T_obs, variables, init_vals):
+    """--mode grad: time value_and_grad of -log p at the init point.
+    --mode map: Adam on the unconstrained coordinates, objective -log p(theta) in the
+    constrained space (no Jacobian), fixed sampler keys; checkpoint every --map-ckpt steps."""
+    import json, pickle, time
+    from jax.example_libraries import optimizers
+    from numpyro.distributions.transforms import biject_to
+    from numpyro.infer.util import log_density
+    names = sorted(variables)
+    tr = {k: biject_to(variables[k].support) for k in names}
+    T = jnp.asarray(T_obs)
+
+    def constrain(u):
+        return {k: tr[k](u[k]) for k in names}
+
+    def objective(u):
+        return -log_density(model, (T,), {}, constrain(u))[0]
+    start = {k: float(init_vals.get(k, np.median(np.asarray(variables[k].sample(jax.random.PRNGKey(0), (2001,))))))
+             for k in names}
+    u0 = {k: jnp.asarray(tr[k].inv(jnp.asarray(v))) for k, v in start.items()}
+    vg = jax.jit(jax.value_and_grad(objective))
+    os.makedirs(args.outdir, exist_ok=True)
+    t0 = time.time(); v, g = vg(u0); jax.block_until_ready(g); t_first = time.time() - t0
+    t0 = time.time(); v, g = vg(u0); jax.block_until_ready(g); t_grad = time.time() - t0
+    print(f"value_and_grad: first call (compile+run) {t_first:.1f}s, repeat {t_grad:.1f}s; "
+          f"-log p = {float(v):.4f}; grad finite: {all(bool(jnp.isfinite(x)) for x in g.values())}", flush=True)
+    for k in names:
+        print(f"  d(-log p)/du[{k}] = {float(g[k]):+.4e}")
+    if args.mode == "grad":
+        return 0
+    ckpt = os.path.join(args.outdir, "map_ckpt.pkl")
+    opt_init, opt_update, get_params = optimizers.adam(args.map_lr)
+    state, hist, step0 = opt_init(u0), [], 0
+    if os.path.exists(ckpt):
+        with open(ckpt, "rb") as f:
+            c = pickle.load(f)
+        state, hist, step0 = optimizers.pack_optimizer_state(c["state"]), c["hist"], c["step"]
+        print(f"MAP: resuming at step {step0}", flush=True)
+    upd = jax.jit(lambda i, gr, st: opt_update(i, gr, st))
+    for i in range(step0, args.map_steps):
+        t0 = time.time(); u = get_params(state); v, g = vg(u)
+        theta = {k: float(x) for k, x in constrain(u).items()}
+        hist.append(dict(step=i, neg_log_p=float(v), theta=theta, seconds=time.time() - t0))
+        print(f"MAP step {i}: -log p = {float(v):.4f} ({time.time() - t0:.1f}s) "
+              + " ".join(f"{k}={theta[k]:.4g}" for k in names), flush=True)
+        state = upd(i, g, state)
+        if (i + 1) % args.map_ckpt == 0 or i + 1 == args.map_steps:
+            with open(ckpt + ".tmp", "wb") as f:
+                pickle.dump(dict(state=optimizers.unpack_optimizer_state(state), hist=hist, step=i + 1), f)
+            os.replace(ckpt + ".tmp", ckpt)
+    best = min(hist, key=lambda h: h["neg_log_p"])
+    with open(os.path.join(args.outdir, "map_result.json"), "w") as f:
+        json.dump(dict(best=best, last=hist[-1], n_steps=len(hist), lr=args.map_lr, init=start,
+                       likelihood=args.likelihood, kappa=args.kappa, free_kappa=args.free_kappa,
+                       n_seed=args.n_seed, n_b=args.n_b, history=hist), f, indent=1)
+    print(f"MAP best at step {best['step']}: -log p = {best['neg_log_p']:.4f}", flush=True)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="check")
@@ -585,7 +687,33 @@ def main():
     p.add_argument("--checkpoint-exit-code", type=int, default=85,
                    help="exit code emitted on an exit-driven checkpoint (must match the sub's "
                         "checkpoint_exit_code); only used when --max-wall-s is set.")
+    # ---- opt-in native4d event likelihoods + redshift population (additive) ----
+    p.add_argument("--likelihood", default="nal3d", choices=["nal3d", "native4d"],
+                   help="nal3d = committed 3D NAL Gaussians (default); native4d = revised 4D fits "
+                        "(Mc_source, eta, chi_eff, z) where available, 3D NAL otherwise")
+    p.add_argument("--kappa", type=float, default=2.7,
+                   help="native4d: redshift law p(z) ~ dVc/dz (1+z)^(kappa-1) on (0, 2.5]; fixed value / init")
+    p.add_argument("--free-kappa", action="store_true", help="native4d: sample kappa ~ U[kappa-min, kappa-max]")
+    p.add_argument("--kappa-min", type=float, default=-2.0)
+    p.add_argument("--kappa-max", type=float, default=8.0)
+    p.add_argument("--native4d-tables", default=os.path.join(_HERE, "../../../runs/A_tables/native4d_events.npz"),
+                   help="per-event table from native4d_event_tables.py (packed fits + quadrature ranges)")
+    p.add_argument("--native4d-tiers", default="primary",
+                   help="'primary' = 20261110 long-EM collection only; 'primary,alt' also fills fallback "
+                        "events from the consumer-selection collections")
+    p.add_argument("--native4d-nodes", type=int, default=48, help="Gauss-Legendre nodes in log Mc_det per event")
+    p.add_argument("--native4d-window", action="store_true",
+                   help="restrict each event's integral to population draws inside its source chirp-mass "
+                        "window (faster; check against the full sum with native4d_window_check.py)")
+    p.add_argument("--pdet-z-grid", default=os.path.join(_HERE, "../../../inputs/combined_pdet_grid_mmin2_refinedz.npz"),
+                   help="native4d: z-resolved pdet(m1, m2, z) grid")
+    p.add_argument("--t-obs", type=float, default=None, help="native4d: T_obs [yr]; default from the pdet grid metadata")
+    p.add_argument("--map-steps", type=int, default=300, help="--mode map: Adam steps")
+    p.add_argument("--map-lr", type=float, default=0.02, help="--mode map: Adam step size (unconstrained coords)")
+    p.add_argument("--map-ckpt", type=int, default=5, help="--mode map: checkpoint interval (steps)")
     args = p.parse_args()
+    if args.free_kappa and args.likelihood != "native4d":
+        raise SystemExit("--free-kappa needs --likelihood native4d")
     global CHANNEL_C, C_MLO, C_MHI, C_ALPHA, C_QA, C_QB, C_CHI_SIG, N_C
     global AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C
     global ALIGNED_SEED, AS_F_DEP, AS_SEED_LO, AS_SEED_HI, AS_TWOG_MEMORY
@@ -718,6 +846,10 @@ def main():
             Ls = [M.GenieMcEtaChieffLikelihood(jnp.asarray(centers[i]), jnp.asarray(sigs[i])) for i in range(n_obs)]
             print(f"REAL catalog: {n_obs} events; diagonal-sigma likelihood")
         logr0 = math.log(n_obs / M.T_OBS / 2)
+        if args.likelihood == "native4d":
+            import native4d_population as _NP
+            _t = args.t_obs or _NP.ZSelection(args.pdet_z_grid).T_obs_years
+            logr0 = math.log(n_obs / _t / 2)
     else:
         s, lw = comb(**TRUTH); s = np.asarray(s)
         dw = np.exp(np.asarray(lw)) * np.asarray(pdet_fn(jnp.asarray(s))); dw = np.clip(dw, 0, None); dw /= dw.sum()
@@ -830,9 +962,13 @@ def main():
             else:
                 variables["mu_C"] = dist.Uniform(12.0, 45.0)
                 variables["sig_C"] = dist.Uniform(2.0, 15.0)
+    if args.free_kappa:
+        variables["kappa"] = dist.Uniform(args.kappa_min, args.kappa_max)
+        print(f"FREE kappa ~ Uniform({args.kappa_min}, {args.kappa_max})")
     names = sorted(variables)
     priors = JointDistribution(*[variables[k] for k in names])
     init_strategy = init_to_median
+    init_vals = {}
     if args.init_json:
         import json
         from numpyro.infer import init_to_value
@@ -841,14 +977,23 @@ def main():
         init_strategy = init_to_value(values=init_vals)
         print(f"INIT at supplied point: {init_vals}")
     kw = dict(init_strategy=init_strategy, max_tree_depth=args.max_tree_depth, target_accept_prob=args.target_accept)
-    model = numpyro_sampled_poisson_likelihood(comb, priors, variables, constants, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
+    T_OBS_RUN = M.T_OBS
+    if args.likelihood == "native4d":
+        if not REAL:
+            raise SystemExit("--likelihood native4d needs --catalog")
+        model, _like = _native4d_model(args, comb, variables, constants, zc, init_vals)
+        T_OBS_RUN = _like.T_obs
+    else:
+        model = numpyro_sampled_poisson_likelihood(comb, priors, variables, constants, {k: i for i, k in enumerate(names)}, Ls, pdet_fn, None)
+    if args.mode in ("map", "grad"):
+        return _map_or_grad(args, model, T_OBS_RUN, variables, init_vals)
     if args.checkpoint_dir:
         import sys
         from gwkokab.inference import run_nuts_with_checkpoints, CheckpointExit
         print(f"CHECKPOINT-SAFE: {args.checkpoint_dir} chunk={args.chunk}"
               + (f" max_wall_s={args.max_wall_s} exit_code={args.checkpoint_exit_code}" if args.max_wall_s else ""))
         try:
-            post = run_nuts_with_checkpoints(model, (jnp.asarray(M.T_OBS),), num_warmup=args.num_warmup,
+            post = run_nuts_with_checkpoints(model, (jnp.asarray(T_OBS_RUN),), num_warmup=args.num_warmup,
                                              num_samples=args.num_samples, key=jax.random.PRNGKey(args.seed),
                                              ckpt_dir=args.checkpoint_dir, chunk=args.chunk, nuts_kwargs=kw,
                                              max_wall_s=args.max_wall_s)
@@ -858,7 +1003,7 @@ def main():
             sys.exit(args.checkpoint_exit_code)
     else:
         mcmc = MCMC(NUTS(model, **kw), num_warmup=args.num_warmup, num_samples=args.num_samples, progress_bar=True)
-        mcmc.run(jax.random.PRNGKey(args.seed), jnp.asarray(M.T_OBS)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
+        mcmc.run(jax.random.PRNGKey(args.seed), jnp.asarray(T_OBS_RUN)); post = {k: np.asarray(v) for k, v in mcmc.get_samples().items()}
     # re-insert any pinned constant as a constant "posterior" column so downstream
     # readers (figures, vt_calibration) that expect all 9 params still work.
     for k, v in constants.items():

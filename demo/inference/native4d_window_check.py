@@ -49,7 +49,7 @@ def main(n_seed=int(sys.argv[1]) if len(sys.argv) > 1 else 3000, n_b=int(sys.arg
         t0 = time.time(); v, gr = g(x, lw); jax.block_until_ready(gr); t2 = time.time() - t0
         res[f'grad_{tag}'] = dict(first_s=t1, repeat_s=t2, value=float(v))
         print(tag, res[f'grad_{tag}'], flush=True)
-    (ROOT / 'runs/A_rescore/window_check_%d_%d.json' % (n_seed, n_b)).write_text(json.dumps(res, indent=1))
+    (ROOT / 'runs/A_rescore' / ('window_check_%d_%d.json' % (n_seed, n_b))).write_text(json.dumps(res, indent=1))
 
 
 if __name__ == '__main__':
