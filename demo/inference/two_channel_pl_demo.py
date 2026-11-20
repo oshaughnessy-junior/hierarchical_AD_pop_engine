@@ -100,11 +100,37 @@ def _log_p_mass_pl_cutoff(m, alpha, m_max):
     return jnp.logaddexp(jnp.log(1.0 - w) + log_pl, jnp.log(w) + log_pk)
 
 
+# opt-in RECENTRED proposal for the PL channel A (reassessment 2026-11-20): None
+# = committed M.make_proposal; (alpha, m_max, spin) = draw masses from the PL
+# target itself at that point (grid inverse CDF of frozen uniforms) and spins from
+# TN(0, spin)[0,1], so the natal IS weights are ~uniform there.  See the
+# RECENTRING note at SEED_GAUSS below for why this matters for the cascade.
+PL_PROP_REF = None
+PL_PROP_KEY = jax.random.PRNGKey(20261122)
+
+
+def _pl_ref_proposal(n_seed):
+    alpha, m_max, s = (float(x) for x in PL_PROP_REF)
+    k1, k2 = jax.random.split(PL_PROP_KEY)
+    g = np.asarray(_NORM_GRID)
+    pdf = np.exp(np.asarray(_log_p_mass_pl_cutoff(_NORM_GRID, alpha, m_max)))
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(g))])
+    cdf /= cdf[-1]
+    u = np.asarray(jax.random.uniform(k1, (n_seed,)))
+    m = jnp.asarray(np.interp(u, cdf, g))
+    c = _tn_draw(jax.random.uniform(k2, (n_seed,)), 0.0, s, 0.0, 1.0)
+    log_q = _log_p_mass_pl_cutoff(m, alpha, m_max) + M.log_p_spin(c, s)
+    return m, c, log_q
+
+
 def make_sampler_A_mmax(n_seed):
     """Channel-A sampler: isotropic power-law natal with a FREE high-mass cutoff
     m_max, feeding the (faint) cascade. Replicates M.make_sampler_fn's IS machinery
     but threads a differentiable m_max through the target density."""
-    m_prop, chi_prop, log_q = M.make_proposal(n_seed)
+    if PL_PROP_REF is None:
+        m_prop, chi_prop, log_q = M.make_proposal(n_seed)
+    else:
+        m_prop, chi_prop, log_q = _pl_ref_proposal(n_seed)
 
     def proposal(_key):
         return m_prop, chi_prop, log_q
@@ -308,7 +334,177 @@ def make_channelC_sampler(n_c):
     return sampler_C
 
 
+# ---- opt-in GAUSSIAN-SEEDED channel A (--seed-gauss; reassessment 2026-11-20) --
+# Channel A natal mass = truncnorm(mu_A, sig_A) on [M.M_MIN, M_MAX_PROP] instead
+# of the flat power law with a smooth m_max cutoff; natal spin unchanged
+# (isotropic truncnorm, scale spin_chi).  Same IS machinery as make_sampler_A_mmax
+# (frozen proposal, theta enters only through weight_array), but with its OWN
+# frozen proposal concentrated on the seed range, because the cascade draws pairs
+# by OCCUPANCY (not by weight): seeds far from the target still pair and carry
+# half their partner's weight, so a broad proposal smears a narrow seed.
+# Proposal masses: SEED_PROP_FRAC * truncnorm(SEED_PROP_MU, SEED_PROP_SIG) +
+# (1 - SEED_PROP_FRAC) * log-uniform, both on [M.M_MIN, M_MAX_PROP].  Spins: the
+# committed proposal law (0.7 truncnorm(0, 0.08) + 0.3 U[0,1]).  All OFF unless
+# --seed-gauss (the committed sampler is untouched).
+# RECENTRING. The merger weight is 0.5(w_i + w_j), not w_i*w_j, so the cascade
+# is exact only where the natal IS weights are uniform. Setting SEED_PROP_FRAC = 1
+# and SEED_PROP_SPIN = s makes the proposal EQUAL to the target at (mu, sig, s) =
+# (SEED_PROP_MU, SEED_PROP_SIG, SEED_PROP_SPIN); a fit then iterates "optimize,
+# move the proposal to the optimum" (hier_map_laplace.py).  Measured at
+# (10, 1.5), f_dep 0.7: the broad default proposal puts 5.8% of merger weight at
+# m1 > 40 against 2.3% with the proposal equal to the target.
+SEED_GAUSS = False                   # master switch (set by --seed-gauss)
+SEED_PROP_MU, SEED_PROP_SIG, SEED_PROP_FRAC = 10.5, 3.0, 0.8
+SEED_PROP_SPIN = None                # None = committed spin proposal; float = TN(0, s)[0,1]
+SEED_PROP_KEY = jax.random.PRNGKey(20261120)
+
+
+def _tn_draw(u, loc, sc, lo, hi):
+    """inverse-CDF truncnorm(loc, sc)[lo, hi] draw from frozen uniforms u."""
+    from jax.scipy.special import ndtri
+    from jax.scipy.stats import norm as _jn
+    clo = _jn.cdf((lo - loc) / sc)
+    chi_ = _jn.cdf((hi - loc) / sc)
+    x = loc + sc * ndtri(clo + u * (chi_ - clo))
+    return jnp.clip(x, lo + 1e-9 * (hi - lo), hi - 1e-9 * (hi - lo))
+
+
+def make_seed_gauss_proposal(n_seed):
+    from jax.scipy.special import ndtri
+    from jax.scipy.stats import norm as _jn
+    lo, hi = float(M.M_MIN), float(M_MAX_PROP)
+    k1, k2, k3, k4, k5, k6 = jax.random.split(SEED_PROP_KEY, 6)
+    pick = jax.random.uniform(k1, (n_seed,)) < SEED_PROP_FRAC
+    clo = _jn.cdf((lo - SEED_PROP_MU) / SEED_PROP_SIG)
+    chi_ = _jn.cdf((hi - SEED_PROP_MU) / SEED_PROP_SIG)
+    m_tn = SEED_PROP_MU + SEED_PROP_SIG * ndtri(
+        clo + jax.random.uniform(k2, (n_seed,)) * (chi_ - clo))
+    m_lu = lo * (hi / lo) ** jax.random.uniform(k3, (n_seed,))
+    if SEED_PROP_FRAC >= 1.0:            # proposal == truncnorm target (recentred)
+        m = _tn_draw(jax.random.uniform(k2, (n_seed,)), SEED_PROP_MU, SEED_PROP_SIG, lo, hi)
+        log_q_m = _tn_logpdf_trunc(m, SEED_PROP_MU, SEED_PROP_SIG, lo, hi)
+    else:
+        m = jnp.clip(jnp.where(pick, m_tn, m_lu), lo * (1 + 1e-9), hi * (1 - 1e-9))
+        log_q_m = jnp.logaddexp(
+            math.log(SEED_PROP_FRAC) + _tn_logpdf_trunc(m, SEED_PROP_MU, SEED_PROP_SIG, lo, hi),
+            math.log(1.0 - SEED_PROP_FRAC) - jnp.log(m) - math.log(math.log(hi / lo)))
+    if SEED_PROP_SPIN is not None:       # spin proposal == truncnorm(0, s)[0,1] target
+        c = _tn_draw(jax.random.uniform(k5, (n_seed,)), 0.0, float(SEED_PROP_SPIN), 0.0, 1.0)
+        return m, c, log_q_m + M.log_p_spin(c, float(SEED_PROP_SPIN))
+    s0, ftn = 0.08, 0.7                  # committed spin proposal (plpeak make_proposal)
+    pick_c = jax.random.uniform(k4, (n_seed,)) < ftn
+    c_tn = s0 * jax.random.truncated_normal(k5, 0.0, 1.0 / s0, (n_seed,))
+    c = jnp.where(pick_c, c_tn, jax.random.uniform(k6, (n_seed,)))
+    log_q_c = jnp.logaddexp(math.log(ftn) + _tn_logpdf_trunc(c, 0.0, s0, 0.0, 1.0),
+                            math.log(1.0 - ftn))
+    return m, c, log_q_m + log_q_c
+
+
+def make_sampler_A_gauss(n_seed):
+    """Channel-A sampler for --seed-gauss: isotropic truncnorm(mu_A, sig_A) natal
+    feeding the cascade.  Mirrors make_sampler_A_mmax line for line except for the
+    proposal and the mass target."""
+    m_prop, chi_prop, log_q = make_seed_gauss_proposal(n_seed)
+
+    def proposal(_key):
+        return m_prop, chi_prop, log_q
+
+    def _cfg(weight_array, kernel_a=M.KERNEL_A, kernel_b=M.KERNEL_B, v_esc=M.V_ESC):
+        return M.MCConfig(
+            m_min=jnp.asarray(M.M_MIN), m_max=jnp.asarray(M_MAX_PROP),
+            natal_spin_loc=jnp.asarray(M.CFG_SPIN_LOC0),
+            natal_spin_scale=jnp.asarray(M.CFG_SPIN_SCALE0),
+            kernel_a=jnp.asarray(kernel_a), kernel_b=jnp.asarray(kernel_b),
+            v_esc=jnp.asarray(v_esc), n_seed=int(n_seed),
+            depletion_fraction=float(M.F_DEP),
+            mu_natal=jnp.asarray(M.CFG_MU0), sigma_natal=jnp.asarray(M.CFG_SIGMA0),
+            proposal=proposal, weight_array=weight_array)
+
+    log_p_cfg = M._natal_log_pdf_jax(m_prop, chi_prop, _cfg(None))
+
+    def sampler_A(mu_A, sig_A, spin_scale, kernel_a, kernel_b, log_rate, v_esc):
+        log_p_target = (_tn_logpdf_trunc(m_prop, mu_A, sig_A, M.M_MIN, M_MAX_PROP)
+                        + M.log_p_spin(chi_prop, spin_scale))
+        weight_array = jnp.exp(log_p_target - log_p_cfg)
+        out = M.particle_mc_jax_soft(
+            _cfg(weight_array, kernel_a, kernel_b, v_esc), M.SAMPLER_KEY)
+        samples = out["mergers"][:, :4]
+        if M.ISOTROPIC_SPIN:
+            n = samples.shape[0]
+            cost = jax.random.uniform(M.SPIN_ORIENT_KEY, (n, 2), minval=-1.0, maxval=1.0)
+            samples = samples.at[:, 2].multiply(cost[:, 0])
+            samples = samples.at[:, 3].multiply(cost[:, 1])
+        w_eff = out["w_mergers"] * out["step_active"]
+        benign = jnp.asarray([10.0, 8.0, 0.0, 0.0])
+        samples = jnp.where(jnp.isfinite(samples), samples, benign[None, :])
+        log_w = jnp.log(jnp.maximum(w_eff, 1e-300))
+        log_w = log_w - logsumexp(log_w) + log_rate
+        return samples, log_w
+
+    return sampler_A
+
+
+# ---- opt-in FIELD variants for channel B (--field; reassessment 2026-11-20) ----
+#   default : committed behaviour (aligned Gaussian / --channel-b-mix / --aligned-seed)
+#   none    : no channel B at all (channel A alone)
+#   broadpl : non-cascading aligned field with a BROAD power-law mass law
+#             m^-alpha_B on [FIELD_MLO, FIELD_MHI] (no peak), exact inverse-CDF
+#             draws from frozen uniforms (smooth in alpha_B, equal weights)
+#   shared  : non-cascading aligned field whose mass law IS channel A's natal
+#             truncnorm(mu_A, sig_A)[M.M_MIN, M_MAX_PROP] (one natal population,
+#             two channels); exact reparametrised draws.
+# Both: iid pair, sorted (as make_channelB_mix_sampler); aligned spin
+# chi ~ N(mu_chiB, sig_chiB) in both columns; rate log_R_B.  The channel-B
+# kwarg names are REUSED (alpha_B = field slope, mu_chiB/sig_chiB = field spins).
+FIELD = "default"
+FIELD_MLO, FIELD_MHI = 5.0, 80.0
+FIELD_KEY = jax.random.PRNGKey(20261121)
+
+
+def make_field_sampler(n_b, kind):
+    from jax.scipy.special import ndtri
+    from jax.scipy.stats import norm as _jn
+    u_m = jax.random.uniform(FIELD_KEY, (n_b, 2), minval=1e-12, maxval=1.0 - 1e-12)
+    z_chi = jax.random.normal(jax.random.fold_in(FIELD_KEY, 1), (n_b,))
+
+    def _pair(m):
+        return jnp.maximum(m[:, 0], m[:, 1]), jnp.minimum(m[:, 0], m[:, 1])
+
+    def _out(m1, m2, mu_chi, sig_chi, log_R):
+        chi = jnp.clip(mu_chi + sig_chi * z_chi, -0.99, 0.99)
+        s = jnp.stack([m1, m2, chi, chi], axis=1)
+        return s, jnp.full((n_b,), log_R - math.log(n_b))
+
+    if kind == "broadpl":
+        L = math.log(FIELD_MHI / FIELD_MLO)
+
+        def sampler_F(alpha, mu_chi, sig_chi, log_R):
+            # inverse CDF of m^-alpha on [lo,hi], b = 1-alpha, written so b -> 0
+            # (alpha = 1) is the log-uniform limit with no pole.
+            b = 1.0 - alpha
+            b_s = jnp.where(jnp.abs(b) < 1e-6, 1e-6, b)
+            m = FIELD_MLO * jnp.exp(jnp.log1p(u_m * jnp.expm1(b_s * L)) / b_s)
+            m1, m2 = _pair(m)
+            return _out(m1, m2, mu_chi, sig_chi, log_R)
+    elif kind == "shared":
+        lo, hi = float(M.M_MIN), float(M_MAX_PROP)
+
+        def sampler_F(mu, sig, mu_chi, sig_chi, log_R):
+            clo = _jn.cdf((lo - mu) / sig)
+            chi_ = _jn.cdf((hi - mu) / sig)
+            m = mu + sig * ndtri(clo + u_m * (chi_ - clo))
+            m = jnp.clip(m, lo * 1.001, hi * 0.999)
+            m1, m2 = _pair(m)
+            return _out(m1, m2, mu_chi, sig_chi, log_R)
+    else:
+        raise ValueError(f"unknown field kind {kind!r}")
+    return sampler_F
+
+
 def make_combined_pl(n_seed_A, n_b):
+    if SEED_GAUSS or FIELD != "default":
+        return make_combined_hier(n_seed_A, n_b)
+    samp_A = make_sampler_A_mmax(n_seed_A)       # power-law natal, FREE m_max, cascade
     samp_A = make_sampler_A_mmax(n_seed_A)       # power-law natal, FREE m_max, cascade
     # channel B: non-cascading aligned Gaussian (default) OR the REAL aligned-seed
     # exchange cascade with differentiable tilt-moment chi_eff (--aligned-seed).
@@ -477,6 +673,52 @@ def _map_or_grad(args, model, T_obs, variables, init_vals):
                        n_seed=args.n_seed, n_b=args.n_b, history=hist), f, indent=1)
     print(f"MAP best at step {best['step']}: -log p = {best['neg_log_p']:.4f}", flush=True)
     return 0
+
+
+def make_combined_hier(n_seed_A, n_b):
+    """--seed-gauss and/or --field {none,broadpl,shared}: channel A is the
+    Gaussian-seeded (or committed PL) cascade, channel B one of the field
+    variants.  Channel C, the 2g kernel and a free b1 are not wired here."""
+    if CHANNEL_C != "off":
+        raise SystemExit("--seed-gauss/--field do not support --channel-c")
+    if FIELD == "shared" and not SEED_GAUSS:
+        raise SystemExit("--field shared needs --seed-gauss (it shares mu_A, sig_A)")
+    samp_A = make_sampler_A_gauss(n_seed_A) if SEED_GAUSS else make_sampler_A_mmax(n_seed_A)
+    if FIELD in ("broadpl", "shared"):
+        samp_B = make_field_sampler(n_b, FIELD)
+    elif FIELD == "default":
+        samp_B = (make_sampler_alignedseed(n_b) if ALIGNED_SEED
+                  else make_channelB_mix_sampler(n_b) if CHANNEL_B_MIX
+                  else tc.make_channelB_sampler(n_b))
+    else:
+        samp_B = None
+
+    def combined(*, spin_chi, log_R_A, v_esc, alpha_A=None, m_max_A=None,
+                 mu_A=None, sig_A=None, mu_B=None, sig_B=None, mu_chiB=None,
+                 sig_chiB=None, log_R_B=None, f_peakB=None, alpha_B=None):
+        if SEED_GAUSS:
+            sA, lwA = samp_A(mu_A, sig_A, spin_chi, M.KERNEL_A, M.KERNEL_B, log_R_A, v_esc)
+        else:
+            sA, lwA = samp_A(alpha_A, m_max_A, spin_chi, M.KERNEL_A, M.KERNEL_B, log_R_A, v_esc)
+        if samp_B is None:
+            return sA, lwA
+        if FIELD == "broadpl":
+            sB, lwB = samp_B(alpha_B, mu_chiB, sig_chiB, log_R_B)
+        elif FIELD == "shared":
+            sB, lwB = samp_B(mu_A, sig_A, mu_chiB, sig_chiB, log_R_B)
+        elif ALIGNED_SEED:
+            sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B, v_esc)
+        elif CHANNEL_B_MIX:
+            sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B, f_peakB, alpha_B)
+        else:
+            sB, lwB = samp_B(mu_B, sig_B, mu_chiB, sig_chiB, log_R_B)
+        return jnp.concatenate([sA, sB], 0), jnp.concatenate([lwA, lwB], 0)
+
+    if SEED_GAUSS:
+        sA0, _ = samp_A(10.0, 1.5, 0.1, M.KERNEL_A, M.KERNEL_B, 0.0, M.V_ESC)
+    else:
+        sA0, _ = samp_A(2.0, 50.0, 0.1, M.KERNEL_A, M.KERNEL_B, 0.0, M.V_ESC)
+    return combined, int(sA0.shape[0])
 
 
 def main():
@@ -665,6 +907,23 @@ def main():
     p.add_argument("--fix-c-shape", action="store_true",
                    help="gauss only: PIN (mu_C, sig_C) instead of sampling them")
     p.add_argument("--n-c", type=int, default=2500)
+    # ---- opt-in fully hierarchical variants (reassessment 2026-11-20) ---------
+    p.add_argument("--seed-gauss", action="store_true",
+                   help="channel A natal mass = truncnorm(mu_A, sig_A) (SAMPLED) instead of "
+                        "the flat PL with free m_max_A; alpha_A/m_max_A are then unused.")
+    p.add_argument("--mu-a-min", type=float, default=5.0)
+    p.add_argument("--mu-a-max", type=float, default=20.0)
+    p.add_argument("--sig-a-min", type=float, default=0.3)
+    p.add_argument("--sig-a-max", type=float, default=5.0)
+    p.add_argument("--field", default="default", choices=["default", "none", "broadpl", "shared"],
+                   help="channel B: default = committed (Gaussian / --channel-b-mix / "
+                        "--aligned-seed); none = no field; broadpl = aligned PL m^-alpha_B on "
+                        "[field-mlo, field-mhi], no peak; shared = aligned field with channel "
+                        "A's natal truncnorm(mu_A, sig_A) (needs --seed-gauss).")
+    p.add_argument("--field-mlo", type=float, default=5.0)
+    p.add_argument("--field-mhi", type=float, default=80.0)
+    p.add_argument("--field-alpha-min", type=float, default=-4.0)
+    p.add_argument("--field-alpha-max", type=float, default=8.0)
     # ---- chain initialization at a known good point (Fig 3 construction) ------
     p.add_argument("--seed", type=int, default=0,
                    help="NUTS PRNG seed (was hard-coded 0). Distinct seeds give "
@@ -803,6 +1062,20 @@ def main():
                  f"aligned-seed cascade pinned at ({AS_MU_C},{AS_SIG_C},{AS_CHIMU_C},{AS_CHISIG_C}), "
                  f"as_f_dep={args.as_f_dep}")
               + f"; n_c={N_C}, rate log_R_C free")
+    global SEED_GAUSS, FIELD, FIELD_MLO, FIELD_MHI
+    if args.seed_gauss:
+        SEED_GAUSS = True
+        print(f"SEED-GAUSS channel A: natal truncnorm(mu_A, sig_A)[{M.M_MIN},{M_MAX_PROP}], "
+              f"mu_A ~ U[{args.mu_a_min},{args.mu_a_max}], sig_A ~ U[{args.sig_a_min},"
+              f"{args.sig_a_max}]; proposal {SEED_PROP_FRAC}*TN({SEED_PROP_MU},{SEED_PROP_SIG})"
+              f" + log-uniform")
+    if args.field != "default":
+        if args.channel_b_mix or args.aligned_seed:
+            raise SystemExit("--field {none,broadpl,shared} replaces channel B; drop "
+                             "--channel-b-mix / --aligned-seed")
+        FIELD = args.field
+        FIELD_MLO, FIELD_MHI = float(args.field_mlo), float(args.field_mhi)
+        print(f"FIELD = {FIELD}" + (f" on [{FIELD_MLO},{FIELD_MHI}]" if FIELD == "broadpl" else ""))
     comb, nA = make_combined_pl(args.n_seed, args.n_b)
 
     TRUTH = dict(alpha_A=2.0, m_max_A=50.0, spin_chi=0.05, mu_B=9.0, sig_B=1.2,
@@ -814,6 +1087,17 @@ def main():
             TRUTH["mu_C"] = args.c_mu; TRUTH["sig_C"] = args.c_sig
     if args.channel_b_mix:
         TRUTH["f_peakB"] = 0.6; TRUTH["alpha_B"] = 1.5
+    if args.seed_gauss:
+        del TRUTH["alpha_A"], TRUTH["m_max_A"]
+        TRUTH["mu_A"] = 10.0; TRUTH["sig_A"] = 1.5
+    if args.field in ("none", "broadpl", "shared"):
+        for k in ("mu_B", "sig_B"):
+            TRUTH.pop(k, None)
+        if args.field == "none":
+            for k in ("mu_chiB", "sig_chiB", "log_R_B"):
+                TRUTH.pop(k, None)
+        if args.field == "broadpl":
+            TRUTH["alpha_B"] = 2.5
 
     if args.mode == "check":
         s, lw = comb(**TRUTH); s = np.asarray(s); w = np.exp(np.asarray(lw))
@@ -965,6 +1249,17 @@ def main():
     if args.free_kappa:
         variables["kappa"] = dist.Uniform(args.kappa_min, args.kappa_max)
         print(f"FREE kappa ~ Uniform({args.kappa_min}, {args.kappa_max})")
+    if args.seed_gauss:
+        for k in ("alpha_A", "m_max_A"):
+            variables.pop(k, None); constants.pop(k, None)
+        variables["mu_A"] = dist.Uniform(args.mu_a_min, args.mu_a_max)
+        variables["sig_A"] = dist.Uniform(args.sig_a_min, args.sig_a_max)
+    if args.field in ("none", "broadpl", "shared"):
+        drop = ["mu_B", "sig_B"] + (["mu_chiB", "sig_chiB", "log_R_B"] if args.field == "none" else [])
+        for k in drop:
+            variables.pop(k, None); constants.pop(k, None)
+        if args.field == "broadpl":
+            variables["alpha_B"] = dist.Uniform(args.field_alpha_min, args.field_alpha_max)
     names = sorted(variables)
     priors = JointDistribution(*[variables[k] for k in names])
     init_strategy = init_to_median
@@ -1007,12 +1302,13 @@ def main():
     # re-insert any pinned constant as a constant "posterior" column so downstream
     # readers (figures, vt_calibration) that expect all 9 params still work.
     for k, v in constants.items():
-        post[k] = np.full_like(post["m_max_A"], float(v))
+        post[k] = np.full_like(post[names[0]], float(v))
     print("\nPOWER-LAW two-channel recovery:")
     for k in names:
         tag = "" if (REAL or k not in TRUTH) else f"  [{TRUTH[k]:.3f}]"
         print(f"  {k:9s}: {post[k].mean():7.3f} +/- {post[k].std():.3f}{tag}")
-    print(f"  R_A/R_B = {np.exp(post['log_R_A']-post['log_R_B']).mean():.2f}")
+    if "log_R_B" in post:
+        print(f"  R_A/R_B = {np.exp(post['log_R_A']-post['log_R_B']).mean():.2f}")
     os.makedirs(args.outdir, exist_ok=True)
     cmeta = ({} if args.channel_c == "off" else dict(
         channel_c=args.channel_c, c_mlo=C_MLO, c_mhi=C_MHI, c_alpha=C_ALPHA,
@@ -1023,6 +1319,9 @@ def main():
     # seed provenance: pooling several runs for quantiles requires knowing that
     # the chains were INDEPENDENT (distinct seeds), so always record it.
     smeta = dict(seed=int(args.seed))
+    if args.seed_gauss or args.field != "default":
+        smeta.update(seed_gauss=int(args.seed_gauss), field=args.field,
+                     field_mlo=FIELD_MLO, field_mhi=FIELD_MHI)
     gmeta = ({} if not args.kernel_geta else dict(
         kernel_geta=1, geta_form=args.kernel_geta_form, geta_eta0=args.kernel_geta_eta0,
         geta_p=args.kernel_geta_p, geta_w=args.kernel_geta_w,
