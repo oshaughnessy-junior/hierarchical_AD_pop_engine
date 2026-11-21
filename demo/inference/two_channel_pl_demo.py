@@ -174,7 +174,7 @@ def make_sampler_A_mmax(n_seed):
     return sampler_A
 
 
-def make_sampler_alignedseed(n_seed):
+def make_sampler_alignedseed(n_seed, exact=None):
     """Channel-B REPLACEMENT (--aligned-seed): the aligned low-mass Gaussian is the
     SEED pool of a real exchange cascade; chi_eff via the smooth, differentiable
     generation-aware tilt moments (Prototype 6) with a frozen-z reparametrisation.
@@ -184,8 +184,19 @@ def make_sampler_alignedseed(n_seed):
     variables dict are UNCHANGED -- but the four are reinterpreted as the aligned
     SEED: mass ~ truncnorm(mu_B, sig_B)[lo,hi], natal spin MAGNITUDE ~ truncnorm
     (mu_chiB, sig_chiB)[0,1] (aligned -> +1 tilt at 1g).  Takes v_esc as a 6th arg
-    (fixed; hard/soft retention set by the caller like channel A)."""
-    m_prop, chi_prop, log_q = M.make_proposal(n_seed)
+    (fixed; hard/soft retention set by the caller like channel A).
+
+    exact=(mu, sig, chi_mu, chi_sig): natal pool drawn from that target itself
+    (uniform IS weights there), so the occupancy-driven cascade is exact at it."""
+    if exact is None:
+        m_prop, chi_prop, log_q = M.make_proposal(n_seed)
+    else:
+        _mu, _sg, _cm, _cs = (float(x) for x in exact)
+        _k1, _k2 = jax.random.split(AS_C_PROP_KEY)
+        m_prop = _tn_draw(jax.random.uniform(_k1, (n_seed,)), _mu, _sg, AS_SEED_LO, AS_SEED_HI)
+        chi_prop = _tn_draw(jax.random.uniform(_k2, (n_seed,)), _cm, _cs, 0.0, 1.0)
+        log_q = (_tn_logpdf_trunc(m_prop, _mu, _sg, AS_SEED_LO, AS_SEED_HI)
+                 + _tn_logpdf_trunc(chi_prop, _cm, _cs, 0.0, 1.0))
 
     def _cfg(weight_array, v_esc=M.V_ESC):
         return M.MCConfig(
@@ -312,6 +323,10 @@ N_C = 2500                           # channel-C sample count (analytic: cheap)
 # B_b (alignedseed gap-filler): the aligned-seed cascade shape is PINNED at the
 # borrowed field values (only the rate log_R_C is free) -- the B_b identity.
 AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C = 9.5, 1.0, 0.10, 0.05
+# reassessment 2026-11-20: draw the channel-C aligned-seed natal pool from its
+# PINNED target (proposal == target), so its cascade is exact. Off = committed.
+AS_C_PROP_EXACT = False
+AS_C_PROP_KEY = jax.random.PRNGKey(20261123)
 C_KEY = jax.random.PRNGKey(20260721)
 
 
@@ -542,7 +557,8 @@ def make_combined_pl(n_seed_A, n_b):
     if CHANNEL_C in ("pl", "gauss"):
         samp_C = make_channelC_sampler(N_C)
     elif CHANNEL_C == "alignedseed":
-        samp_C = make_sampler_alignedseed(N_C)
+        samp_C = make_sampler_alignedseed(
+            N_C, exact=(AS_MU_C, AS_SIG_C, AS_CHIMU_C, AS_CHISIG_C) if AS_C_PROP_EXACT else None)
 
     def combined(*, alpha_A, m_max_A, spin_chi, mu_B, sig_B, mu_chiB, sig_chiB,
                  log_R_A, log_R_B, v_esc, sigq_2g=None, gamma_2g=None, kernel_b1=None,

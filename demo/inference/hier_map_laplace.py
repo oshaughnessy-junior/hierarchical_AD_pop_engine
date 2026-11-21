@@ -9,6 +9,16 @@ g(eta) kernel lor eta0=0.23 w=0.03, exchange mode 0 -- the headline settings):
   H1   H0 + broad aligned power-law field on [5,80] (--field broadpl).
   H2   H0 + narrow aligned field sharing the seed's (mu_A, sig_A) (--field shared).
 
+B-series members of the paper's tab:bseries (flags from notes/refit_exchange/
+launch_etafix_fleet_pcdev1{1,3}.sh and launch_headline_etafix.sh): flat-PL channel A
+with free m_max_A, exchange mode 1 (HHM96), no g(eta) kernel, v_esc 1000:
+  NULL  channel B = single aligned Gaussian.     BMIX  B = PL + narrow peak.
+  BB    NULL + channel C aligned-seed cascade (shape pinned, log_R_C free).
+  BC    NULL + channel C PL m^-2 on [20,45] (shape fixed, log_R_C free).
+  BD    NULL + channel C Gaussian (mu_C, sig_C, log_R_C free).
+  NULLG NULL with the combined kernel (exchange 0 + g(eta) lor) instead.
+Every one of them is recentred (exact cascade) unless built with prop=None.
+
 The objective is the fixed-key sampled Poisson log likelihood, written as in
 notes/refit_exchange/model_ranking.py (eval_logL): logL = -mu + sum_i log sum_j
 w_j L_i(x_j), full-covariance NAL Gaussians. Priors are flat boxes, so the MAP
@@ -50,6 +60,30 @@ def load_pl():
     return pl
 
 
+BSERIES = {
+    "NULL": dict(exch=1, geta=False, bmix=False, chc="off"),
+    "BB": dict(exch=1, geta=False, bmix=False, chc="alignedseed"),
+    "BC": dict(exch=1, geta=False, bmix=False, chc="pl"),
+    "BD": dict(exch=1, geta=False, bmix=False, chc="gauss"),
+    "BMIX": dict(exch=1, geta=False, bmix=True, chc="off"),
+    "NULLG": dict(exch=0, geta=True, bmix=False, chc="off"),
+}
+# launch-script --init-json points (committed fits' starting points)
+BSERIES_INIT = {
+    "NULL": dict(m_max_A=40.33, spin_chi=0.214, mu_B=9.15, sig_B=2.31, mu_chiB=0.073,
+                 sig_chiB=0.098, log_R_A=10.12, log_R_B=11.79),
+    "BB": dict(m_max_A=40.43, spin_chi=0.192, mu_B=8.95, sig_B=1.80, mu_chiB=0.050,
+               sig_chiB=0.047, log_R_A=10.01, log_R_B=11.76, log_R_C=9.28),
+    "BC": dict(m_max_A=40.9, spin_chi=0.22, mu_B=8.98, sig_B=1.81, mu_chiB=0.06,
+               sig_chiB=0.10, log_R_A=9.97, log_R_B=11.82, log_R_C=6.2),
+    "BD": dict(m_max_A=42.4, spin_chi=0.19, mu_B=8.15, sig_B=2.51, mu_chiB=0.06,
+               sig_chiB=0.10, log_R_A=9.68, log_R_B=11.83, log_R_C=9.0, mu_C=21.6, sig_C=10.2),
+    "BMIX": dict(m_max_A=41.0, spin_chi=0.20, mu_B=9.35, sig_B=1.20, mu_chiB=0.06,
+                 sig_chiB=0.10, log_R_A=10.05, log_R_B=11.85, f_peakB=0.82, alpha_B=2.7),
+}
+BSERIES_INIT["NULLG"] = dict(BSERIES_INIT["NULL"])
+
+
 def model_spec(model, logr0, rw=8.0):
     """(bounds, constants) for each model. Bounds mirror two_channel_pl_demo's
     priors under the headline flags (--sig-b-min 0.2 --log-r-width 8)."""
@@ -57,6 +91,18 @@ def model_spec(model, logr0, rw=8.0):
     c = {"v_esc": 1000.0}
     rB = {"log_R_B": (logr0 - rw, logr0 + rw)}
     spinB = {"mu_chiB": (-0.1, 0.5), "sig_chiB": (0.01, 0.3)}
+    if model in BSERIES:
+        sp = BSERIES[model]
+        b.update(m_max_A=(40.0, 70.0), mu_B=(5.0, 15.0),
+                 sig_B=(0.2 if sp["bmix"] else 0.5, 3.0), **spinB, **rB)
+        c["alpha_A"] = 0.0
+        if sp["bmix"]:
+            b.update(f_peakB=(0.01, 0.99), alpha_B=(-4.0, 8.0))
+        if sp["chc"] != "off":
+            b["log_R_C"] = (logr0 - rw, logr0 + rw)
+        if sp["chc"] == "gauss":
+            b.update(mu_C=(12.0, 45.0), sig_C=(2.0, 15.0))
+        return b, c
     if model in ("REF", "REFRC"):
         b.update(m_max_A=(40.0, 70.0), mu_B=(5.0, 15.0), sig_B=(0.2, 3.0),
                  f_peakB=(0.01, 0.99), alpha_B=(-4.0, 8.0), **spinB, **rB)
@@ -71,6 +117,8 @@ def model_spec(model, logr0, rw=8.0):
 
 
 def default_init(model, logr0):
+    if model in BSERIES:
+        return dict(BSERIES_INIT[model])
     if model in ("REF", "REFRC"):   # headline posterior means (inputs/headline_combined_vesc1000_post.npz)
         return dict(m_max_A=40.82, spin_chi=0.038, mu_B=9.30, sig_B=1.21,
                     mu_chiB=0.054, sig_chiB=0.043, log_R_A=10.14, log_R_B=11.77,
@@ -95,6 +143,26 @@ def configure(pl, model, f_dep, key, prop=None):
     bpm.KERNEL_GETA_ETA0 = 0.23; bpm.KERNEL_GETA_P = 4.0
     bpm.KERNEL_GETA_W = 0.03; bpm.KERNEL_GETA_FLOOR = 0.0
     pl.CHANNEL_C = "off"; pl.ALIGNED_SEED = False
+    if model in BSERIES:
+        sp = BSERIES[model]
+        bpm.EXCHANGE_MODE = sp["exch"]
+        bpm.KERNEL_GETA_ON = sp["geta"]
+        pl.CHANNEL_B_MIX = sp["bmix"]; pl.BMIX_MLO, pl.BMIX_MHI = 5.0, 20.0
+        pl.SEED_GAUSS = False; pl.FIELD = "default"
+        pl.CHANNEL_C = sp["chc"]; pl.N_C = 2500
+        if sp["chc"] == "pl":
+            pl.C_MLO, pl.C_MHI, pl.C_ALPHA = 20.0, 45.0, 2.0
+            pl.C_QA, pl.C_QB, pl.C_CHI_SIG = 4.0, 1.0, 0.2
+        elif sp["chc"] == "gauss":
+            pl.C_QA, pl.C_QB, pl.C_CHI_SIG = 6.0, 1.0, 0.1
+        elif sp["chc"] == "alignedseed":
+            pl.AS_MU_C, pl.AS_SIG_C, pl.AS_CHIMU_C, pl.AS_CHISIG_C = 9.5, 1.0, 0.10, 0.05
+            pl.AS_F_DEP = 0.5; pl.AS_SEED_LO, pl.AS_SEED_HI = 5.0, 45.0
+            pl.AS_TWOG_MEMORY = 0.0
+        if prop is not None:        # exact: every cascade proposal == its target
+            pl.PL_PROP_REF = (prop["alpha"], prop["m_max"], prop["spin"])
+            pl.AS_C_PROP_EXACT = True
+        return
     if model in ("REF", "REFRC"):
         pl.CHANNEL_B_MIX = True; pl.BMIX_MLO, pl.BMIX_MHI = 5.0, 20.0
         pl.SEED_GAUSS = False; pl.FIELD = "default"
@@ -273,7 +341,7 @@ def prop_ref_from(model, th):
     """proposal reference point for the recentred models (None = fixed proposal)."""
     if model in ("H0", "H1", "H2"):
         return dict(mu=float(th["mu_A"]), sig=float(th["sig_A"]), spin=float(th["spin_chi"]))
-    if model == "REFRC":
+    if model == "REFRC" or model in BSERIES:
         return dict(alpha=0.0, m_max=float(th["m_max_A"]), spin=float(th["spin_chi"]))
     return None
 
@@ -501,7 +569,7 @@ def run_smoke(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="fit", choices=["smoke", "fit", "reeval"])
-    p.add_argument("--model", default="H0", choices=["REF", "REFRC", "H0", "H1", "H2"])
+    p.add_argument("--model", default="H0", choices=["REF", "REFRC", "H0", "H1", "H2"] + list(BSERIES))
     p.add_argument("--f-dep", type=float, default=0.7)
     p.add_argument("--n-seed", type=int, default=3000)
     p.add_argument("--n-b", type=int, default=3000)
