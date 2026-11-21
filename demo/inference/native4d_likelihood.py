@@ -174,12 +174,25 @@ def as_jax(p):
 
 
 # ---- likelihood --------------------------------------------------------------
+
+def _delta(eta):
+    """sqrt(1 - 4 eta), 0 at equal mass, with a finite (zero) gradient there.
+
+    jnp.sqrt has an infinite derivative at 0. Equal-mass draws (eta = 0.25 exactly, as the
+    plain-Gaussian field channel produces) then give inf * 0 = NaN in reverse mode even when
+    the eta tangent is 0. The double where keeps every value identical and stops the NaN.
+    """
+    d = 1 - 4 * eta
+    pos = d > 0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, d, 1.0)), 0.0)
+
+
 def support_mask(x, P):
     """aligned_redshift.support plus the spin-cap edge test of log_likelihood_x."""
     mc, eta, chi, z = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
     good = jnp.isfinite(x).all(-1) & (mc > 0) & (eta > 0) & (eta <= 0.25) & (jnp.abs(chi) <= P["amax"]) & (z > 0)
     se = jnp.where(good, eta, 0.2); sm = jnp.where(good, mc, 20.0); sz = jnp.where(good, z, 0.1)
-    delta = jnp.sqrt(jnp.maximum(1 - 4 * se, 0.0)); tot = sm * se ** (-0.6)
+    delta = _delta(se); tot = sm * se ** (-0.6)
     m1 = tot * (1 + delta) / 2; m2 = tot * (1 - delta) / 2; q = m2 / m1
     good &= jnp.abs(chi) <= (P["a1max"] + q * P["a2max"]) / (1 + q)
     vals = jnp.stack([sm, sm * (1 + sz), m1 * (1 + sz), m2 * (1 + sz), tot * (1 + sz), q, sz], -1)
@@ -190,7 +203,7 @@ def support_mask(x, P):
 
 def component_terms(mc, eta, chi, z, P):
     """log p_j + log g_j + log N_j, shape (..., KMAX)."""
-    delta = jnp.sqrt(jnp.maximum(1 - 4 * eta, 0.0))
+    delta = _delta(eta)
     u = (delta - P["center"][0]) / P["scale"][0]; w = (chi - P["center"][1]) / P["scale"][1]
     T = jnp.stack([u, w, u * u, u * w, w * w], -1)                        # (...,5)
     Y = jnp.stack([mc * (1 + z), jnp.log(z)], -1)                         # (...,2)
