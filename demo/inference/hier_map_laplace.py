@@ -50,7 +50,7 @@ jax.config.update("jax_enable_x64", True)
 from jax.scipy.special import logsumexp
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-WS = os.path.expanduser("~/20261120-hier-reassess")
+WS = os.environ.get("HIER_WS", os.path.expanduser("~/20261120-hier-reassess"))
 
 
 def load_pl():
@@ -564,7 +564,7 @@ def run_smoke(args):
         t3 = time.time()
         print(f"{lab}: first {t2-t1:.1f}s (incl. compile), second {t3-t2:.1f}s", flush=True)
     (L, (mu, muA)), g = r
-    print(f"lnL={float(L):.3f} mu={float(mu):.2f} muA={float(muA):.2f} grad=" +
+    print(f"lnL={float(L):.9f} mu={float(mu):.6f} muA={float(muA):.2f} grad=" +
           " ".join(f"{k}:{float(gi):+.3g}" for k, gi in zip(B["names"], np.asarray(g))), flush=True)
     print("finite grad:", bool(np.all(np.isfinite(np.asarray(g)))), flush=True)
 
