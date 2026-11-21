@@ -13,6 +13,13 @@
 
 With several starts at one (model, f_dep) the profile keeps the best held-out lnL.
 
+Delegated fits: if <scan>/AWAIT_SPORC.json exists, --emit-extend first waits (up to
+max_wait_h) until every listed tag has result.json under its sporc_dir, then copies
+each result into <scan>/<tag>/ (source path, sha256 and time in
+<scan>/MERGED_FROM_SPORC.json; the delegation markers move to <tag>/.delegation/).
+Tags still missing at the deadline get their markers removed and their original job
+lines emitted, so the queue fits them here before the 0.1 extension list.
+
 Best f_dep per member = highest held-out lnL (n_seed 3000, keys 202/3003/40004).
 The ranking uses the n_seed 8000 re-evaluation (keys 11/202/3003) at that f_dep.
 Laplace lnZ is the n_seed 3000 Occam factor shifted by (lnL_8000 - lnL_fit).
@@ -90,6 +97,61 @@ def prev_dlnz():
     return out
 
 
+def await_delegated(scan):
+    """block until delegated results exist (or deadline), merge them; return job lines
+    to run here for tags still missing."""
+    import hashlib, shutil, sys, time
+    cfg_p = os.path.join(scan, "AWAIT_SPORC.json")
+    if not os.path.exists(cfg_p):
+        return []
+    cfg = json.load(open(cfg_p))
+    if cfg.get("merged"):
+        return []
+    src_root = cfg["sporc_dir"]; tags = cfg["tags"]; t0 = time.time()
+    deadline = t0 + 3600.0 * float(cfg.get("max_wait_h", 8.0))
+
+    def have(t):
+        return os.path.exists(os.path.join(src_root, t, "result.json"))
+    while True:
+        miss = [t for t in tags if not have(t)]
+        if not miss or time.time() > deadline:
+            break
+        print(f"{time.ctime()} awaiting {len(miss)} delegated results: {' '.join(miss)}",
+              file=sys.stderr, flush=True)
+        time.sleep(300)
+    rec = {}
+    for t in tags:
+        if not have(t):
+            continue
+        d = os.path.join(scan, t); os.makedirs(d, exist_ok=True)
+        keep = os.path.join(d, ".delegation"); os.makedirs(keep, exist_ok=True)
+        for mk in (".failed_fit", ".delegated_sporc"):
+            if os.path.exists(os.path.join(d, mk)):
+                shutil.move(os.path.join(d, mk), os.path.join(keep, mk))
+        srcd = os.path.join(src_root, t)
+        for fn in os.listdir(srcd):
+            if fn in ("result.json", "fit.log") or fn.endswith(".json"):
+                shutil.copy2(os.path.join(srcd, fn), os.path.join(d, fn))
+        rec[t] = dict(source=os.path.join(srcd, "result.json"),
+                      sha256=hashlib.sha256(open(os.path.join(srcd, "result.json"), "rb").read()).hexdigest(),
+                      copied=time.ctime())
+    missing = [t for t in tags if t not in rec]
+    jobs = []
+    for t in missing:
+        d = os.path.join(scan, t)
+        for mk in (".failed_fit", ".delegated_sporc"):
+            if os.path.exists(os.path.join(d, mk)):
+                os.remove(os.path.join(d, mk))
+        jobs.append(cfg["jobs"][t])
+    json.dump(dict(merged=rec, run_here_after_deadline=missing,
+                   waited_s=time.time() - t0), open(os.path.join(scan, "MERGED_FROM_SPORC.json"), "w"), indent=1)
+    cfg["merged"] = True
+    json.dump(cfg, open(cfg_p, "w"), indent=1)
+    print(f"{time.ctime()} merged {len(rec)} delegated results; {len(missing)} to run here",
+          file=sys.stderr, flush=True)
+    return jobs
+
+
 def profile_fig(res, path):
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -140,6 +202,9 @@ def main():
                 print(job(m, f, src))
         return
     if a.emit_extend:
+        for line in await_delegated(SCAN):
+            print(line)
+        res = load()
         for m in MEMBERS:
             b = best(res[m])
             have = {r["f_dep"] for r in res[m]}
