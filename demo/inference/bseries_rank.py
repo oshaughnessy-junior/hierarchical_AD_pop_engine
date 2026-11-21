@@ -16,7 +16,7 @@ SCAN = os.path.join(WS, "runs/BS_scan")
 OUT = os.path.join(WS, "runs/BS_rank")
 MEMBERS = ["NULL", "BB", "BC", "BD", "BMIX", "NULLG", "REFRC"]
 LABEL = {"NULL": "null", "BB": "B_b", "BC": "B_c", "BD": "B_d", "BMIX": "Bmix",
-         "NULLG": "null + g(eta), exch 0", "REFRC": "combined (REFRC)"}
+         "NULLG": "null + g(eta) exch 0", "REFRC": "combined (REFRC)"}
 # paper tab:bseries, committed proposal (macros_results.tex, model_ranking etafix_k10_vesc1000)
 PAPER = {"NULL": (-36.5, -34.4), "BB": (-12.5, -12.8), "BC": (-40.3, -38.5),
          "BD": (-19.3, -21.3), "BMIX": (-37.7, -34.3), "REFRC": (0.0, 0.0), "NULLG": (None, None)}
