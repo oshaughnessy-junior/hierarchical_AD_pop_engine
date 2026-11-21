@@ -6,6 +6,12 @@
   bseries_rank.py --emit-reeval           each model's best-f_dep tag (n_seed 8000 pass)
   bseries_rank.py                         runs/BS_rank/{table.csv, profile.csv, README.md,
                                           profile_fdep.png}
+  --scan DIR --suffix S                   another scan (e.g. runs/BS_scan_mmax20, _mmax20):
+                                          outputs table_S.csv etc., and a column with the
+                                          floor-40 dlnZ from runs/BS_rank/table.csv
+  --job-extra "ARGS"                      appended to every emitted fit job
+
+With several starts at one (model, f_dep) the profile keeps the best held-out lnL.
 
 Best f_dep per member = highest held-out lnL (n_seed 3000, keys 202/3003/40004).
 The ranking uses the n_seed 8000 re-evaluation (keys 11/202/3003) at that f_dep.
@@ -53,33 +59,79 @@ def start_from(r, pad=0.002):
     return json.dumps(th, separators=(",", ":"))
 
 
-def job(model, f, src):
-    return f"{model}_f{f} --model {model} --f-dep {f} --init-json {start_from(src)}"
+JOB_EXTRA = ""
+
+
+def job(model, f, src, suffix=""):
+    return (f"{model}_f{f}{suffix} --model {model} --f-dep {f} --init-json {start_from(src)}"
+            + (f" {JOB_EXTRA}" if JOB_EXTRA else ""))
+
+
+def per_fdep(rs):
+    """best held-out result at each f_dep (several starts allowed)"""
+    d = {}
+    for r in rs:
+        if r["f_dep"] not in d or r["lnL_heldout_mean"] > d[r["f_dep"]]["lnL_heldout_mean"]:
+            d[r["f_dep"]] = r
+    return [d[f] for f in sorted(d)]
+
+
+def prev_dlnz():
+    p = os.path.join(WS, "runs/BS_rank/table.csv")
+    out = {}
+    if os.path.exists(p):
+        hdr = None
+        for line in open(p):
+            parts = line.rstrip("\n").split(",")
+            if hdr is None:
+                hdr = parts; continue
+            row = dict(zip(hdr, parts))
+            out[row["member"]] = (row.get("dlnZ"), row.get("best_f_dep"))
+    return out
 
 
 def profile_fig(res, path):
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    two = any("m_max_A" in r["theta_map"] and r["bounds"]["m_max_A"][0] < 40 for rs in res.values() for r in rs)
+    fig, axs = plt.subplots(1, 2 if two else 1, figsize=(11.5 if two else 6.4, 4.2), squeeze=False)
+    ax = axs[0, 0]
     for m in MEMBERS:
         if m not in res:
             continue
-        rs = sorted(res[m], key=lambda r: r["f_dep"])
+        rs = per_fdep(res[m])
         f = np.array([r["f_dep"] for r in rs]); L = np.array([r["lnL_heldout_mean"] for r in rs])
         sd = np.array([r["lnL_heldout_sd"] or 0.0 for r in rs])
-        ax.errorbar(f, L, yerr=sd, marker="o", ms=4, capsize=2, lw=1.2, label=LABEL[m])
+        ln = ax.errorbar(f, L, yerr=sd, marker="o", ms=4, capsize=2, lw=1.2, label=LABEL[m])
+        if two:
+            mm = np.array([r["theta_map"]["m_max_A"] for r in rs])
+            axs[0, 1].plot(f, mm, marker="o", ms=4, lw=1.2, color=ln[0].get_color(), label=LABEL[m])
     ax.set_xlabel(r"$f_{\rm dep}$"); ax.set_ylabel(r"held-out $\ln\mathcal{L}$ ($n_{\rm seed}=3000$)")
     ax.set_title("B-series, exact cascade: profile in $f_{\\rm dep}$")
     ax.legend(fontsize=8, ncol=2); ax.grid(alpha=0.3)
+    if two:
+        a2 = axs[0, 1]
+        lo = min(r["bounds"]["m_max_A"][0] for rs in res.values() for r in rs)
+        a2.axhline(lo, color="k", ls=":", lw=1); a2.axhline(40, color="0.5", ls="--", lw=1)
+        a2.set_xlabel(r"$f_{\rm dep}$"); a2.set_ylabel(r"$m_{\max,A}$ at the profile optimum [$M_\odot$]")
+        a2.set_title(r"$(m_{\max,A}, f_{\rm dep})$ ridge (dotted: prior floor; dashed: old floor)")
+        a2.grid(alpha=0.3)
     fig.tight_layout(); fig.savefig(path, dpi=150); plt.close(fig)
 
 
 def main():
+    global SCAN, JOB_EXTRA
     ap = argparse.ArgumentParser()
     ap.add_argument("--emit-jobs", type=float, nargs="+")
     ap.add_argument("--emit-extend", action="store_true")
     ap.add_argument("--emit-reeval", action="store_true")
+    ap.add_argument("--scan", default="runs/BS_scan")
+    ap.add_argument("--suffix", default="")
+    ap.add_argument("--job-extra", default="")
     a = ap.parse_args()
+    SCAN = a.scan if os.path.isabs(a.scan) else os.path.join(WS, a.scan)
+    JOB_EXTRA = a.job_extra
+    sfx = a.suffix
     res = load()
     if a.emit_jobs:
         for f in a.emit_jobs:
@@ -103,12 +155,13 @@ def main():
     for m in MEMBERS:
         if m not in res:
             continue
-        rs = sorted(res[m], key=lambda r: r["f_dep"])
+        rs = per_fdep(res[m])
         for r in rs:
-            prof.append(dict(member=m, f_dep=r["f_dep"], lnL_heldout=r["lnL_heldout_mean"],
+            prof.append(dict(member=m, f_dep=r["f_dep"], tag=r["tag"],
+                             m_max_A=r["theta_map"].get("m_max_A"), lnL_heldout=r["lnL_heldout_mean"],
                              lnL_heldout_sd=r["lnL_heldout_sd"], lnZ_bdy=r["lnZ_laplace_bdy"],
                              railing=";".join(r["railing"]) if r.get("railing") else ""))
-        b = best(rs)
+        b = best(res[m])
         fs = [r["f_dep"] for r in rs]
         bracketed = min(fs) < b["f_dep"] < max(fs)
         if b["reeval"]:
@@ -119,29 +172,33 @@ def main():
         rows.append(dict(member=m, label=LABEL[m], best_f_dep=b["f_dep"], bracketed=bracketed,
                          lnL=L, lnL_sd=sd, lnL_src=src, lnZ=lnZ,
                          railing=";".join(b["railing"]) if b.get("railing") else "",
-                         negH_pd=b["negH_pd"], n_par=len(b["names"]),
+                         negH_pd=b["negH_pd"], n_par=len(b["names"]), best_tag=b["tag"],
+                         m_max_A=b["theta_map"].get("m_max_A"),
                          scan=" ".join(f"{r['f_dep']}:{r['lnL_heldout_mean']:.1f}" for r in rs),
                          theta=b["theta_map"], paper_dlnL=PAPER[m][0], paper_dlnZ=PAPER[m][1],
                          paper_f_dep=PAPER_FDEP[m]))
     ref = next((r for r in rows if r["member"] == "REFRC"), None)
+    prev = prev_dlnz() if sfx else {}
     for r in rows:
         r["dlnL"] = r["lnL"] - ref["lnL"] if ref else None
         r["dlnZ"] = r["lnZ"] - ref["lnZ"] if ref else None
+        r["floor40_dlnZ"], r["floor40_f_dep"] = prev.get(r["member"], (None, None))
     os.makedirs(OUT, exist_ok=True)
-    cols = ["member", "label", "best_f_dep", "bracketed", "lnL", "lnL_sd", "lnL_src", "lnZ", "dlnL",
-            "dlnZ", "paper_dlnL", "paper_dlnZ", "paper_f_dep", "n_par", "negH_pd", "railing", "scan"]
+    cols = ["member", "label", "best_tag", "best_f_dep", "bracketed", "m_max_A", "lnL", "lnL_sd", "lnL_src",
+            "lnZ", "dlnL", "dlnZ", "floor40_dlnZ", "floor40_f_dep", "paper_dlnL", "paper_dlnZ", "paper_f_dep",
+            "n_par", "negH_pd", "railing", "scan"]
     fmt = lambda v: "" if v is None else (f"{v:.2f}" if isinstance(v, float) else str(v))
-    with open(os.path.join(OUT, "table.csv"), "w") as f:
+    with open(os.path.join(OUT, f"table{sfx}.csv"), "w") as f:
         f.write(",".join(cols) + ",theta_map\n")
         for r in rows:
             f.write(",".join(fmt(r[c]) for c in cols) + ',"'
                     + json.dumps({k: round(v, 4) for k, v in r["theta"].items()}).replace('"', "'") + '"\n')
-    pc = ["member", "f_dep", "lnL_heldout", "lnL_heldout_sd", "lnZ_bdy", "railing"]
-    with open(os.path.join(OUT, "profile.csv"), "w") as f:
+    pc = ["member", "f_dep", "tag", "m_max_A", "lnL_heldout", "lnL_heldout_sd", "lnZ_bdy", "railing"]
+    with open(os.path.join(OUT, f"profile{sfx}.csv"), "w") as f:
         f.write(",".join(pc) + "\n")
         for p in prof:
             f.write(",".join(fmt(p[c]) for c in pc) + "\n")
-    profile_fig(res, os.path.join(OUT, "profile_fdep.png"))
+    profile_fig(res, os.path.join(OUT, f"profile_fdep{sfx}.png"))
     rk_new = sorted(rows, key=lambda r: -r["dlnZ"])
     rk_old = sorted([r for r in rows if r["paper_dlnZ"] is not None], key=lambda r: -r["paper_dlnZ"])
     fd = sorted({p["f_dep"] for p in prof})
@@ -153,12 +210,14 @@ def main():
              "n_b 6000 mean over keys 11, 202, 3003. Laplace lnZ keeps the n_seed 3000 Occam",
              "factor. Differences are relative to REFRC. Paper columns are tab:bseries",
              "(committed proposal, posterior mean, 10 keys).", "",
-             "| member | best f_dep | bracketed | lnL (sd) | dlnL | dlnZ | paper dlnL | paper dlnZ | rails |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             f"Scan: `{os.path.relpath(SCAN, WS)}`.", "",
+             "| member | best f_dep | bracketed | m_max_A | lnL (sd) | dlnL | dlnZ | floor-40 dlnZ (f_dep) | paper dlnZ | rails |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rk_new:
         lines.append(f"| {r['label']} | {r['best_f_dep']} | {'yes' if r['bracketed'] else 'NO'} | "
-                     f"{r['lnL']:.1f} ({(r['lnL_sd'] or float('nan')):.1f}, {r['lnL_src']}) | "
-                     f"{r['dlnL']:+.1f} | {r['dlnZ']:+.1f} | {fmt(r['paper_dlnL'])} | {fmt(r['paper_dlnZ'])} | {r['railing']} |")
+                     f"{fmt(r['m_max_A'])} | {r['lnL']:.1f} ({(r['lnL_sd'] or float('nan')):.1f}, {r['lnL_src']}) | "
+                     f"{r['dlnL']:+.1f} | {r['dlnZ']:+.1f} | {fmt(r['floor40_dlnZ'])} ({fmt(r['floor40_f_dep'])}) | "
+                     f"{fmt(r['paper_dlnZ'])} | {r['railing']} |")
     lines += ["", "Rank by dlnZ, exact: " + " > ".join(r["label"] for r in rk_new),
               "Rank by dlnZ, paper: " + " > ".join(r["label"] for r in rk_old), "",
               "## Profile: held-out lnL (n_seed 3000) against f_dep", "",
@@ -167,10 +226,18 @@ def main():
     for m in MEMBERS:
         if m not in res:
             continue
-        d = {r["f_dep"]: r["lnL_heldout_mean"] for r in res[m]}
+        d = {r["f_dep"]: r["lnL_heldout_mean"] for r in per_fdep(res[m])}
         lines.append(f"| {LABEL[m]} | " + " | ".join(f"{d[f]:.1f}" if f in d else "" for f in fd) + " |")
-    lines += ["", "![profile](profile_fdep.png)"]
-    open(os.path.join(OUT, "README.md"), "w").write("\n".join(lines) + "\n")
+    if sfx:
+        lines += ["", "## m_max_A at the profile optimum against f_dep", "",
+                  "| member | " + " | ".join(str(f) for f in fd) + " |", "|---|" + "---|" * len(fd)]
+        for m in MEMBERS:
+            if m not in res:
+                continue
+            d = {r["f_dep"]: r["theta_map"].get("m_max_A") for r in per_fdep(res[m])}
+            lines.append(f"| {LABEL[m]} | " + " | ".join(f"{d[f]:.1f}" if d.get(f) is not None else "" for f in fd) + " |")
+    lines += ["", f"![profile](profile_fdep{sfx}.png)"]
+    open(os.path.join(OUT, f"README{sfx}.md"), "w").write("\n".join(lines) + "\n")
     print("\n".join(lines))
 
 
