@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # B-series exact-cascade refit queue (cardassia, reassessment 2026-11-20).
 # 5 workers x 4 cores (8-11 ... 24-27). Resumable: a job with result.json is
-# skipped; a dead claim is cleared and the fit resumes from state.npz. After the
-# fits drain: pick each member's best f_dep (held-out lnL), re-evaluate those and
-# REFRC_f0.5 at n_seed 8000 / n_b 6000 on keys 11 202 3003, then build the table.
+# skipped; a dead claim is cleared and the fit resumes from state.npz.
+# Order: the fits in jobs.txt; then f_dep 0.1 for any model still best at 0.2
+# (jobs_extend.txt); then each model's best f_dep is re-evaluated at n_seed 8000 /
+# n_b 6000 on keys 11 202 3003 (skipped where done); then the table is rebuilt.
 #
 #   setsid nohup bash bs_queue.sh > logs/BS_queue.log 2>&1 < /dev/null &
 set -u
@@ -56,12 +57,16 @@ worker() {   # CORES MODE JOBFILE
 }
 
 run_pool() {   # MODE JOBFILE
+  [ -s "$2" ] || return 0
   clear_stale
   for c in 8-11 12-15 16-19 20-23 24-27; do worker $c "$1" "$2" & sleep 20; done
   wait
 }
 
 run_pool fit $JOBS
+$PY $RANK --emit-extend > $SCAN/jobs_extend.txt
+echo "$(date) extend jobs:"; cut -d" " -f1 $SCAN/jobs_extend.txt
+run_pool fit $SCAN/jobs_extend.txt
 $PY $RANK --emit-reeval > $SCAN/jobs_reeval.txt
 echo "$(date) reeval jobs:"; cat $SCAN/jobs_reeval.txt
 run_pool reeval $SCAN/jobs_reeval.txt
