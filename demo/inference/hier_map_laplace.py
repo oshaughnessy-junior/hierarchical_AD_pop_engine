@@ -62,6 +62,8 @@ def load_pl():
 
 # lower edge of the m_max_A prior (paper/committed: 40). Set by --m-max-lo.
 M_MAX_LO = 40.0
+FREE_KAPPA = None      # (lo, hi) when kappa is fitted (--free-kappa)
+KAPPA_INIT = 2.7
 
 BSERIES = {
     "NULL": dict(exch=1, geta=False, bmix=False, chc="off"),
@@ -89,7 +91,15 @@ BSERIES_INIT["NULLG"] = dict(BSERIES_INIT["NULL"])
 
 def model_spec(model, logr0, rw=8.0):
     """(bounds, constants) for each model. Bounds mirror two_channel_pl_demo's
-    priors under the headline flags (--sig-b-min 0.2 --log-r-width 8)."""
+    priors under the headline flags (--sig-b-min 0.2 --log-r-width 8).
+    With --free-kappa LO HI (native4d only), kappa ~ U[LO, HI] is added to every model."""
+    b, c = _model_spec(model, logr0, rw)
+    if FREE_KAPPA is not None:
+        b["kappa"] = tuple(FREE_KAPPA)
+    return b, c
+
+
+def _model_spec(model, logr0, rw=8.0):
     b = {"spin_chi": (0.01, 0.3), "log_R_A": (logr0 - rw, logr0 + rw)}
     c = {"v_esc": 1000.0}
     rB = {"log_R_B": (logr0 - rw, logr0 + rw)}
@@ -120,6 +130,13 @@ def model_spec(model, logr0, rw=8.0):
 
 
 def default_init(model, logr0):
+    th = _default_init(model, logr0)
+    if FREE_KAPPA is not None:
+        th["kappa"] = KAPPA_INIT
+    return th
+
+
+def _default_init(model, logr0):
     if model in BSERIES:
         return dict(BSERIES_INIT[model])
     if model in ("REF", "REFRC"):   # headline posterior means (inputs/headline_combined_vesc1000_post.npz)
@@ -247,6 +264,7 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
     names = sorted(bounds)
     ref = default_init(model, logr0)
     ref.update(consts)
+    ref.pop("kappa", None)
     mc_ref = None
     if args.native4d_window:
         s0, _ = comb(**ref)
@@ -264,10 +282,11 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
     def parts(theta):
         th = {k: theta[i] for i, k in enumerate(names)}
         th.update(consts)
+        kap = th.pop("kappa", kappa)
         s, lw = comb(**th)
-        L, d = like(s, lw, kappa)
+        L, d = like(s, lw, kap)
         mu = d["mu"]
-        muA = T * jnp.sum(jnp.exp(lw[:nA]) * like.sel.xi(s[:nA], kappa))
+        muA = T * jnp.sum(jnp.exp(lw[:nA]) * like.sel.xi(s[:nA], kap))
         return L, (mu, muA)
 
     def prof(theta):
@@ -276,7 +295,8 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
         return sl - n_obs * jnp.log(mu) + n_obs * math.log(n_obs) - n_obs, (mu, muA)
 
     win = "on" if like.window is not None else "off"
-    print(f"NATIVE4D: {like.n4} events on 4D fits, {like.n3} on 3D NAL; kappa={kappa}; "
+    kdesc = f"free U{tuple(FREE_KAPPA)}" if FREE_KAPPA is not None else kappa
+    print(f"NATIVE4D: {like.n4} events on 4D fits, {like.n3} on 3D NAL; kappa={kdesc}; "
           f"T_obs={T:.4f} yr; window={win}", flush=True)
     return dict(prof=prof, pl=pl, M=M, names=names, bounds=bounds, consts=consts, parts=parts,
                 n_obs=n_obs, logr0=logr0, nA=nA, comb=comb, pdet=None, like=like)
@@ -598,7 +618,10 @@ def main():
     p.add_argument("--outdir", default=None)
     # ---- opt-in revised 4D event likelihoods (A's native4d path) ----
     p.add_argument("--likelihood", default="nal3d", choices=["nal3d", "native4d"])
-    p.add_argument("--kappa", type=float, default=2.7, help="native4d: fixed redshift-evolution index")
+    p.add_argument("--kappa", type=float, default=2.7, help="native4d: fixed redshift-evolution index "
+                   "(with --free-kappa: the starting value)")
+    p.add_argument("--free-kappa", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="native4d: fit kappa with a uniform prior on [LO, HI]")
     p.add_argument("--native4d-tables", default=os.path.join(WS, "runs/A_tables/native4d_events.npz"))
     p.add_argument("--native4d-tiers", default="primary")
     p.add_argument("--native4d-nodes", type=int, default=32)
@@ -607,8 +630,11 @@ def main():
     p.add_argument("--m-max-lo", type=float, default=40.0,
                    help="lower edge of the m_max_A prior U[lo, 70] (committed 40)")
     args = p.parse_args()
-    global M_MAX_LO
+    global M_MAX_LO, FREE_KAPPA, KAPPA_INIT
     M_MAX_LO = float(args.m_max_lo)
+    if args.free_kappa is not None and args.likelihood != "native4d":
+        raise SystemExit("--free-kappa needs --likelihood native4d")
+    FREE_KAPPA = args.free_kappa; KAPPA_INIT = float(args.kappa)
     if args.mode == "smoke":
         return run_smoke(args)
     if args.outdir is None:
