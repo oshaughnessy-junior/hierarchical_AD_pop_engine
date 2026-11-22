@@ -64,6 +64,7 @@ def load_pl():
 M_MAX_LO = 40.0
 FREE_KAPPA = None      # (lo, hi) when kappa is fitted (--free-kappa)
 KAPPA_INIT = 2.7
+LOG_R_RANGE = None     # (lo, hi) offsets from logr0 for every log_R_* (--log-r-range)
 
 BSERIES = {
     "NULL": dict(exch=1, geta=False, bmix=False, chc="off"),
@@ -94,6 +95,10 @@ def model_spec(model, logr0, rw=8.0):
     priors under the headline flags (--sig-b-min 0.2 --log-r-width 8).
     With --free-kappa LO HI (native4d only), kappa ~ U[LO, HI] is added to every model."""
     b, c = _model_spec(model, logr0, rw)
+    if LOG_R_RANGE is not None:        # --log-r-range LO HI: every log_R_* on [logr0+LO, logr0+HI]
+        for k in b:
+            if k.startswith("log_R_"):
+                b[k] = (logr0 + LOG_R_RANGE[0], logr0 + LOG_R_RANGE[1])
     if FREE_KAPPA is not None:
         b["kappa"] = tuple(FREE_KAPPA)
     return b, c
@@ -567,6 +572,31 @@ def run_reeval(args):
         json.dump(out, f, indent=1)
 
 
+def run_laplace(args):
+    """Laplace at the MAP of <outdir>/result.json, re-evaluated at --n-seed/--n-b with --key and the
+    fit's final proposal (no re-optimisation). Writes laplace_n<n_seed>.json."""
+    r = json.load(open(os.path.join(args.outdir, "result.json")))
+    args.f_dep = r["f_dep"]
+    t0 = time.time()
+    B = build(args, r["model"], args.key, args.n_seed, args.n_b, r.get("final_proposal"))
+    th = np.array([r["theta_map"][n] for n in B["names"]])
+    L, (mu, muA) = jax.jit(B["parts"])(jnp.asarray(th))
+    g = np.asarray(jax.jit(jax.grad(lambda t: B["parts"](t)[0]))(jnp.asarray(th)))
+    out = laplace(B, th, float(L))
+    ev, V = np.linalg.eigh(-np.array(out["hessian"]))
+    v = V[:, 0]; order = np.argsort(-np.abs(v))
+    out.update(src=args.outdir, n_seed=args.n_seed, n_b=args.n_b, key=args.key, lnL=float(L), mu=float(mu),
+               names=B["names"], grad=dict(zip(B["names"], g.tolist())),
+               min_eig_vector={B["names"][i]: float(v[i]) for i in order},
+               min_eig_dominant=B["names"][order[0]], wall_s=time.time() - t0,
+               ref_n_seed=r["n_seed"], ref_lnL=r["lnL"], ref_lnZ_laplace_bdy=r["lnZ_laplace_bdy"],
+               ref_negH_eigs=r["negH_eigs"])
+    with open(os.path.join(args.outdir, f"laplace_n{args.n_seed}.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    print(f"laplace n_seed={args.n_seed}: lnL={float(L):.3f} lnZ_bdy={out['lnZ_laplace_bdy']:.3f} "
+          f"(ref {r['lnZ_laplace_bdy']:.3f}) pd={out['negH_pd']} min eig {ev[0]:.3g} along {B['names'][order[0]]}", flush=True)
+
+
 def run_smoke(args):
     t0 = time.time()
     B0 = build(args, args.model, args.key, args.n_seed, args.n_b, dry=True)
@@ -591,7 +621,7 @@ def run_smoke(args):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", default="fit", choices=["smoke", "fit", "reeval"])
+    p.add_argument("--mode", default="fit", choices=["smoke", "fit", "reeval", "laplace"])
     p.add_argument("--model", default="H0", choices=["REF", "REFRC", "H0", "H1", "H2"] + list(BSERIES))
     p.add_argument("--f-dep", type=float, default=0.7)
     p.add_argument("--n-seed", type=int, default=3000)
@@ -620,6 +650,8 @@ def main():
     p.add_argument("--likelihood", default="nal3d", choices=["nal3d", "native4d"])
     p.add_argument("--kappa", type=float, default=2.7, help="native4d: fixed redshift-evolution index "
                    "(with --free-kappa: the starting value)")
+    p.add_argument("--log-r-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="every log_R_* prior on [logr0+LO, logr0+HI] (default -8 8)")
     p.add_argument("--free-kappa", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                    help="native4d: fit kappa with a uniform prior on [LO, HI]")
     p.add_argument("--native4d-tables", default=os.path.join(WS, "runs/A_tables/native4d_events.npz"))
@@ -635,10 +667,14 @@ def main():
     if args.free_kappa is not None and args.likelihood != "native4d":
         raise SystemExit("--free-kappa needs --likelihood native4d")
     FREE_KAPPA = args.free_kappa; KAPPA_INIT = float(args.kappa)
+    global LOG_R_RANGE
+    LOG_R_RANGE = args.log_r_range
     if args.mode == "smoke":
         return run_smoke(args)
     if args.outdir is None:
         raise SystemExit("--outdir required")
+    if args.mode == "laplace":
+        return run_laplace(args)
     return run_fit(args) if args.mode == "fit" else run_reeval(args)
 
 
