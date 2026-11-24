@@ -121,6 +121,74 @@ class ZSelection:
         return dict(m1_above=float(jnp.sum(w * (m1 > self.mmax))), m2_below=float(jnp.sum(w * (m2 < self.mmin))))
 
 
+
+# ---- injection-based selection ------------------------------------------------
+class InjectionSelection:
+    """mu from found sensitivity injections (Essick 2025 recipe), for a population given as weighted draws.
+
+        mu = (T_obs / N_gen) sum_found f_run * weights_i * rho(m1_i, m2_i) p(z_i|kappa) / p_draw(m1_i, m2_i, z_i)
+
+    rho is the population density per (m1_source, m2_source) built from the draws by cloud-in-cell
+    deposition on a grid in (ln m1, ln m2) and bilinear interpolation at the injections (deposit and
+    interpolation are adjoint, so this equals sum_j w_j xi(m_j) with a tent-smoothed xi). Spins are
+    taken at the injection draw distribution, so their draw factors cancel and only the factored
+    (m1, m2, z) draw density enters. Masses and z are source frame on both sides (Jacobian 1).
+    p(z|kappa) is zero above ZMAX_POP. f_run thins the detected population per observing run for
+    catalog completeness (events without a fit, assumed random within a run).
+    """
+
+    def __init__(self, npz, thinning, lnm_lo=math.log(2.0), lnm_hi=math.log(600.0), nbins=140):
+        d = np.load(npz, allow_pickle=True)
+        self.T_obs_years = float(d["T_obs_s"]) / (365.25 * 86400.0)
+        self.NG = float(d["total_generated"])
+        run = np.asarray(d["run"]).astype(int)
+        f = np.array([thinning.get(int(r), 0.0) for r in run])
+        keep = f > 0
+        m1 = np.asarray(d["m1"])[keep]; m2 = np.asarray(d["m2"])[keep]; z = np.asarray(d["z"])[keep]
+        self.base = jnp.asarray(np.log(np.asarray(d["weights"])[keep] * f[keep]) - np.asarray(d["lnpdraw_m1m2z"])[keep]
+                                - np.log(m1) - np.log(m2))          # per (ln m1, ln m2) -> per (m1, m2)
+        self.z = jnp.asarray(z); self.run = run[keep]; self.n_inj = int(keep.sum())
+        self.lo, self.h, self.n = lnm_lo, (lnm_hi - lnm_lo) / (nbins - 1), nbins
+        self._ii, self._tt = self._coords(np.log(np.maximum(m1, m2)), np.log(np.minimum(m1, m2)))
+        self.thinning = dict(thinning)
+
+    def _coords(self, l1, l2):
+        u1 = np.clip((np.asarray(l1) - self.lo) / self.h, 0, self.n - 1 - 1e-9)
+        u2 = np.clip((np.asarray(l2) - self.lo) / self.h, 0, self.n - 1 - 1e-9)
+        i1, i2 = np.floor(u1).astype(int), np.floor(u2).astype(int)
+        return (jnp.asarray(i1), jnp.asarray(i2)), (jnp.asarray(u1 - i1), jnp.asarray(u2 - i2))
+
+    def _density(self, samples, log_w):
+        """grid of population weight per unit (ln m1, ln m2), CIC-deposited from the draws."""
+        a, b = samples[:, 0], samples[:, 1]
+        l1, l2 = jnp.log(jnp.maximum(a, b)), jnp.log(jnp.minimum(a, b))
+        u1 = jnp.clip((l1 - self.lo) / self.h, 0, self.n - 1 - 1e-9); u2 = jnp.clip((l2 - self.lo) / self.h, 0, self.n - 1 - 1e-9)
+        i1, i2 = jnp.floor(u1).astype(jnp.int32), jnp.floor(u2).astype(jnp.int32)
+        t1, t2 = u1 - i1, u2 - i2; w = jnp.exp(log_w)
+        G = jnp.zeros((self.n, self.n))
+        for di, dj, ww in ((0, 0, (1 - t1) * (1 - t2)), (1, 0, t1 * (1 - t2)), (0, 1, (1 - t1) * t2), (1, 1, t1 * t2)):
+            G = G.at[i1 + di, i2 + dj].add(w * ww)
+        return G / self.h ** 2
+
+    def log_v(self, samples, log_w, kappa):
+        """per-injection log importance weight (without T/N_gen)."""
+        G = self._density(samples, log_w)
+        (i1, i2), (t1, t2) = self._ii, self._tt
+        rho = ((1 - t1) * (1 - t2) * G[i1, i2] + t1 * (1 - t2) * G[i1 + 1, i2]
+               + (1 - t1) * t2 * G[i1, i2 + 1] + t1 * t2 * G[i1 + 1, i2 + 1])
+        return jnp.log(jnp.maximum(rho, 1e-300)) + log_pz(self.z, kappa) + self.base
+
+    def log_mu(self, samples, log_w, kappa):
+        return math.log(self.T_obs_years / self.NG) + logsumexp(self.log_v(samples, log_w, kappa))
+
+    def diagnostics(self, samples, log_w, kappa, n_obs):
+        lv = self.log_v(samples, log_w, kappa); c = self.T_obs_years / self.NG
+        s1 = jnp.exp(logsumexp(lv)); s2 = jnp.exp(logsumexp(2 * lv))
+        mu = c * s1; var = c * c * s2 - mu * mu / self.NG
+        return dict(mu=mu, neff=s1 * s1 / s2, var_mu=var, sd_mu=jnp.sqrt(jnp.maximum(var, 0.0)),
+                    mc_var_lnL=n_obs ** 2 * var / mu ** 2)
+
+
 # ---- per-event integrals -----------------------------------------------------
 def mc_eta_chieff(samples):
     m1, m2, c1, c2 = samples[:, 0], samples[:, 1], samples[:, 2], samples[:, 3]
@@ -242,19 +310,26 @@ class HybridPoissonLikelihood:
     prior, so they do not respond to kappa.
     """
 
-    def __init__(self, catalog, tables, pdet_z_grid, tiers=("primary",), nodes=48, T_obs=None, mc_ref=None):
+    def __init__(self, catalog, tables, pdet_z_grid, tiers=("primary",), nodes=48, T_obs=None, mc_ref=None,
+                 injection_selection=None):
         names = [str(n) for n in catalog["names"]]
         self.P, meta = load_event_tables(tables, tiers)
-        idx = np.asarray(meta["catalog_index"]).astype(int)
-        bad = [(i, str(n)) for i, n in zip(idx, meta["name"]) if names[i] != str(n)]
-        if bad:
-            raise ValueError("event table does not match this catalog: %r" % bad[:3])
+        # match table rows to this catalog by name (the catalog may be a subset of the full one)
+        pos = {n: i for i, n in enumerate(names)}
+        rows = np.array([str(n) in pos for n in meta["name"]])
+        if not rows.all():
+            self.P = {k: v[np.where(rows)[0]] for k, v in self.P.items()}
+            meta = {k: v[rows] for k, v in meta.items()}
+        idx = np.array([pos[str(n)] for n in meta["name"]], int)
+        self.injsel = injection_selection
         self.t, self.lwt = gl_nodes(meta["lmcd_lo"], meta["lmcd_hi"], nodes)
         rest = np.setdiff1d(np.arange(len(names)), idx)
         self.centers3 = np.asarray(catalog["centers"])[rest]; self.covs3 = np.asarray(catalog["covs"])[rest]
         self.n4, self.n3, self.n = len(idx), len(rest), len(names)
         self.names4 = [names[i] for i in idx]; self.names3 = [names[i] for i in rest]
         self.sel = ZSelection(pdet_z_grid)
+        if injection_selection is not None:
+            T_obs = injection_selection.T_obs_years
         self.T_obs = float(T_obs if T_obs is not None else self.sel.T_obs_years)
         self.window = None
         if mc_ref is not None:
@@ -267,8 +342,14 @@ class HybridPoissonLikelihood:
             e4 = event_log_integrals(self.P, self.t, self.lwt, x, log_w, kappa, checkpoint=checkpoint)
         else:
             e4, over = self.window(x, log_w, kappa, checkpoint=checkpoint)
-        e3 = nal3d_log_integrals(self.centers3, self.covs3, x, log_w)
-        log_mu = math.log(self.T_obs) + logsumexp(log_w + jnp.log(self.sel.xi(samples, kappa)))
+        if self.n3 > 0:
+            e3 = nal3d_log_integrals(self.centers3, self.covs3, x, log_w)
+        else:
+            e3 = jnp.zeros((0, 2))
+        if self.injsel is not None:
+            log_mu = self.injsel.log_mu(samples, log_w, kappa)
+        else:
+            log_mu = math.log(self.T_obs) + logsumexp(log_w + jnp.log(self.sel.xi(samples, kappa)))
         lnL = jnp.sum(e4[:, 0]) + jnp.sum(e3[:, 0]) + self.n * math.log(self.T_obs) - jnp.exp(log_mu)
         return lnL, dict(log_I4=e4[:, 0], ess4=jnp.exp(2 * e4[:, 0] - e4[:, 1]),
                          log_I3=e3[:, 0], ess3=jnp.exp(2 * e3[:, 0] - e3[:, 1]), mu=jnp.exp(log_mu),

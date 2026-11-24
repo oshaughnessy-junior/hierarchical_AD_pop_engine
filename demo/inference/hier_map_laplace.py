@@ -202,11 +202,44 @@ def configure(pl, model, f_dep, key, prop=None):
             pl.SEED_PROP_FRAC = 1.0; pl.SEED_PROP_SPIN = prop["spin"]
 
 
-def build(args, model, key, n_seed, n_b, prop=None, dry=False):
+def load_catalog(args):
+    """The event catalog, optionally restricted (--event-subset o4: O4a/O4b events with a primary 4D fit),
+    and the per-run thinning fractions (events kept / catalog events in that run)."""
     cat = np.load(args.catalog, allow_pickle=True)
+    if getattr(args, "event_subset", "all") == "all":
+        return cat, None
+    t = np.load(args.native4d_tables, allow_pickle=True)
+    have = set(str(n) for n, tier in zip(t["name"], t["tier"]) if str(tier) == "primary")
+    lab = np.array([str(l) for l in cat["labels"]]); names = np.array([str(n) for n in cat["names"]])
+    if args.event_subset == "o4all":         # every O4a/O4b event; those without a 4D fit use their 3D NAL
+        keep = np.isin(lab, ["O4a", "O4b"]); thin = {0: 1.0, 1: 1.0}
+    else:
+        keep = np.isin(lab, ["O4a", "O4b"]) & np.array([n in have for n in names])
+        thin = {0: keep[lab == "O4a"].sum() / (lab == "O4a").sum(), 1: keep[lab == "O4b"].sum() / (lab == "O4b").sum()}
+    sub = {k: np.asarray(cat[k])[keep] for k in ("names", "labels", "centers", "covs")}
+    return sub, thin
+
+
+_INJSEL = {}
+
+
+def injection_selection(args, thin):
+    import native4d_population as NP
+    key = (args.injection_file, tuple(sorted(thin.items())))
+    if key not in _INJSEL:
+        _INJSEL[key] = NP.InjectionSelection(args.injection_file, thin)
+    return _INJSEL[key]
+
+
+def build(args, model, key, n_seed, n_b, prop=None, dry=False):
+    cat, thin = load_catalog(args)
+    if getattr(args, "selection", "grid") == "injections" and thin is None:
+        thin = {0: 1.0, 1: 1.0}
     if dry:
         T_dry = 1.0
-        if getattr(args, "likelihood", "nal3d") == "native4d":   # same rate units as _build_native4d
+        if getattr(args, "selection", "grid") == "injections":
+            T_dry = float(np.load(args.injection_file)["T_obs_s"]) / (365.25 * 86400.0)
+        elif getattr(args, "likelihood", "nal3d") == "native4d":   # same rate units as _build_native4d
             g = np.load(args.pdet_z_grid, allow_pickle=True)
             T_dry = float(json.loads(str(g["metadata_json"]))["T_obs_years"])
         n_obs = len(cat["centers"]); logr0 = float(np.log(n_obs / T_dry / 2.0))
@@ -218,7 +251,7 @@ def build(args, model, key, n_seed, n_b, prop=None, dry=False):
     assert float(M.T_OBS) == 1.0
     comb, nA = pl.make_combined_pl(n_seed, n_b)
     if getattr(args, "likelihood", "nal3d") == "native4d":
-        return _build_native4d(args, cat, pl, M, model, comb, nA)
+        return _build_native4d(args, cat, pl, M, model, comb, nA, thin)
     from mass_pdet_interp import make_real_pdet_fn
     pdet = make_real_pdet_fn(args.pdet_grid)
     ce = jnp.asarray(cat["centers"]); cov = jnp.asarray(cat["covs"])
@@ -252,7 +285,7 @@ def build(args, model, key, n_seed, n_b, prop=None, dry=False):
                 n_obs=n_obs, logr0=logr0, nA=nA, comb=comb, pdet=pdet)
 
 
-def _build_native4d(args, cat, pl, M, model, comb, nA):
+def _build_native4d(args, cat, pl, M, model, comb, nA, thin=None):
     """--likelihood native4d: revised 4D event fits (A's HybridPoissonLikelihood: z integrated
     per event by Gauss-Legendre quadrature against p(z|kappa) ~ dVc/dz (1+z)^(kappa-1) on
     (0, 2.5]; 3D NAL fallback for events without a fit; selection pdet(m1, m2, z) from the
@@ -263,7 +296,8 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
     NP.install_rift_stub()
     kappa = float(args.kappa)
     n_obs = int(len(cat["centers"]))
-    T_ref = float(NP.ZSelection(args.pdet_z_grid).T_obs_years)
+    injsel = injection_selection(args, thin) if getattr(args, "selection", "grid") == "injections" else None
+    T_ref = injsel.T_obs_years if injsel is not None else float(NP.ZSelection(args.pdet_z_grid).T_obs_years)
     logr0 = float(np.log(n_obs / T_ref / 2.0))
     bounds, consts = model_spec(model, logr0)
     names = sorted(bounds)
@@ -276,7 +310,7 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
         mc_ref = np.asarray(NP.mc_eta_chieff(jnp.asarray(s0))[:, 0])
     like = NP.HybridPoissonLikelihood(cat, args.native4d_tables, args.pdet_z_grid,
                                       tiers=tuple(args.native4d_tiers.split(",")),
-                                      nodes=args.native4d_nodes, mc_ref=mc_ref)
+                                      nodes=args.native4d_nodes, mc_ref=mc_ref, injection_selection=injsel)
     T = like.T_obs
     if like.window is not None:      # positions are theta-independent: check overflow once
         s0, lw0 = comb(**ref)
@@ -291,23 +325,48 @@ def _build_native4d(args, cat, pl, M, model, comb, nA):
         s, lw = comb(**th)
         L, d = like(s, lw, kap)
         mu = d["mu"]
-        muA = T * jnp.sum(jnp.exp(lw[:nA]) * like.sel.xi(s[:nA], kap))
+        if injsel is not None:
+            muA = jnp.exp(injsel.log_mu(s, jnp.where(jnp.arange(lw.shape[0]) < nA, lw, -jnp.inf), kap))
+            jax.debug.callback(_record_neff, injsel.diagnostics(s, lw, kap, n_obs)["neff"])
+        else:
+            muA = T * jnp.sum(jnp.exp(lw[:nA]) * like.sel.xi(s[:nA], kap))
         return L, (mu, muA)
+
+    def sel_diag(theta):
+        if injsel is None:
+            return None
+        th = {k: theta[i] for i, k in enumerate(names)}; th.update(consts)
+        kap = th.pop("kappa", kappa); s, lw = comb(**th)
+        dd = injsel.diagnostics(s, lw, kap, n_obs)
+        out = {k: float(v) for k, v in dd.items()}
+        out.update(n_obs=n_obs, neff_flag=bool(out["neff"] < 4 * n_obs), thinning={str(k): float(v) for k, v in injsel.thinning.items()},
+                   T_obs_years=injsel.T_obs_years, n_injections=injsel.n_inj)
+        return out
 
     def prof(theta):
         L, (mu, muA) = parts(theta)
         sl = L + mu
         return sl - n_obs * jnp.log(mu) + n_obs * math.log(n_obs) - n_obs, (mu, muA)
 
+    if injsel is not None:
+        print(f"INJECTION SELECTION: {injsel.n_inj} found injections, T_obs={injsel.T_obs_years:.4f} yr, "
+              f"N_gen={injsel.NG:.0f}, thinning={injsel.thinning}; events={n_obs}", flush=True)
     win = "on" if like.window is not None else "off"
     kdesc = f"free U{tuple(FREE_KAPPA)}" if FREE_KAPPA is not None else kappa
     print(f"NATIVE4D: {like.n4} events on 4D fits, {like.n3} on 3D NAL; kappa={kdesc}; "
           f"T_obs={T:.4f} yr; window={win}", flush=True)
     return dict(prof=prof, pl=pl, M=M, names=names, bounds=bounds, consts=consts, parts=parts,
-                n_obs=n_obs, logr0=logr0, nA=nA, comb=comb, pdet=None, like=like)
+                n_obs=n_obs, logr0=logr0, nA=nA, comb=comb, pdet=None, like=like, sel_diag=sel_diag)
 
 
 # ---- coordinate maps -------------------------------------------------------
+NEFF_TRACE = []
+
+
+def _record_neff(x):
+    NEFF_TRACE.append(float(x))
+
+
 def to_z(theta, lo, hi):
     u = np.clip((theta - lo) / (hi - lo), 1e-6, 1 - 1e-6)
     return np.log(u) - np.log1p(-u)
@@ -548,6 +607,12 @@ def run_fit(args):
                grad_at_map={k: float(np.asarray(g)[i]) for i, k in enumerate(names)},
                stages=trail, lbfgs_message=str(res.message), n_obs=n_obs,
                wall_s=time.time() - t0, **lap)
+    if B.get("sel_diag") is not None and getattr(args, "selection", "grid") == "injections":
+        out["selection"] = B["sel_diag"](jnp.asarray(theta_map))
+        tr = np.array(NEFF_TRACE) if NEFF_TRACE else np.array([np.nan])
+        out["neff_trace"] = dict(n_eval=int(len(NEFF_TRACE)), min=float(np.nanmin(tr)), median=float(np.nanmedian(tr)),
+                                 n_below_4Nobs=int(np.sum(tr < 4 * n_obs)))
+        np.save(os.path.join(args.outdir, "neff_trace.npy"), tr)
     with open(os.path.join(args.outdir, "result.json"), "w") as f:
         json.dump(out, f, indent=1)
     log(f"DONE lnL={out['lnL']:.3f} lnZ={out['lnZ_laplace']:.3f} (bdy {out['lnZ_laplace_bdy']:.3f}) "
@@ -564,7 +629,10 @@ def run_reeval(args):
         B = build(args, r["model"], k, args.n_seed, args.n_b, r.get("final_proposal"))
         th = jnp.asarray([r["theta_map"][n] for n in B["names"]])
         L, (mu, muA) = jax.jit(B["parts"])(th)
-        out["evals"].append(dict(key=k, lnL=float(L), mu=float(mu), mu_A=float(muA)))
+        ev = dict(key=k, lnL=float(L), mu=float(mu), mu_A=float(muA))
+        if B.get("sel_diag") is not None and getattr(args, "selection", "grid") == "injections":
+            ev["selection"] = B["sel_diag"](th)
+        out["evals"].append(ev)
         print(f"reeval key={k} lnL={float(L):.3f} mu={float(mu):.1f} ({time.time()-t0:.0f}s)", flush=True)
     Ls = np.array([e["lnL"] for e in out["evals"]])
     out["lnL_mean"] = float(Ls.mean()); out["lnL_sd"] = float(Ls.std(ddof=1)) if len(Ls) > 1 else None
@@ -650,6 +718,12 @@ def main():
     p.add_argument("--likelihood", default="nal3d", choices=["nal3d", "native4d"])
     p.add_argument("--kappa", type=float, default=2.7, help="native4d: fixed redshift-evolution index "
                    "(with --free-kappa: the starting value)")
+    p.add_argument("--selection", default="grid", choices=["grid", "injections"],
+                   help="native4d: selection from the pdet grid or directly from found injections (--injection-file)")
+    p.add_argument("--injection-file", default=os.path.join(WS, "inputs/derived/gwtc5_o4ab_found.npz"))
+    p.add_argument("--event-subset", default="all", choices=["all", "o4", "o4all"],
+                   help="o4: O4a/O4b events with a primary 4D fit, mu thinned per run by the kept fraction; "
+                        "o4all: every O4a/O4b event (3D NAL where no 4D fit), no thinning")
     p.add_argument("--log-r-range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                    help="every log_R_* prior on [logr0+LO, logr0+HI] (default -8 8)")
     p.add_argument("--free-kappa", type=float, nargs=2, default=None, metavar=("LO", "HI"),
