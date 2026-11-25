@@ -156,9 +156,28 @@ def _default_init(model, logr0):
     return th
 
 
+FIELD_SEED = None       # opt-in (--field-seed): fold an integer into every static-draw key; None = committed draws
+_STATIC_KEYS = {}        # original static keys, stored on first use
+
+
+def apply_field_seed(pl):
+    """Re-seed the static draws (channel B normals, B-mix, channel C, the aligned-seed proposal and tilts, the natal
+    proposal and the spin orientations). They do not depend on theta or on the cascade key, so they are fixed across
+    fits and evaluations unless this is used. No effect when FIELD_SEED is None."""
+    mods = [(pl, n) for n in ("AS_Z_KEY", "PL_PROP_KEY", "BMIX_KEY", "AS_C_PROP_KEY", "C_KEY", "SEED_PROP_KEY", "FIELD_KEY")]
+    mods += [(pl.tc, "B_KEY"), (pl.M, "SPIN_ORIENT_KEY")]
+    for mod, name in mods:
+        if not hasattr(mod, name): continue
+        kk = (mod.__name__, name)
+        _STATIC_KEYS.setdefault(kk, getattr(mod, name))
+        orig = _STATIC_KEYS[kk]
+        setattr(mod, name, orig if FIELD_SEED is None else jax.random.fold_in(orig, 7919 + int(FIELD_SEED)))
+
+
 def configure(pl, model, f_dep, key, prop=None):
     import red_team.backup_particle_mc as bpm
     M = pl.M
+    apply_field_seed(pl)
     M.F_DEP = float(f_dep)
     M.V_ESC = 1000.0
     M.SAMPLER_KEY = jax.random.PRNGKey(int(key))
@@ -211,11 +230,16 @@ def load_catalog(args):
     t = np.load(args.native4d_tables, allow_pickle=True)
     have = set(str(n) for n, tier in zip(t["name"], t["tier"]) if str(tier) == "primary")
     lab = np.array([str(l) for l in cat["labels"]]); names = np.array([str(n) for n in cat["names"]])
+    excl = set(getattr(args, "exclude_events", None) or [])
     if args.event_subset == "o4all":         # every O4a/O4b event; those without a 4D fit use their 3D NAL
         keep = np.isin(lab, ["O4a", "O4b"]); thin = {0: 1.0, 1: 1.0}
     else:
         keep = np.isin(lab, ["O4a", "O4b"]) & np.array([n in have for n in names])
         thin = {0: keep[lab == "O4a"].sum() / (lab == "O4a").sum(), 1: keep[lab == "O4b"].sum() / (lab == "O4b").sum()}
+    if excl:
+        missing = excl - set(names[keep]); assert not missing, ("not in the analysed set", missing)
+        keep &= ~np.isin(names, list(excl))
+        thin = {0: keep[lab == "O4a"].sum() / (lab == "O4a").sum(), 1: keep[lab == "O4b"].sum() / (lab == "O4b").sum()} if args.event_subset == "o4" else thin
     sub = {k: np.asarray(cat[k])[keep] for k in ("names", "labels", "centers", "covs")}
     return sub, thin
 
@@ -718,6 +742,9 @@ def main():
     p.add_argument("--likelihood", default="nal3d", choices=["nal3d", "native4d"])
     p.add_argument("--kappa", type=float, default=2.7, help="native4d: fixed redshift-evolution index "
                    "(with --free-kappa: the starting value)")
+    p.add_argument("--field-seed", type=int, default=None,
+                   help="opt-in: re-seed the static (theta- and cascade-key-independent) draws with this integer; default unchanged")
+    p.add_argument("--exclude-events", nargs="*", default=None, help="event names dropped from the analysed set (per-run thinning follows)")
     p.add_argument("--selection", default="grid", choices=["grid", "injections"],
                    help="native4d: selection from the pdet grid or directly from found injections (--injection-file)")
     p.add_argument("--injection-file", default=os.path.join(WS, "inputs/derived/gwtc5_o4ab_found.npz"))
@@ -741,6 +768,8 @@ def main():
     if args.free_kappa is not None and args.likelihood != "native4d":
         raise SystemExit("--free-kappa needs --likelihood native4d")
     FREE_KAPPA = args.free_kappa; KAPPA_INIT = float(args.kappa)
+    global FIELD_SEED
+    FIELD_SEED = args.field_seed
     global LOG_R_RANGE
     LOG_R_RANGE = args.log_r_range
     if args.mode == "smoke":
