@@ -73,4 +73,5 @@ for label, th in starts:
     rec = dict(member=MEM, dataset=DS, f_dep=FD, start=label, start_theta=th, theta=dict(zip(names, best_th.tolist())), lnL_key11=float(best_L), lnL_ho=ho, lnL_ho_mean=float(np.mean(ho)), sup=bool(min(ho) > -1e9), wall_s=time.time() - t0)
     with open(dst, "a") as f: f.write(json.dumps(rec) + "\n")
     print(MEM, DS, FD, label, "start lnL11", round(float(best_L), 1), "heldout", [round(x, 1) for x in ho], f"{rec['wall_s']:.0f}s", flush=True)
+open(dst.replace(".jsonl", ".done"), "w").write("ok")
 print("DONE", dst, flush=True)
