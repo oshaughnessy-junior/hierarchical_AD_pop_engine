@@ -111,9 +111,12 @@ for M in MEMBERS:
         if not settled: done_all = False; continue
         lh = {(i, fd): res(b)["lnL_heldout_mean"] for (i, fd), b in fitted.items() if b}
         (bi, bfd) = max(lh, key=lh.get); ext = {0.4: 0.5, 0.3: 0.2}[bfd]
-        ok, b = run_fit_cell(M, DS, ext, bi, res(fitted[(bi, bfd)])["theta_map"]); settled &= ok
-        if ok and b: fitted[(bi, ext)] = b
-        if not settled: done_all = False; continue
+        # f_dep 0.2 / 0.5 extensions are HELD until the coordinator releases them (file HOLD_EXT present): not requested, not counted as pending
+        if not os.path.exists(f"{ROOT}/HOLD_EXT"):
+            ok, b = run_fit_cell(M, DS, ext, bi, res(fitted[(bi, bfd)])["theta_map"]); settled &= ok
+            if ok and b: fitted[(bi, ext)] = b
+            if not settled: done_all = False; continue
+        else: rec["held_extension"] = ext
         tags = []
         for i, o in enumerate(kept, 1):
             cand = {fd: b for (j, fd), b in fitted.items() if j == i and b}
