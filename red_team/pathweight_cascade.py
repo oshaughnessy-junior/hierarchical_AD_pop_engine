@@ -139,6 +139,8 @@ def make_evaluator(sh, n_grid=192):
         Zmq0 = jnp.sum(iw[:n_init]); Zmp0 = jnp.sum(W0 * iw[:n_init])
         chi = jnp.zeros(S, dtype=lw.dtype).at[:n_init].set(chi_natal)
         budget = jnp.asarray(f_dep) * Zp0
+        zfloor = 1e-3 * Zp0
+        zmfloor = 1e-3 * Zmp0
         phil = jnp.zeros(S, dtype=lw.dtype)
         Phi = jnp.zeros(n_grid if exch else 1, dtype=lw.dtype)
 
@@ -146,7 +148,7 @@ def make_evaluator(sh, n_grid=192):
             return Ph[gi_j[s]] * (1.0 - gf_j[s]) + Ph[gi_j[s] + 1] * gf_j[s]
 
         def step(c, x):
-            logW, phil, m, chi, Zq, Zp, Zmq, Zmp, Rp, Ph, lwmax, tau = c
+            logW, phil, m, chi, Zq, Zp, Zmq, Zmp, Rp, Ph, lwmax, tau, nfl = c
             i, j, a, b = x["i"], x["j"], x["a"], x["b"]
             oi, oj, dl, mult = x["oi"], x["oj"], x["dl"], x["mult"]
             act = dl > 0.0
@@ -158,10 +160,13 @@ def make_evaluator(sh, n_grid=192):
             else:
                 lWi, lWj = logW[i], logW[j]
             Wi = jnp.exp(lWi)
-            log_r = lWi + lWj + jnp.log(Zq - oi) - jnp.log(Zp - oi)
+            # Zp, Zmp are IS estimates; one huge event weight can drive them below
+            # zero far outside the proposal's support. Floor them (counted in diag).
+            Zp_s = jnp.maximum(Zp - oi, zfloor)
+            log_r = lWi + lWj + jnp.log(Zq - oi) - jnp.log(Zp_s)
             if exch:
                 Zmq_ex = Zmq - (oi * iw[i] + oj * iw[j])
-                Zmp_ex = Zmp - (oi * iw[i] + oj * iw[j])
+                Zmp_ex = jnp.maximum(Zmp - (oi * iw[i] + oj * iw[j]), zmfloor)
                 log_m = log_r + lWk + jnp.log(Zmq_ex) - jnp.log(Zmp_ex)
                 d = jnp.where(act, jnp.exp(log_r) / Zmp_ex - 1.0 / Zmq_ex, 0.0)
             else:
@@ -169,7 +174,7 @@ def make_evaluator(sh, n_grid=192):
             mk = jnp.exp(log_m)
             # target clock: Zp/Zq target steps per shadow step; the target stops
             # after the committed n_steps on its own clock (fraction at the crossing)
-            rate = Zp / Zq
+            rate = jnp.maximum(Zp, zfloor) / Zq
             fs = jnp.clip((n_target - tau) / rate, 0.0, 1.0)
             tau = tau + rate
             # record weight, capped at the target's own depletion budget
@@ -205,13 +210,14 @@ def make_evaluator(sh, n_grid=192):
                 phil = phil.at[kk].set(jnp.where(hit_k, phi_at(Ph, kk), phil[kk]))
                 phil = phil.at[r].set(phi_at(Ph, r))
             lwmax = jnp.maximum(lwmax, jnp.where(act, log_m, -jnp.inf))
-            return (logW, phil, m, chi, Zq, Zp, Zmq, Zmp, Rp, Ph, lwmax, tau), (rec, wrec)
+            nfl = nfl + (Zp - oi < zfloor).astype(nfl.dtype)
+            return (logW, phil, m, chi, Zq, Zp, Zmq, Zmp, Rp, Ph, lwmax, tau, nfl), (rec, wrec)
 
         c0 = (logW, phil, m0, chi, Zq0, Zp0, Zmq0, Zmp0, jnp.zeros((), lw.dtype), Phi,
-              jnp.asarray(-jnp.inf, lw.dtype), jnp.zeros((), lw.dtype))
+              jnp.asarray(-jnp.inf, lw.dtype), jnp.zeros((), lw.dtype), jnp.zeros((), lw.dtype))
         cf, (rec, wrec) = jax.lax.scan(step, c0, xs)
         diag = dict(budget_frac=cf[8] / budget, log_m_max=cf[10], Zp_end=cf[5], Zq_end=cf[4],
-                    clock_frac=cf[11] / n_target)
+                    clock_frac=cf[11] / n_target, n_floor=cf[12])
         return rec, wrec, diag
 
     return evaluate

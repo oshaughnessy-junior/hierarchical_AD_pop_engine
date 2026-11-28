@@ -62,6 +62,8 @@ def run_points(a, r, pts, names):
             Bw = setup_path(a, r, "exact", ref=prop)
             Lw, (muw, _) = jax.jit(Bw["parts"])(jnp.asarray(th))
             we = channelA_weights(Be, th); ww = channelA_weights(Bw, th)
+            n = max(we.size, ww.size)           # the shadow may run extra steps (zero weight)
+            we = np.pad(we, (0, n - we.size)); ww = np.pad(ww, (0, n - ww.size))
             row = dict(label=pt["label"], mahal=pt["mahal"], theta=dict(zip(names, th.tolist())),
                        lnL_exact=float(Le), lnL_path=float(Lw), diff=float(Lw - Le),
                        mu_exact=float(mue), mu_path=float(muw),
