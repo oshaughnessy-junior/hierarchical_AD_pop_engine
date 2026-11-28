@@ -1,0 +1,4 @@
+MAP result.json + reeval_n8000.json copied from cardassia ~/20261120-hier-reassess/runs/
+  <M>_floor40  <- BS_scan/<M>_f<best>  (floor-40 table, BS_rank/table.csv)
+  REFRC_floor20 <- BS_scan_mmax20/REFRC_f0.5_s25 (BS_rank/table_mmax20.csv best tag)
+Inputs to hier_nuts.py --map-json (pinned final_proposal).
