@@ -134,7 +134,7 @@ def default_init(model, logr0):
     return th
 
 
-def configure(pl, model, f_dep, key, prop=None):
+def configure(pl, model, f_dep, key, prop=None, pathw=None):
     import red_team.backup_particle_mc as bpm
     M = pl.M
     M.F_DEP = float(f_dep)
@@ -165,12 +165,19 @@ def configure(pl, model, f_dep, key, prop=None):
         if prop is not None:        # exact: every cascade proposal == its target
             pl.PL_PROP_REF = (prop["alpha"], prop["m_max"], prop["spin"])
             pl.AS_C_PROP_EXACT = True
+        if pathw is not None:       # path-weighted channel A (fixed proposal); channel C
+            pl.PL_PROP_REF = None   # (aligned seed, shape pinned) stays exact
+            pl.PL_PATHWEIGHT = dict(pathw)
+            pl.AS_C_PROP_EXACT = True
         return
     if model in ("REF", "REFRC"):
         pl.CHANNEL_B_MIX = True; pl.BMIX_MLO, pl.BMIX_MHI = 5.0, 20.0
         pl.SEED_GAUSS = False; pl.FIELD = "default"
         if model == "REFRC" and prop is not None:
             pl.PL_PROP_REF = (prop["alpha"], prop["m_max"], prop["spin"])
+        if model == "REFRC" and pathw is not None:
+            pl.PL_PROP_REF = None
+            pl.PL_PATHWEIGHT = dict(pathw)
     else:
         pl.CHANNEL_B_MIX = False; pl.SEED_GAUSS = True
         pl.FIELD = {"H0": "none", "H1": "broadpl", "H2": "shared"}[model]
@@ -180,7 +187,7 @@ def configure(pl, model, f_dep, key, prop=None):
             pl.SEED_PROP_FRAC = 1.0; pl.SEED_PROP_SPIN = prop["spin"]
 
 
-def build(args, model, key, n_seed, n_b, prop=None, dry=False):
+def build(args, model, key, n_seed, n_b, prop=None, dry=False, pathw=None):
     cat = np.load(args.catalog, allow_pickle=True)
     if dry:
         T_dry = 1.0
@@ -191,7 +198,7 @@ def build(args, model, key, n_seed, n_b, prop=None, dry=False):
         bounds, consts = model_spec(model, logr0)
         return dict(names=sorted(bounds), bounds=bounds, consts=consts, n_obs=n_obs, logr0=logr0)
     pl = load_pl()
-    configure(pl, model, args.f_dep, key, prop)
+    configure(pl, model, args.f_dep, key, prop, pathw)
     M = pl.M
     assert float(M.T_OBS) == 1.0
     comb, nA = pl.make_combined_pl(n_seed, n_b)
@@ -338,6 +345,40 @@ def laplace(B, theta, logL):
     return dict(hessian=H.tolist(), negH_eigs=ev.tolist(), negH_pd=pd,
                 lnZ_laplace=lnZ, lnZ_laplace_bdy=lnZ_bdy, railing=rail,
                 laplace_sigma=sig, ln_prior=ln_prior)
+
+
+def pathw_spec(model, prop, kind="defensive", budget_scale=1.5, steps_scale=1.0, spin="reparam"):
+    """fixed mass proposal for the path-weighted cascade (runs/BS_weights/DESIGN.md).
+
+    "tail": 0.95 PL at the reference m_max, 0.03 at m_max + 5, a 0.02 uniform floor.
+    "mild": 0.85 PL at the reference m_max, 0.10 at m_max + 5, a 0.05 uniform floor.
+    "defensive": 0.55 PL at the reference m_max (the MAP's final_proposal), 0.20 at
+    m_max + 7, 0.15 at m_max + 15, and a 0.10 uniform floor on [5, 70]; shadow spin
+    scale = the reference spin. "exact": one component at the reference (proposal
+    equals the target there). "broad": a 1.0 uniform floor on [5, 70]."""
+    if model != "REFRC" and model not in BSERIES:
+        raise SystemExit(f"path-weighted cascade: PL channel-A models only, not {model}")
+    a, m0, s0 = float(prop["alpha"]), float(prop["m_max"]), float(prop["spin"])
+    if kind == "exact":
+        comps, floor = [(1.0, m0)], 0.0
+    elif kind == "tail":
+        comps, floor = [(0.95, m0), (0.03, min(m0 + 5.0, 70.0))], 0.02
+    elif kind == "mild":
+        comps, floor = [(0.85, m0), (0.10, min(m0 + 5.0, 70.0))], 0.05
+    elif kind == "defensive":
+        comps, floor = [(0.55, m0), (0.20, min(m0 + 7.0, 70.0)), (0.15, min(m0 + 15.0, 70.0))], 0.10
+    elif kind == "broad":
+        comps, floor = [], 1.0
+    else:
+        raise SystemExit(f"unknown path proposal {kind!r}")
+    if spin == "reparam":
+        sis = None
+    elif spin == "is":   # fixed spin mixture: 0.6 TN(0, s0), 0.3 TN(0, 2 s0), 0.1 U[0, 1]
+        sis = dict(comps=[(0.6, s0), (0.3, min(2.0 * s0, 1.0))], floor=0.1)
+    else:
+        raise SystemExit(f"unknown path spin mode {spin!r}")
+    return dict(kind=kind, comps=comps, floor=floor, alpha=a, spin0=s0, budget_scale=float(budget_scale),
+                steps_scale=float(steps_scale), spin_is=sis)
 
 
 def prop_ref_from(model, th):

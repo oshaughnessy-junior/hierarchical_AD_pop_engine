@@ -40,12 +40,29 @@ def load_map(path):
     return r
 
 
+def path_spec(args, r):
+    """--path-proposal: None (pinned exact cascade) or the path-weighted spec."""
+    kind = getattr(args, "path_proposal", "none")
+    if kind == "none":
+        return None
+    return hml.pathw_spec(r["model"], r["final_proposal"], kind,
+                          getattr(args, "path_budget_scale", 1.5), getattr(args, "path_steps_scale", 1.0),
+                          getattr(args, "path_spin", "reparam"))
+
+
 def setup(args, r, key=None, prop=None):
-    """build() for the MAP's model / f_dep / m_max_A floor; check bounds agree."""
+    """build() for the MAP's model / f_dep / m_max_A floor; check bounds agree.
+
+    prop given: recentred exact cascade at prop. Otherwise --path-proposal none pins
+    the proposal at the MAP; any other value uses the path-weighted cascade with a
+    fixed proposal built from the MAP's final_proposal (runs/BS_weights)."""
     hml.M_MAX_LO = float(r["bounds"]["m_max_A"][0])
     args.f_dep = float(r["f_dep"])
+    pw = path_spec(args, r) if prop is None else None
     B = hml.build(args, r["model"], args.key if key is None else key, args.n_seed, args.n_b,
-                  r["final_proposal"] if prop is None else prop)
+                  None if pw is not None else (r["final_proposal"] if prop is None else prop),
+                  pathw=pw)
+    B["pathw"] = pw
     if B["names"] != r["names"]:
         raise SystemExit(f"parameter names differ from the MAP JSON: {B['names']} vs {r['names']}")
     for k in B["names"]:
@@ -147,6 +164,7 @@ def run_nuts(args):
     info = dict(map_json=os.path.abspath(args.map_json), model=r["model"], f_dep=r["f_dep"],
                 m_max_lo=hml.M_MAX_LO, key=args.key, n_seed=args.n_seed, n_b=args.n_b,
                 chain_seed=args.chain_seed, final_proposal=r["final_proposal"], names=names,
+                cascade_pathw=B.get("pathw"),
                 bounds={k: list(bounds[k]) for k in names},
                 theta_map=dict(zip(names, th.tolist())), theta_init=dict(zip(names, th0.tolist())),
                 lnL_map=L_map, lnL_init=L_init, ref_lnL=L0, ref_src=src,
@@ -270,6 +288,12 @@ def main():
     p.add_argument("--catalog", default=os.path.join(hml.WS, "inputs/full_o3_o4a_o4b_catalog_NAL_exNSBH_etafix.npz"))
     p.add_argument("--pdet-grid", default=os.path.join(hml.WS, "inputs/mass_pdet_grid_kappa2.7.npz"))
     p.add_argument("--likelihood", default="nal3d", choices=["nal3d"])
+    p.add_argument("--path-proposal", default="none", choices=["none", "tail", "mild", "defensive", "exact", "broad"],
+                   help="none = exact cascade pinned at the MAP proposal (committed); else the "
+                        "path-weighted cascade on this fixed proposal (runs/BS_weights/DESIGN.md)")
+    p.add_argument("--path-budget-scale", type=float, default=1.5)
+    p.add_argument("--path-steps-scale", type=float, default=1.0)
+    p.add_argument("--path-spin", default="reparam", choices=["reparam", "is"])
     args = p.parse_args()
     args.dense_mass = bool(args.dense_mass)
     return dict(parity=run_parity, nuts=run_nuts, status=run_status, bias=run_bias)[args.mode](args)

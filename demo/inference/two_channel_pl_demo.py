@@ -123,10 +123,131 @@ def _pl_ref_proposal(n_seed):
     return m, c, log_q
 
 
+# opt-in PATH-WEIGHTED cascade for the PL channel A (2026-11-28,
+# runs/BS_weights/DESIGN.md).  None = committed behaviour (weights 0.5(w_i+w_j)).
+# A dict switches channel A to red_team.pathweight_cascade: the cascade runs once
+# on a FIXED mass proposal (mixture of the PL target at several m_max plus a
+# uniform floor) at a reference spin scale, and theta enters through path
+# importance weights (masses) and reparameterised natal spins.  Keys:
+#   comps: [(weight, m_max), ...] PL(alpha) components; floor: weight of U[M_MIN, 70]
+#   alpha: PL slope of the components; spin0: reference spin scale of the shadow
+#   budget_scale: shadow depletion budget / f_dep (default 1.5, capped at 0.95/f_dep)
+#   steps_scale: shadow scan length / committed n_steps (default 1.0)
+#   spin_is: None = reparameterised spins (shadow at spin0, frozen pair sequence);
+#            {"comps": [(weight, scale), ...], "floor": w} = fixed spin proposal
+#            (TN(0, scale)[0,1] components plus a U[0,1] floor) with spin IS weights
+PL_PATHWEIGHT = None
+
+
+def _pl_mix_proposal(n_seed, spec):
+    """mixture mass proposal (grid inverse CDF of frozen uniforms, as
+    _pl_ref_proposal) and the frozen spin uniforms. One component with no floor
+    reproduces _pl_ref_proposal's masses exactly."""
+    k1, k2 = jax.random.split(PL_PROP_KEY)
+    g = np.asarray(_NORM_GRID)
+    alpha = float(spec.get("alpha", 0.0))
+    comps = [(float(w), float(mm)) for w, mm in spec["comps"]]
+    floor = float(spec.get("floor", 0.0))
+    wsum = sum(w for w, _ in comps) + floor
+    comps = [(w / wsum, mm) for w, mm in comps]; floor /= wsum
+    lo, hi = float(M.M_MIN), float(M_MAX_PROP)
+
+    def log_q(m):
+        terms = [math.log(w) + _log_p_mass_pl_cutoff(m, alpha, mm) for w, mm in comps]
+        if floor > 0:
+            terms.append(jnp.where((m >= lo) & (m <= hi), math.log(floor) - math.log(hi - lo), -jnp.inf))
+        if len(terms) == 1 and comps:
+            return _log_p_mass_pl_cutoff(m, alpha, comps[0][1])
+        if len(terms) == 1:
+            return terms[0]
+        return logsumexp(jnp.stack(terms), axis=0)
+
+    pdf = np.exp(np.asarray(log_q(_NORM_GRID)))
+    cdf = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(g))])
+    cdf /= cdf[-1]
+    u = np.asarray(jax.random.uniform(k1, (n_seed,)))
+    m = jnp.asarray(np.interp(u, cdf, g))
+    u_spin = jax.random.uniform(k2, (n_seed,))
+    return m, u_spin, log_q(m)
+
+
+def make_sampler_A_pathweight(n_seed, spec):
+    """Channel-A sampler with the path-weighted cascade (PL_PATHWEIGHT)."""
+    import red_team.pathweight_cascade as pwc
+    m_prop, u_spin, log_q_m = _pl_mix_proposal(n_seed, spec)
+    s0 = float(spec["spin0"])
+    sis = spec.get("spin_is")
+    if sis is None:
+        chi0 = _tn_draw(u_spin, 0.0, s0, 0.0, 1.0)
+        log_q_c = None
+    else:                                   # fixed spin mixture proposal, IS weights
+        k_lab = jax.random.fold_in(PL_PROP_KEY, 7)
+        ul = np.asarray(jax.random.uniform(k_lab, (n_seed,)))
+        sc = [(float(w), float(x)) for w, x in sis["comps"]]
+        fl = float(sis.get("floor", 0.0))
+        tot = sum(w for w, _ in sc) + fl
+        sc = [(w / tot, x) for w, x in sc]; fl /= tot
+        edges = np.cumsum([w for w, _ in sc] + [fl])
+        lab = np.searchsorted(edges, ul * edges[-1], side="right")
+        lab = np.minimum(lab, len(edges) - 1)
+        draws = [np.asarray(_tn_draw(u_spin, 0.0, x, 0.0, 1.0)) for _, x in sc] + [np.asarray(u_spin)]
+        chi0 = jnp.asarray(np.choose(lab, draws))
+        terms = [math.log(w) + M.log_p_spin(chi0, x) for w, x in sc]
+        if fl > 0:
+            terms.append(jnp.full_like(chi0, math.log(fl)))
+        log_q_c = logsumexp(jnp.stack(terms), axis=0)
+    bscale = float(spec.get("budget_scale", 1.5))
+    bscale = min(bscale, 0.95 / float(M.F_DEP))
+    fixed = dict(kernel_a=float(M.KERNEL_A), kernel_b=float(M.KERNEL_B), v_esc=float(M.V_ESC))
+    cfg = M.MCConfig(
+        m_min=jnp.asarray(M.M_MIN), m_max=jnp.asarray(M_MAX_PROP),
+        natal_spin_loc=jnp.asarray(M.CFG_SPIN_LOC0),
+        natal_spin_scale=jnp.asarray(M.CFG_SPIN_SCALE0),
+        kernel_a=jnp.asarray(fixed["kernel_a"]), kernel_b=jnp.asarray(fixed["kernel_b"]),
+        v_esc=jnp.asarray(fixed["v_esc"]), n_seed=int(n_seed),
+        depletion_fraction=float(M.F_DEP),
+        mu_natal=jnp.asarray(M.CFG_MU0), sigma_natal=jnp.asarray(M.CFG_SIGMA0),
+        proposal=lambda _k: (m_prop, chi0, log_q_m), weight_array=None)
+    sh = pwc.run_shadow(cfg, M.SAMPLER_KEY, budget_scale=bscale,
+                        steps_scale=float(spec.get("steps_scale", 1.0)))
+    evaluate = pwc.make_evaluator(sh)
+
+    def sampler_A(alpha, m_max, spin_scale, kernel_a, kernel_b, log_rate, v_esc):
+        for nm, v in (("kernel_a", kernel_a), ("kernel_b", kernel_b), ("v_esc", v_esc)):
+            if not isinstance(v, (int, float)) or float(v) != fixed[nm]:
+                raise NotImplementedError(f"PL_PATHWEIGHT: {nm} must stay fixed at {fixed[nm]}")
+        logw = _log_p_mass_pl_cutoff(m_prop, alpha, m_max) - log_q_m
+        if log_q_c is None:
+            chi = _tn_draw(u_spin, 0.0, spin_scale, 0.0, 1.0)
+        else:
+            chi = chi0
+            logw = logw + M.log_p_spin(chi0, spin_scale) - log_q_c
+        rec, w_eff, _diag = evaluate(logw, chi)
+        samples = rec
+        if M.ISOTROPIC_SPIN:
+            n = samples.shape[0]
+            cost = jax.random.uniform(M.SPIN_ORIENT_KEY, (n, 2), minval=-1.0, maxval=1.0)
+            samples = samples.at[:, 2].multiply(cost[:, 0])
+            samples = samples.at[:, 3].multiply(cost[:, 1])
+        benign = jnp.asarray([10.0, 8.0, 0.0, 0.0])
+        samples = jnp.where(jnp.isfinite(samples), samples, benign[None, :])
+        log_w = jnp.log(jnp.maximum(w_eff, 1e-300))
+        log_w = log_w - logsumexp(log_w) + log_rate
+        return samples, log_w
+
+    sampler_A.shadow = sh
+    sampler_A.spec = dict(spec)
+    sampler_A.evaluate = evaluate
+    sampler_A.natal = dict(m=m_prop, u_spin=u_spin, log_q_m=log_q_m, chi0=chi0, log_q_c=log_q_c)
+    return sampler_A
+
+
 def make_sampler_A_mmax(n_seed):
     """Channel-A sampler: isotropic power-law natal with a FREE high-mass cutoff
     m_max, feeding the (faint) cascade. Replicates M.make_sampler_fn's IS machinery
     but threads a differentiable m_max through the target density."""
+    if PL_PATHWEIGHT is not None:
+        return make_sampler_A_pathweight(n_seed, PL_PATHWEIGHT)
     if PL_PROP_REF is None:
         m_prop, chi_prop, log_q = M.make_proposal(n_seed)
     else:

@@ -1656,6 +1656,8 @@ def particle_mc_jax_soft(
     n_steps: Optional[int] = None,
     n_steps_mult: float = 3.0,
     occ_tol: float = 1e-9,
+    trace: bool = False,
+    budget_scale: float = 1.0,
 ):
     """JAX-pure particle MC under the B.2 deterministic soft K-gate.
 
@@ -1704,6 +1706,17 @@ def particle_mc_jax_soft(
     occ_tol : float, default 1e-9
         Occupancy below this counts as "merged away" for pair-eligibility
         and the ``active_mask`` boolean.
+    trace : bool, default False
+        Opt-in (2026-11-28, path-weighted cascade).  Also return
+        ``out["trace"]``: per-step slot indices (``i``, ``j``, intruder
+        ``kk``, merging pair ``a``/``b``), pre-step occupancies, ``delta``,
+        ``mult``, ``retain`` and flags, for
+        :mod:`red_team.pathweight_cascade`.  Python-level guard: False
+        leaves the traced graph bit-for-bit unchanged.
+    budget_scale : float, default 1.0
+        Opt-in.  Multiplies the depletion budget ``R_target``, so a shadow
+        run used as a pair proposal can continue past ``depletion_fraction``.
+        1.0 (the default) is bit-for-bit the committed engine.
     """
     # J2b — the soft-gate path now supports non-Aligned per-event vector
     # physics (Isotropic / Fisher-κ).  Aligned keeps the bit-for-bit
@@ -1743,6 +1756,8 @@ def particle_mc_jax_soft(
     b_k = jnp.asarray(cfg.kernel_b)
     v_esc = jnp.asarray(cfg.v_esc)
     R_target = jnp.asarray(cfg.depletion_fraction) * n_init
+    if budget_scale != 1.0:
+        R_target = R_target * float(budget_scale)
     # ---- opt-in STEADILY-SEEDED / DRIVEN cascade (Prototype 6; Python-level
     # gate — with DRIVEN_MODE == 0 nothing below is traced and the graph, PRNG
     # stream and every output are bit-for-bit the committed engine).  In driven
@@ -2160,16 +2175,34 @@ def particle_mc_jax_soft(
         # δ — no straight-through needed, the B.2 AD headline).
         w_out = 0.5 * (w_i + w_j) * delta
         step_flag = is_event.astype(jnp.int32)
+        if trace:
+            # opt-in per-step trace for the path-weighted cascade (no PRNG,
+            # no effect on the carry; Python guard keeps the default graph).
+            tr = dict(i=i, j=j, a=i, b=j, o_i=o_i, o_j=o_j, delta=delta,
+                      mult=mult, retain=retain_rec, heavier_is_a=heavier_is_i,
+                      m_new=m_new, is_event=is_event, active=step_active_now,
+                      zq=denom_i)
+            if EXCHANGE_MODE:
+                idx3 = jnp.stack([i, j, kk])
+                tr.update(kk=kk, o_kk=o_kk, is_exch=is_exch,
+                          a=jnp.where(is_exch, idx3[hvy], i),
+                          b=jnp.where(is_exch, idx3[lgt], j),
+                          m_light=m_light_bin, sum_k=sum_k)
 
         new_carry = (new_m_arr, new_chi_arr, new_w_arr, new_occ, new_gen,
                      new_net_removed, key)
+        if trace:
+            return new_carry, (rec, v_kick_out, w_out, step_flag, tr)
         return new_carry, (rec, v_kick_out, w_out, step_flag)
 
     final_carry, outputs = jax.lax.scan(
         step_fn, carry0, jnp.arange(n_steps)
     )
     (m_f, chi_f, w_f, occ_f, gen_f, net_removed_f, _key_f) = final_carry
-    (mergers_arr, v_kicks_arr, w_mergers_arr, step_flags) = outputs
+    if trace:
+        (mergers_arr, v_kicks_arr, w_mergers_arr, step_flags, tr_arr) = outputs
+    else:
+        (mergers_arr, v_kicks_arr, w_mergers_arr, step_flags) = outputs
 
     W_total = jnp.sum(occ_f * w_f)
     out_dict = dict(
@@ -2197,6 +2230,8 @@ def particle_mc_jax_soft(
             ),
         ),
     )
+    if trace:
+        out_dict["trace"] = tr_arr
     return out_dict
 
 
