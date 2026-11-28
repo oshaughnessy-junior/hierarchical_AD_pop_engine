@@ -20,8 +20,12 @@ Modes
           MAP JSON's lnL (same key, n_seed, n_b) or with reeval_n<n_seed>.json.
   nuts    one chain -> <outdir>/nuts_ckpt.pkl, <outdir>/samples.npz at the end.
   status  one-line health summary of every chain dir given (--ckpt-dirs).
-  bias    lnL at --n-draws posterior draws with the proposal pinned at the MAP
-          versus recentred at the draw (exact there) -> <outdir>/bias_check.json.
+  bias    lnL at --n-draws posterior draws with the sampled cascade (pinned at the MAP, or
+          path-weighted with --path-proposal; "lnL_pinned" in the output) versus recentred
+          at the draw (exact there) -> <outdir>/bias_check.json.
+
+--path-proposal P (2026-11-28): path-weighted cascade on a fixed proposal built from the
+MAP (runs/BS_weights). --m-max-cap X: m_max_A prior U[lo, X], recorded in meta.json.
 """
 import argparse, glob, json, os, pickle, sys, time
 import numpy as np
@@ -57,6 +61,12 @@ def setup(args, r, key=None, prop=None):
     the proposal at the MAP; any other value uses the path-weighted cascade with a
     fixed proposal built from the MAP's final_proposal (runs/BS_weights)."""
     hml.M_MAX_LO = float(r["bounds"]["m_max_A"][0])
+    cap = getattr(args, "m_max_cap", None)
+    if cap is not None:              # narrower m_max_A prior U[lo, cap] (path "exact" coverage)
+        if not hml.M_MAX_LO < cap <= 70.0:
+            raise SystemExit(f"--m-max-cap {cap} outside ({hml.M_MAX_LO}, 70]")
+        hml.M_MAX_HI = float(cap)
+        r["bounds"]["m_max_A"] = [hml.M_MAX_LO, float(cap)]
     args.f_dep = float(r["f_dep"])
     pw = path_spec(args, r) if prop is None else None
     B = hml.build(args, r["model"], args.key if key is None else key, args.n_seed, args.n_b,
@@ -164,7 +174,7 @@ def run_nuts(args):
     info = dict(map_json=os.path.abspath(args.map_json), model=r["model"], f_dep=r["f_dep"],
                 m_max_lo=hml.M_MAX_LO, key=args.key, n_seed=args.n_seed, n_b=args.n_b,
                 chain_seed=args.chain_seed, final_proposal=r["final_proposal"], names=names,
-                cascade_pathw=B.get("pathw"),
+                cascade_pathw=B.get("pathw"), m_max_cap=getattr(args, "m_max_cap", None),
                 bounds={k: list(bounds[k]) for k in names},
                 theta_map=dict(zip(names, th.tolist())), theta_init=dict(zip(names, th0.tolist())),
                 lnL_map=L_map, lnL_init=L_init, ref_lnL=L0, ref_src=src,
@@ -256,6 +266,8 @@ def run_bias(args):
     out = dict(map_json=os.path.abspath(args.map_json), model=r["model"], f_dep=r["f_dep"],
                key=args.key, n_seed=args.n_seed, n_b=args.n_b, n_posterior=n,
                pinned_proposal=r["final_proposal"], draws=rows,
+               sampled_cascade="path" if Bp.get("pathw") else "pinned", cascade_pathw=Bp.get("pathw"),
+               m_max_cap=getattr(args, "m_max_cap", None),
                diff_mean=float(d.mean()), diff_sd=float(d.std(ddof=1)) if len(d) > 1 else None,
                diff_maxabs=float(np.abs(d).max()))
     print(f"pinned - exact: mean {out['diff_mean']:+.3f} sd {out['diff_sd']} max|.| {out['diff_maxabs']:.3f}")
@@ -294,6 +306,8 @@ def main():
     p.add_argument("--path-budget-scale", type=float, default=1.5)
     p.add_argument("--path-steps-scale", type=float, default=1.0)
     p.add_argument("--path-spin", default="reparam", choices=["reparam", "is"])
+    p.add_argument("--m-max-cap", type=float, default=None,
+                   help="upper edge of the m_max_A prior (default: the MAP JSON's, 70)")
     args = p.parse_args()
     args.dense_mass = bool(args.dense_mass)
     return dict(parity=run_parity, nuts=run_nuts, status=run_status, bias=run_bias)[args.mode](args)

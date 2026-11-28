@@ -62,6 +62,8 @@ def load_pl():
 
 # lower edge of the m_max_A prior (paper/committed: 40). Set by --m-max-lo.
 M_MAX_LO = 40.0
+# upper edge of the m_max_A prior (paper/committed: 70). hier_nuts --m-max-cap lowers it.
+M_MAX_HI = 70.0
 
 BSERIES = {
     "NULL": dict(exch=1, geta=False, bmix=False, chc="off"),
@@ -96,7 +98,7 @@ def model_spec(model, logr0, rw=8.0):
     spinB = {"mu_chiB": (-0.1, 0.5), "sig_chiB": (0.01, 0.3)}
     if model in BSERIES:
         sp = BSERIES[model]
-        b.update(m_max_A=(M_MAX_LO, 70.0), mu_B=(5.0, 15.0),
+        b.update(m_max_A=(M_MAX_LO, M_MAX_HI), mu_B=(5.0, 15.0),
                  sig_B=(0.2 if sp["bmix"] else 0.5, 3.0), **spinB, **rB)
         c["alpha_A"] = 0.0
         if sp["bmix"]:
@@ -107,7 +109,7 @@ def model_spec(model, logr0, rw=8.0):
             b.update(mu_C=(12.0, 45.0), sig_C=(2.0, 15.0))
         return b, c
     if model in ("REF", "REFRC"):
-        b.update(m_max_A=(M_MAX_LO, 70.0), mu_B=(5.0, 15.0), sig_B=(0.2, 3.0),
+        b.update(m_max_A=(M_MAX_LO, M_MAX_HI), mu_B=(5.0, 15.0), sig_B=(0.2, 3.0),
                  f_peakB=(0.01, 0.99), alpha_B=(-4.0, 8.0), **spinB, **rB)
         c["alpha_A"] = 0.0
     else:
