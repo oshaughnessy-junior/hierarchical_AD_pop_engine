@@ -1,0 +1,34 @@
+GPU 0: NVIDIA A100-PCIE-40GB (UUID: GPU-3b4b705e-eed6-ed3f-c591-171e249fa08a)
+[CudaDevice(id=0)]
+{
+ "map_json": "/home/rossma/hier-reassess-20261121/engine-nuts/demo/inference/bs_nuts_maps/NULL_floor40/result.json",
+ "model": "NULL",
+ "f_dep": 0.4,
+ "m_max_lo": 40.0,
+ "key": 11,
+ "n_seed": 8000,
+ "n_b": 6000,
+ "final_proposal": {
+  "alpha": 0.0,
+  "m_max": 40.00000003,
+  "spin": 0.09646197924319114
+ },
+ "lnL": 2048.7856705856543,
+ "mu": 235.4859831300531,
+ "ref_lnL": 2048.785670585654,
+ "ref_src": "reeval_n8000.json",
+ "diff": 4.547473508864641e-13,
+ "build_s": 50.968085050582886,
+ "first_vg_s": 17.086753606796265,
+ "vg_s": 11.178611278533936,
+ "vg_s_all": [
+  11.178538084030151,
+  11.178611278533936,
+  11.165563583374023,
+  11.198729753494263,
+  11.18967890739441
+ ],
+ "finite_grad": true,
+ "threads": "4",
+ "host": "clx-a-02.rc.rit.edu"
+}

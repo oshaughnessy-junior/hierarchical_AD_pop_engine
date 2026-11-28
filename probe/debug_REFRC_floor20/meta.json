@@ -1,0 +1,107 @@
+{
+ "map_json": "/home/rossma/hier-reassess-20261121/engine-nuts/demo/inference/bs_nuts_maps/REFRC_floor20/result.json",
+ "model": "REFRC",
+ "f_dep": 0.5,
+ "m_max_lo": 20.0,
+ "key": 11,
+ "n_seed": 8000,
+ "n_b": 6000,
+ "chain_seed": 7,
+ "final_proposal": {
+  "alpha": 0.0,
+  "m_max": 36.87942152595108,
+  "spin": 0.030108036692945483
+ },
+ "names": [
+  "alpha_B",
+  "f_peakB",
+  "log_R_A",
+  "log_R_B",
+  "m_max_A",
+  "mu_B",
+  "mu_chiB",
+  "sig_B",
+  "sig_chiB",
+  "spin_chi"
+ ],
+ "bounds": {
+  "alpha_B": [
+   -4.0,
+   8.0
+  ],
+  "f_peakB": [
+   0.01,
+   0.99
+  ],
+  "log_R_A": [
+   -3.229315375534335,
+   12.770684624465666
+  ],
+  "log_R_B": [
+   -3.229315375534335,
+   12.770684624465666
+  ],
+  "m_max_A": [
+   20.0,
+   70.0
+  ],
+  "mu_B": [
+   5.0,
+   15.0
+  ],
+  "mu_chiB": [
+   -0.1,
+   0.5
+  ],
+  "sig_B": [
+   0.2,
+   3.0
+  ],
+  "sig_chiB": [
+   0.01,
+   0.3
+  ],
+  "spin_chi": [
+   0.01,
+   0.3
+  ]
+ },
+ "theta_map": {
+  "alpha_B": 2.119844442328628,
+  "f_peakB": 0.7540465315237721,
+  "log_R_A": 10.061503437952867,
+  "log_R_B": 11.823148396946403,
+  "m_max_A": 36.87942152595108,
+  "mu_B": 9.33242354652322,
+  "mu_chiB": 0.0632834364517978,
+  "sig_B": 1.1913637000088266,
+  "sig_chiB": 0.09642464580492582,
+  "spin_chi": 0.030108036692945483
+ },
+ "theta_init": {
+  "alpha_B": 2.119844442328628,
+  "f_peakB": 0.7540465315237721,
+  "log_R_A": 10.061503437952867,
+  "log_R_B": 11.823148396946403,
+  "m_max_A": 36.87942152595108,
+  "mu_B": 9.33242354652322,
+  "mu_chiB": 0.0632834364517978,
+  "sig_B": 1.1913637000088266,
+  "sig_chiB": 0.09642464580492582,
+  "spin_chi": 0.030108036692945483
+ },
+ "lnL_map": 2071.209862871523,
+ "lnL_init": 2071.209862871523,
+ "ref_lnL": 2071.209862871523,
+ "ref_src": "reeval_n8000.json",
+ "num_warmup": 150,
+ "num_samples": 50,
+ "chunk": 10,
+ "max_tree_depth": 6,
+ "target_accept": 0.8,
+ "dense_mass": true,
+ "host": "skl-a-47.rc.rit.edu",
+ "slurm_job": "22181532",
+ "pid": 679604,
+ "started": "2026-11-27 21:02:05"
+}
